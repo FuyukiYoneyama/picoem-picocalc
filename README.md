@@ -1,27 +1,47 @@
-# picoem
+# picoem-picocalc
+
+An independent PicoCalc-oriented derivative of [`0x4D44/picoem`](https://github.com/0x4D44/picoem), retaining the upstream Git history and dual MIT OR Apache-2.0 licensing.
+
+## Derivative origin and direction
+
+- **Upstream:** `0x4D44/picoem`
+- **Initial upstream base:** `8e20a82e64ef0a416e21af20edd964138ecd41be`
+- **Repository model:** independent derivative rather than a GitHub fork-network repository
+- **Primary consumer:** [`FuyukiYoneyama/picocalc_emu`](https://github.com/FuyukiYoneyama/picocalc_emu)
+
+This derivative is intended to provide the RP2040 firmware-execution backend for `picocalc_emu`. The main objective is to run the same PicoCalc ELF, BIN, or UF2 firmware used on hardware while connecting the emulated RP2040 to deterministic PicoCalc board-device models.
+
+Development priorities are:
+
+1. Keep the existing RP2040 CPU, dual-core, SIO, PIO, DMA, peripheral, and differential-test assets intact.
+2. Treat the single-host-thread `ExecutionModel::Serial` path as the correctness reference. Threaded execution remains optional until it is demonstrably equivalent for PicoCalc workloads.
+3. Add reusable external-device interfaces needed by PicoCalc, including LCD, keyboard, SD card, PSRAM, audio, GPIO stimulus, UART capture, SPI devices, and I2C devices.
+4. Support deterministic scenario execution and artifacts such as framebuffer images, UART logs, traces, filesystem results, and test reports.
+5. Preserve upstream attribution, licenses, and history. General fixes suitable for upstream may be prepared separately for contribution to `0x4D44/picoem`.
+
+This firmware backend complements rather than replaces the faster host-device-model backend planned in `picocalc_emu`. PicoCalc-specific behavior should remain outside the generic RP2040 core wherever a board-level adapter or external-device model is sufficient.
+
+Upstream changes are fetched through the local `upstream` remote and incorporated selectively after review and regression testing. They are not merged automatically.
+
+## Original project scope
 
 Cycle-accurate emulators for the Raspberry Pi **RP2354 / RP2350** (dual Arm Cortex-M33 @ 150 MHz, 520 KB SRAM, FPU, coprocessors, PIO) and **RP2040** (dual Arm Cortex-M0+ @ 133 MHz, 264 KB SRAM, PIO), written in Rust.
 
-The goal is a small, clean, verifiable emulator core that can boot the real Pi bootroms, run ARMv8-M (M33) or ARMv6-M (M0+) firmware with accurate cycle timing, and serve as a reusable library crate for downstream projects.
+The original project goal is a small, clean, verifiable emulator core that can boot the real Pi bootroms, run ARMv8-M (M33) or ARMv6-M (M0+) firmware with accurate cycle timing, and serve as a reusable library crate for downstream projects.
 
 ```
-picoem (this repo)           — RP2350/RP2354 + RP2040 emulators, TUIs, test harness
+picoem-picocalc (this repo)      — PicoCalc-oriented derivative and test workspace
   ├─► rp2350-emu                 — RP2350 / RP2354 emulator library (Cortex-M33)
   ├─► rp2040-emu                 — RP2040 emulator library (Cortex-M0+)
-  └─► onerom-emu               — OneROM firmware running on rp2350-emu
-        └─► mddosem            — DOS emulator, uses OneROM as BIOS
+  └─► onerom-emu                 — OneROM firmware running on rp2350-emu
+        └─► mddosem              — DOS emulator, uses OneROM as BIOS
 ```
 
 ## Status
 
-A personal research project, published in case it's useful to others.
-I use these crates in my own work and will likely keep pushing fixes
-as I hit them, but I'm not committing to issue triage, PR review SLAs,
-or ongoing feature development. No promises — if you need certainty
-around a bugfix or feature, fork freely under MIT/Apache-2.0.
+The upstream repository is a personal research project and does not promise issue-triage, pull-request review, or ongoing feature-development service levels. This derivative is maintained independently for PicoCalc integration; users should not expect the upstream author to support derivative-specific changes.
 
-Feature coverage as of the published versions — Arm-mode only; Hazard3
-RISC-V cores on RP2350 are out of scope:
+Feature coverage as of the published versions — Arm-mode only; Hazard3 RISC-V cores on RP2350 are out of scope:
 
 | Subsystem | RP2350 / RP2354 | RP2040 |
 |---|---|---|
@@ -43,21 +63,15 @@ Open cycle-timing gaps and post-Phase-7 residuals are tracked in `tech_debt.md`.
 
 ## Quick Start
 
-Clone with submodules — the workspace member `epio-sys` references vendored
-upstream sources via git submodules. A normal clone works for everything else,
-but `cargo build -p epio-sys` requires submodules to be initialised:
+Clone with submodules — the workspace member `epio-sys` references vendored upstream sources via git submodules. A normal clone works for everything else, but `cargo build -p epio-sys` requires submodules to be initialised:
 
 ```bash
-git clone --recursive https://github.com/0x4D44/picoem.git
+git clone --recursive https://github.com/FuyukiYoneyama/picoem-picocalc.git
 # or, after a non-recursive clone:
 git submodule update --init
 ```
 
-`epio-sys` is excluded from the workspace's `default-members` and additionally
-requires `clang` to be on `PATH`, so a plain `cargo build --release` at the
-workspace root works on hosts without `clang` or initialised submodules — opt
-in explicitly with `cargo build -p epio-sys` once those prerequisites are in
-place.
+`epio-sys` is excluded from the workspace's `default-members` and additionally requires `clang` to be on `PATH`, so a plain `cargo build --release` at the workspace root works on hosts without `clang` or initialised submodules — opt in explicitly with `cargo build -p epio-sys` once those prerequisites are in place.
 
 ```bash
 # Build everything (release profile is strongly recommended — debug is slow)
@@ -103,9 +117,9 @@ The emulators are validated by independent oracles, each catching different bug 
 
 ```bash
 cargo test                      # all crates
-cargo test -p rp2350-emu          # RP2350 / RP2354 core only
-cargo test -p rp2040-emu          # RP2040 core only
-cargo test <name_substring>     # filtered
+cargo test -p rp2350-emu        # RP2350 / RP2354 core only
+cargo test -p rp2040-emu        # RP2040 core only
+cargo test <name_substring>      # filtered
 ```
 
 Instruction semantics, decode edge cases, exception mechanics, PIO, and clock-tree config live in each core crate's `tests.rs` / `pio_tests.rs` / `tests/firmware.rs`.
@@ -116,8 +130,8 @@ Each oracle spawns a QEMU reference CPU, connects over GDB, runs the same instru
 
 ```bash
 # RP2350 / Cortex-M33 oracle (GDB port 3333)
-cargo run -p picoem-harness --release --bin qemu_diff_m33                        # edge-case suite
-cargo run -p picoem-harness --release --bin qemu_diff_m33 -- --fuzz 100000       # random fuzz
+cargo run -p picoem-harness --release --bin qemu_diff_m33
+cargo run -p picoem-harness --release --bin qemu_diff_m33 -- --fuzz 100000
 cargo run -p picoem-harness --release --bin qemu_diff_m33 -- --fuzz 100000 --seed <S>
 
 # RP2040 / Cortex-M0+ oracle (GDB port 3334, uses QEMU `cortex-m0` — see `tech_debt.md`)
@@ -185,26 +199,12 @@ Licensed under either of
 
 at your option.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
-This repository redistributes third-party content under their respective
-licenses — Raspberry Pi RP2350 and RP2040 bootroms (BSD-3-Clause), the
-PicoGUS firmware (GPL-2.0-or-later), and a vendored fork of probe-rs
-(MIT OR Apache-2.0). See [NOTICE](NOTICE) for the full list and attribution.
+This repository redistributes third-party content under their respective licenses — Raspberry Pi RP2350 and RP2040 bootroms (BSD-3-Clause), the PicoGUS firmware (GPL-2.0-or-later), and a vendored fork of probe-rs (MIT OR Apache-2.0). See [NOTICE](NOTICE) for the full list and attribution.
 
 ## Trademarks
 
-*Raspberry Pi*, *RP2350*, *RP2354*, *RP2040*, and *Pico* are trademarks
-of Raspberry Pi Ltd. *Arm*, *Cortex-M0+*, *Cortex-M33*, *Armv6-M*,
-*Armv8-M*, and *NEON* are trademarks or registered trademarks of Arm
-Limited (or its subsidiaries) in the US and/or elsewhere. *Sound
-Blaster* is a trademark of Creative Technology Ltd. *AdLib*, *Gravis
-Ultrasound*, and *MT-32* are trademarks of their respective owners.
-*Monkey Island* is a trademark of Lucasfilm Entertainment Company Ltd.
-LLC.
+*Raspberry Pi*, *RP2350*, *RP2354*, *RP2040*, and *Pico* are trademarks of Raspberry Pi Ltd. *Arm*, *Cortex-M0+*, *Cortex-M33*, *Armv6-M*, *Armv8-M*, and *NEON* are trademarks or registered trademarks of Arm Limited (or its subsidiaries) in the US and/or elsewhere. *Sound Blaster* is a trademark of Creative Technology Ltd. *AdLib*, *Gravis Ultrasound*, and *MT-32* are trademarks of their respective owners. *Monkey Island* is a trademark of Lucasfilm Entertainment Company Ltd. LLC.
 
-This project is an independent emulator and is not affiliated with,
-endorsed by, or sponsored by any of the above trademark holders. All
-trademarks are used for identification purposes only.
+This project is an independent emulator and is not affiliated with, endorsed by, or sponsored by any of the above trademark holders. All trademarks are used for identification purposes only.
