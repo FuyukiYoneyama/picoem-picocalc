@@ -40,7 +40,8 @@ use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 ///
 /// * 1 — Gate 1: boot / UART / unsupported-MMIO report.
 /// * 2 — Gate 2: optional `lcd` + `framebuffer` sections, `board` field.
-const SCHEMA_VERSION: u32 = 2;
+/// * 3 — Gate 3: optional `psram` section (`--psram` / `--psram-verify-range`).
+const SCHEMA_VERSION: u32 = 3;
 
 /// Default 16 KB RP2040 bootrom image, relative to the repo root.
 const DEFAULT_BOOTROM_PATH: &str = "roms/rp2040/bootrom-rp2040-b2.bin";
@@ -88,6 +89,28 @@ const QUANTUM_PC_WATCH: u32 = 1;
 /// dispatch overhead over a run measured in tens of millions of cycles.
 /// Override with `--quantum`.
 const QUANTUM_BOARD: u32 = 16;
+
+/// Master-clock cycles per `Emulator::step` when `--psram` is attached
+/// (and no explicit `--quantum` overrides it).
+///
+/// Unlike the LCD's SSP (where the CPU polls `SSPSR.BSY` and is
+/// architecturally parked for the whole drain — see [`QUANTUM_BOARD`]),
+/// the PSRAM is driven by a free-running PIO state machine over DMA:
+/// the CPU only polls the *DMA channel's* busy flag, which says nothing
+/// about where the PIO program counter is mid-transfer. `Bus::step`'s
+/// slow path takes a single `bus.gpio_in` snapshot at the top of
+/// `tick_pio_and_route_irqs` and reuses it for the *entire* quantum's
+/// `pio.step_n(cycles, gpio_in)` call — `update_gpio()` (which feeds
+/// `Psram::tick` and splices its MISO bit back in) only runs once, at
+/// the end. With `clkdiv=1.0` (picocalc_helloworld's setting — one PIO
+/// instruction per sysclk) any quantum > 1 would let every SCK/CS edge
+/// inside it go unseen by the PSRAM model until the quantum boundary,
+/// exactly the failure mode `tech_debt.md`'s "PSRAM PIO-integration
+/// tests cover only 1 edge/quantum" entry warns about. Forcing 1 here
+/// keeps every edge synchronous with the PSRAM's `tick()` — matching
+/// the same choice already made by the `onerom_*` and
+/// `picogus_diff_rp2040` harnesses for the same reason.
+const QUANTUM_PSRAM: u32 = 1;
 
 /// How often (in steps) the UART TX log is drained during free-run.
 /// Draining is cheap (a `mem::take` of a `Vec`), but not free at one
@@ -139,6 +162,26 @@ struct Args {
     board: Board,
     fb_png: Option<PathBuf>,
     quantum: Option<u32>,
+    psram: bool,
+    psram_verify_range: Option<(u32, u32)>,
+}
+
+/// Parse a `start:len` range, e.g. `0:10000` or `0x100:0x2000` (either
+/// side may be hex with a `0x` prefix, or plain decimal).
+fn parse_range(raw: &str) -> Result<(u32, u32), String> {
+    let (start_raw, len_raw) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("invalid range '{raw}' (expected START:LEN)"))?;
+    let parse_num = |s: &str| -> Result<u32, String> {
+        let digits = s.trim_start_matches("0x").trim_start_matches("0X");
+        if digits.len() != s.len() {
+            u32::from_str_radix(digits, 16).map_err(|e| format!("invalid hex '{s}': {e}"))
+        } else {
+            s.parse::<u32>()
+                .map_err(|e| format!("invalid number '{s}': {e}"))
+        }
+    };
+    Ok((parse_num(start_raw)?, parse_num(len_raw)?))
 }
 
 fn print_usage() {
@@ -167,7 +210,17 @@ fn print_usage() {
                                   Requires --board picocalc.\n\
          --quantum <N>            Master-clock cycles per step. Overrides the default\n\
                                   ({QUANTUM_FREE_RUN} free-run, {QUANTUM_BOARD} with a board,\n\
-                                  {QUANTUM_PC_WATCH} with --stop-pc).\n\
+                                  {QUANTUM_PC_WATCH} with --stop-pc, {QUANTUM_PSRAM} with --psram).\n\
+         --psram                  Attach the off-chip SPI PSRAM (APS6404L, 8 MiB) wired the\n\
+                                  way PicoCalc solders it (CS=GP20, SCK=GP21, MOSI=GP2,\n\
+                                  MISO=GP3). Works with or without --board picocalc. Forces\n\
+                                  a 1-cycle step quantum (see --quantum) unless overridden.\n\
+         --psram-verify-range <START:LEN>\n\
+                                  After the run, check PSRAM buffer bytes [START, START+LEN)\n\
+                                  against the `addr & 0xFF` pattern picocalc_helloworld's\n\
+                                  psram_test() writes, and report matched/mismatched counts.\n\
+                                  START/LEN accept hex (0x-prefixed) or decimal. Requires\n\
+                                  --psram.\n\
          -h, --help               This message."
     );
 }
@@ -184,6 +237,8 @@ fn parse_args() -> Result<Args, String> {
     let mut board = Board::None;
     let mut fb_png: Option<PathBuf> = None;
     let mut quantum: Option<u32> = None;
+    let mut psram = false;
+    let mut psram_verify_range: Option<(u32, u32)> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -229,6 +284,11 @@ fn parse_args() -> Result<Args, String> {
                 }
                 quantum = Some(n);
             }
+            "--psram" => psram = true,
+            "--psram-verify-range" => {
+                let raw = value("--psram-verify-range")?;
+                psram_verify_range = Some(parse_range(&raw)?);
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -240,6 +300,9 @@ fn parse_args() -> Result<Args, String> {
 
     if fb_png.is_some() && board != Board::PicoCalc {
         return Err("--fb-png requires --board picocalc".to_string());
+    }
+    if psram_verify_range.is_some() && !psram {
+        return Err("--psram-verify-range requires --psram".to_string());
     }
 
     Ok(Args {
@@ -253,6 +316,8 @@ fn parse_args() -> Result<Args, String> {
         board,
         fb_png,
         quantum,
+        psram,
+        psram_verify_range,
     })
 }
 
@@ -350,14 +415,21 @@ fn boot(
     bootrom: &[u8],
     step_quantum: u32,
     board: Board,
+    psram: bool,
 ) -> Result<(Emulator, BootMode, Option<Arc<Mutex<St7365p>>>), String> {
-    let mut emu = EmulatorBuilder::new(Config {
+    let mut builder = EmulatorBuilder::new(Config {
         sys_clk_hz: DEFAULT_SYS_CLK_HZ,
     })
     .step_quantum(step_quantum)
-    .flash(firmware)
-    .build()
-    .expect("Serial build is infallible");
+    .flash(firmware);
+
+    // PSRAM attaches independently of `--board` — PicoCalc's PSRAM is
+    // wired to pio1 regardless of whether the LCD model is present.
+    if psram {
+        builder = builder.psram(pins::psram_picocalc());
+    }
+
+    let mut emu = builder.build().expect("Serial build is infallible");
 
     // Board models go on before reset: `SpiRegs::reset` deliberately
     // keeps an attached device (a soldered part survives an MCU reset),
@@ -637,6 +709,109 @@ impl FramebufferReport {
     }
 }
 
+/// Result of checking a PSRAM buffer range against the `addr & 0xFF`
+/// pattern that picocalc_helloworld's `psram_test()` writes in its
+/// 8-bit pass (`main.c`: `psram_write8(psram_spi, addr, addr & 0xFF)`).
+struct PsramVerifyReport {
+    start: u32,
+    len: u32,
+    matched: u64,
+    mismatched: u64,
+    /// `(addr, expected, actual)` of the first mismatch, if any.
+    first_mismatch: Option<(u32, u8, u8)>,
+}
+
+fn verify_psram_range(buffer: &[u8], start: u32, len: u32) -> PsramVerifyReport {
+    let mut matched: u64 = 0;
+    let mut mismatched: u64 = 0;
+    let mut first_mismatch: Option<(u32, u8, u8)> = None;
+    let size = buffer.len() as u32;
+    for i in 0..len {
+        let addr = start.wrapping_add(i);
+        let off = (addr & (size - 1)) as usize;
+        let expected = (addr & 0xFF) as u8;
+        let actual = buffer[off];
+        if actual == expected {
+            matched += 1;
+        } else {
+            mismatched += 1;
+            if first_mismatch.is_none() {
+                first_mismatch = Some((addr, expected, actual));
+            }
+        }
+    }
+    PsramVerifyReport {
+        start,
+        len,
+        matched,
+        mismatched,
+        first_mismatch,
+    }
+}
+
+/// The `psram` report section.
+struct PsramReport {
+    attached: bool,
+    tick_count: u64,
+    cs_falling_count: u64,
+    bytes_written: u64,
+    bytes_read: u64,
+    cmd_write_count: u64,
+    cmd_fast_read_count: u64,
+    cmd_reset_enable_count: u64,
+    cmd_reset_count: u64,
+    cmd_unknown_count: u64,
+    verify: Option<PsramVerifyReport>,
+}
+
+impl PsramReport {
+    fn to_json(&self) -> String {
+        let mut s = String::new();
+        s.push_str("  \"psram\": {\n");
+        s.push_str(&format!("    \"attached\": {},\n", self.attached));
+        s.push_str(&format!(
+            "    \"tick_count\": {}, \"cs_falling_count\": {},\n",
+            self.tick_count, self.cs_falling_count
+        ));
+        s.push_str(&format!(
+            "    \"bytes_written\": {}, \"bytes_read\": {},\n",
+            self.bytes_written, self.bytes_read
+        ));
+        s.push_str(&format!(
+            "    \"cmd_counts\": {{\"write\": {}, \"fast_read\": {}, \"reset_enable\": {}, \
+             \"reset\": {}, \"unknown\": {}}},\n",
+            self.cmd_write_count,
+            self.cmd_fast_read_count,
+            self.cmd_reset_enable_count,
+            self.cmd_reset_count,
+            self.cmd_unknown_count
+        ));
+        s.push_str("    \"verify\": ");
+        match &self.verify {
+            None => s.push_str("null\n"),
+            Some(v) => {
+                s.push_str(&format!(
+                    "{{\"range\": \"{:#010x}:{:#x}\", \"matched\": {}, \"mismatched\": {}, \
+                     \"first_mismatch\": {}}}\n",
+                    v.start,
+                    v.len,
+                    v.matched,
+                    v.mismatched,
+                    match v.first_mismatch {
+                        Some((addr, expected, actual)) => format!(
+                            "{{\"addr\": \"{addr:#010x}\", \"expected\": \"{expected:#04x}\", \
+                             \"actual\": \"{actual:#04x}\"}}"
+                        ),
+                        None => "null".to_string(),
+                    }
+                ));
+            }
+        }
+        s.push_str("  },\n");
+        s
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_report(
     backend_commit: &str,
@@ -655,6 +830,7 @@ fn build_report(
     board: Board,
     lcd: Option<&LcdReport>,
     fb: Option<&FramebufferReport>,
+    psram: Option<&PsramReport>,
 ) -> String {
     let mut s = String::new();
     s.push_str("{\n");
@@ -739,6 +915,9 @@ fn build_report(
     if let Some(fb) = fb {
         s.push_str(&fb.to_json());
     }
+    if let Some(psram) = psram {
+        s.push_str(&psram.to_json());
+    }
 
     s.push_str(&format!(
         "  \"uart\": {{\"bytes\": {}, \"sha256\": {}}}\n",
@@ -792,16 +971,20 @@ fn run() -> Result<(), String> {
     let bootrom_sha = sha256_hex(&bootrom);
 
     // Explicit `--quantum` wins; then the `--stop-pc` single-step
-    // requirement (correctness, not a preference); then the board
-    // default; then free-run.
-    let step_quantum = match (args.quantum, args.stop_pc.is_some(), args.board) {
-        (Some(n), _, _) => n,
-        (None, true, _) => QUANTUM_PC_WATCH,
-        (None, false, Board::PicoCalc) => QUANTUM_BOARD,
-        (None, false, Board::None) => QUANTUM_FREE_RUN,
+    // requirement (correctness, not a preference); then `--psram`'s
+    // stricter 1-cycle correctness requirement (see QUANTUM_PSRAM —
+    // takes priority over the board default since it is the tighter
+    // constraint whenever both are attached); then the board default;
+    // then free-run.
+    let step_quantum = match (args.quantum, args.stop_pc.is_some(), args.psram, args.board) {
+        (Some(n), _, _, _) => n,
+        (None, true, _, _) => QUANTUM_PC_WATCH,
+        (None, false, true, _) => QUANTUM_PSRAM,
+        (None, false, false, Board::PicoCalc) => QUANTUM_BOARD,
+        (None, false, false, Board::None) => QUANTUM_FREE_RUN,
     };
 
-    let (mut emu, boot_mode, lcd) = boot(firmware, &bootrom, step_quantum, args.board)?;
+    let (mut emu, boot_mode, lcd) = boot(firmware, &bootrom, step_quantum, args.board, args.psram)?;
     emu.bus.unsupported_mmio_log_enabled = true;
 
     let outcome = run_loop(&mut emu, args.cycles, args.stop_pc);
@@ -815,6 +998,32 @@ fn run() -> Result<(), String> {
         None => (None, None),
     };
     let fb_report = build_framebuffer_report(fb.as_ref(), args.fb_png.as_deref())?;
+
+    let psram_report = if args.psram {
+        let psram = emu
+            .bus
+            .psram
+            .as_ref()
+            .expect("--psram implies bus.psram is Some");
+        let verify = args
+            .psram_verify_range
+            .map(|(start, len)| verify_psram_range(&psram.buffer[..], start, len));
+        Some(PsramReport {
+            attached: true,
+            tick_count: psram.tick_count,
+            cs_falling_count: psram.cs_falling_count,
+            bytes_written: psram.bytes_written,
+            bytes_read: psram.bytes_read,
+            cmd_write_count: psram.cmd_write_count,
+            cmd_fast_read_count: psram.cmd_fast_read_count,
+            cmd_reset_enable_count: psram.cmd_reset_enable_count,
+            cmd_reset_count: psram.cmd_reset_count,
+            cmd_unknown_count: psram.cmd_unknown_count,
+            verify,
+        })
+    } else {
+        None
+    };
 
     let unsupported = emu.bus.unsupported_mmio_log();
     let unsupported_truncated = emu.bus.unsupported_mmio_log_truncated();
@@ -848,6 +1057,7 @@ fn run() -> Result<(), String> {
         args.board,
         lcd_report.as_ref(),
         fb_report.as_ref(),
+        psram_report.as_ref(),
     );
 
     match &args.json {

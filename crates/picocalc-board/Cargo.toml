@@ -14,6 +14,9 @@ workspace = true
 
 [dependencies]
 rp2040-emu = { path = "../rp2040-emu" }
+# Off-chip PSRAM model (APS6404L). PicoCalc-specific pin wiring lives in
+# this crate (`pins::psram_picocalc`); the model itself is board-agnostic.
+picoem-devices = { path = "../picoem-devices" }
 # Deterministic PNG output: `png` writes IHDR/IDAT/IEND only — no tIME
 # chunk, no encoder banner — so the same framebuffer always produces the
 # same file. Version pinned by Cargo.lock (plan Gate 2 §5).

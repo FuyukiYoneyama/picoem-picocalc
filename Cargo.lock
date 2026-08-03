@@ -1839,6 +1839,7 @@ dependencies = [
 name = "picocalc-board"
 version = "0.1.0"
 dependencies = [
+ "picoem-devices",
  "png",
  "rp2040-emu",
 ]

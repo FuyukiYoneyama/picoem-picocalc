@@ -1914,6 +1914,21 @@ impl Bus {
             && self.pio[1].pending_irqs() == 0
     }
 
+    /// True iff some off-chip device wired to `update_gpio`'s merge
+    /// needs to observe *every* SCK/CS/etc. pad edge, not just the
+    /// quantum-end snapshot.
+    ///
+    /// `Emulator::step_serial`'s slow path uses this to decide whether
+    /// the PIO+GPIO merge for the current quantum must run one system
+    /// cycle at a time (see that function's docs). Currently PSRAM is
+    /// the only such device, but the predicate is named generically so
+    /// a future PIO-driven off-chip model (e.g. a second SPI PSRAM, an
+    /// I2S codec) can opt in without another call-site change.
+    #[inline]
+    pub fn has_pin_watching_device(&self) -> bool {
+        self.psram.is_some()
+    }
+
     /// Collect the current DREQ (data-request) bitmap for all 64 TREQ
     /// sources + the FORCE sentinel at bit 63.
     ///

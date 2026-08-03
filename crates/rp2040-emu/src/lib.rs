@@ -581,13 +581,23 @@ impl Emulator {
     ///    one clock on real silicon.
     ///
     /// The loop exits when `clock.cycles >= target` or both cores are
-    /// halted. Then advance PIO and the GPIO/PSRAM merge **one system
-    /// cycle at a time** for each consumed cycle — so PIO-driven SPI
-    /// programs (which toggle SCK every 1–2 sysclks) present every edge
-    /// to the off-chip PSRAM model. A bulk `tick_pio(consumed)` followed
-    /// by a single `update_gpio()` would let SCK/CS edges slip between
-    /// the start and end of the quantum — the PSRAM would only ever see
-    /// the quantum's final pin snapshot.
+    /// halted. Then advance PIO and the GPIO/PSRAM merge. On the slow
+    /// branch (see below), this runs **one system cycle at a time** —
+    /// but *only* when a PIO-driven pin-watching off-chip device is
+    /// actually attached (`Bus::has_pin_watching_device`, currently just
+    /// PSRAM) and PIO is active and the quantum consumed more than one
+    /// cycle. PIO-driven SPI programs toggle SCK every 1–2 sysclks, and
+    /// `tick_pio_and_route_irqs` takes a single static `bus.gpio_in`
+    /// snapshot for its entire `cycles` argument — so a bulk
+    /// `tick_pio_and_route_irqs(consumed)` followed by one
+    /// `update_gpio()` would let every SCK/CS edge inside the quantum go
+    /// unobserved by the off-chip model until the quantum boundary (the
+    /// PSRAM would only ever see the quantum's final pin snapshot, and a
+    /// real firmware's byte framing would desync — this was an actual
+    /// bug: see `wrk_journals` Gate 3 PSRAM PIO-integration diagnosis).
+    /// Looping `tick_pio_and_route_irqs(1) + update_gpio()` `consumed`
+    /// times keeps every edge synchronous with `Psram::tick`, at the
+    /// cost of `consumed` `update_gpio` calls instead of one.
     ///
     /// Fast-path: when both PIO blocks have no SM enabled, no GPIO pin
     /// can change during this peripheral-tick window (SIO writes only
@@ -597,6 +607,13 @@ impl Emulator {
     /// suffices. This preserves paced_bench_rp2040's throughput on
     /// pure-ALU workloads (no PIO activity), which would otherwise pay
     /// a per-cycle `update_gpio` tax for nothing.
+    ///
+    /// Slow-path without a pin-watching device attached (e.g. a board
+    /// with PIO active but no PSRAM): still one bulk call per quantum,
+    /// same as before this fix — no off-chip model depends on
+    /// sub-quantum edges, so there is nothing to preserve and no reason
+    /// to pay the per-cycle cost. This is what keeps existing
+    /// (PSRAM-less) workloads' performance and behaviour unchanged.
     ///
     /// Core 1 halted ⇒ PIO may still be ticking (e.g. SPI PSRAM on core
     /// 0), so the per-cycle loop runs regardless of core-halt state.
@@ -798,14 +815,38 @@ impl Emulator {
             // window's end-of-quantum cycle. SysTick advances per-core
             // by each core's actual consumed cycle count (mirrors M0+
             // hardware: SysTick is per-core, decremented on the cycles
-            // the owning core consumes — see §5.2.3). PIO and IRQ drain
-            // run once at quantum end; net IRQ-delivery latency grows
-            // from ≤1 cycle to ≤step_quantum-1 cycles (see §5.4).
+            // the owning core consumes — see §5.2.3).
             self.bus.master_cycle = self.bus.master_cycle.wrapping_add(consumed);
             self.bus.tick_peripherals(consumed as u32);
             self.tick_systick(c0_total as u32, c1_total as u32);
-            self.tick_pio_and_route_irqs(consumed as u32);
-            self.update_gpio();
+            // PIO + GPIO merge: per the fn docstring, a PIO-driven off-chip
+            // device (currently only PSRAM — `Bus::has_pin_watching_device`)
+            // needs every SCK/CS edge, not just the quantum-end pad
+            // snapshot. `tick_pio_and_route_irqs` takes one static
+            // `bus.gpio_in` read at its top and reuses it for the entire
+            // `cycles` argument, so a bulk call here would let every edge
+            // inside a `consumed > 1` quantum go unobserved by
+            // `update_gpio` (which is what feeds `Psram::tick`) until the
+            // quantum boundary — exactly the failure this branch's old
+            // bulk-call implementation had despite the docstring above
+            // promising per-cycle interleave. Loop one system cycle at a
+            // time only when it can matter (PIO active, quantum > 1, and
+            // a pin-watching device is actually attached); otherwise keep
+            // the single bulk call so PSRAM-less workloads (the common
+            // case) pay no extra cost. IRQ and drain semantics are
+            // unchanged either way — net IRQ-delivery latency still grows
+            // from ≤1 cycle to ≤step_quantum-1 cycles in the bulk case
+            // (see §5.4); the per-cycle case delivers at ≤1 cycle same as
+            // the fast path, as a side effect of the finer granularity.
+            if !pio_idle && consumed > 1 && self.bus.has_pin_watching_device() {
+                for _ in 0..consumed {
+                    self.tick_pio_and_route_irqs(1);
+                    self.update_gpio();
+                }
+            } else {
+                self.tick_pio_and_route_irqs(consumed as u32);
+                self.update_gpio();
+            }
             self.drain_pending_irqs_to_cores();
         }
         self.wake_checks();
@@ -866,7 +907,11 @@ impl Emulator {
     /// enables `RXNEMPTY_SM0` on PIO0 INT0_INTE so its ISA handler
     /// fires when an autopushed event lands in PIO0 SM0's RX FIFO.
     ///
-    /// Per HLD 2026.04.26 V5 §5.1: chunked once-per-quantum.
+    /// Per HLD 2026.04.26 V5 §5.1: chunked once-per-quantum on the
+    /// common (no pin-watching device) slow-path call site. The
+    /// PSRAM-aware slow-path branch instead calls this with `cycles=1`
+    /// in a loop, `consumed` times, so every SCK/CS edge gets its own
+    /// `bus.gpio_in` snapshot — see `step_serial`'s docstring.
     fn tick_pio_and_route_irqs(&mut self, cycles: u32) {
         let gpio_in = self.bus.gpio_in;
         // Diagnostic counters bump by `cycles` (per-quantum granularity is

@@ -29,6 +29,30 @@
 //! * The PSRAM drives MISO on SCK falling edge; we update the MISO latch
 //!   on falling edges so it's stable for the master to sample on the next
 //!   rising edge.
+//!
+//! # Fast Read output-start delay (`read_output_delay_sck`)
+//!
+//! The real APS6404L needs one extra SCK cycle after the dummy phase
+//! before its output driver has settled — `rp2040-psram`'s
+//! `psram_spi.pio` documents this on the chip vendor's own authority:
+//! the `spi_psram_fudge` program's comment on its extra `nop` states
+//! plainly "the PSRAM needs 1 extra \[clock\] for output to start
+//! appearing". Firmware that selects the *non-fudge* `spi_psram`
+//! program (or drives Fast Read by hand without that settling
+//! allowance) does not need this — hence it is a per-instance,
+//! opt-in delay (`with_read_output_delay`), not a change to the
+//! default protocol timing. Default `0` reproduces the original
+//! "ideal chip" behaviour byte-for-byte (see the `psram::tests`
+//! module — every pre-existing test keeps passing unmodified).
+//!
+//! With a non-zero delay, the model still latches the read byte off
+//! `buffer` immediately when the dummy phase ends (there is no
+//! externally observable effect from *when* we peek the buffer, only
+//! from when we start driving MISO), but withholds `driving_miso`
+//! for that many SCK falling edges, presenting a deterministic `0`
+//! bit while it does — matching the existing dummy-phase convention
+//! ("don't-care in the real chip, but deterministic here") rather
+//! than leaking stale state from a previous frame.
 
 /// PSRAM size: 8 MiB, as on PicoGUS v2 hardware.
 pub const PSRAM_SIZE: usize = 8 << 20;
@@ -120,6 +144,40 @@ pub struct Psram {
     /// Number of CS# falling edges observed (start of an SPI frame).
     /// A non-zero value means the master attempted at least one frame.
     pub cs_falling_count: u64,
+
+    /// Command-byte decode counters — observation-only, do not affect
+    /// protocol behaviour. Added to diagnose real-PIO integrations
+    /// (as opposed to the hand-driven unit tests below, which always
+    /// present a clean bit stream): a real master's frame can open and
+    /// close `cs_falling_count` times without ever landing a byte in
+    /// `bytes_written` if every command byte is being decoded as
+    /// something other than `0x02`/`0x0B` — these counters make that
+    /// distinguishable from "frames never open" or "buffer writes are
+    /// silently dropped".
+    pub cmd_write_count: u64,
+    pub cmd_fast_read_count: u64,
+    pub cmd_reset_enable_count: u64,
+    pub cmd_reset_count: u64,
+    /// Any command byte other than `0x66`/`0x99`/`0x02`/`0x0B`.
+    pub cmd_unknown_count: u64,
+
+    /// Number of SCK falling edges to withhold `driving_miso` for
+    /// after the Fast Read dummy phase ends, before the real first
+    /// data bit is presented. `0` (default) is the original
+    /// zero-delay "ideal chip" behaviour. See the module-level
+    /// "Fast Read output-start delay" docs. Set via
+    /// [`Self::with_read_output_delay`].
+    read_output_delay_sck: u8,
+    /// Countdown of remaining withheld falling edges for the *current*
+    /// Fast Read data phase. Set from `read_output_delay_sck` when
+    /// `ReadDummy` completes; reaching 0 flips `driving_miso` on but
+    /// does not itself pop a bit — the pop still needs its own
+    /// falling edge, which is exactly the "1 extra SCK" the real chip
+    /// needs. Only ever primed once per frame (at the dummy→data
+    /// transition), never re-armed between subsequent bytes of a
+    /// multi-byte burst read — the real chip's output driver, once
+    /// settled, keeps driving continuously.
+    read_delay_remaining: u8,
 }
 
 impl Psram {
@@ -156,6 +214,13 @@ impl Psram {
             bytes_read: 0,
             tick_count: 0,
             cs_falling_count: 0,
+            cmd_write_count: 0,
+            cmd_fast_read_count: 0,
+            cmd_reset_enable_count: 0,
+            cmd_reset_count: 0,
+            cmd_unknown_count: 0,
+            read_output_delay_sck: 0,
+            read_delay_remaining: 0,
         }
     }
 
@@ -163,6 +228,17 @@ impl Psram {
     /// MISO=GPIO0, CS=GPIO1, SCK=GPIO2, MOSI=GPIO3.
     pub fn picogus() -> Self {
         Self::new(0, 1, 2, 3)
+    }
+
+    /// Builder-style setter: withhold Fast Read's `driving_miso` for
+    /// `sck` extra SCK falling edges after the dummy phase, modelling
+    /// the real chip's output-settling delay (see the module-level
+    /// "Fast Read output-start delay" docs). `0` (the default from
+    /// [`Self::new`]) is a no-op — every existing caller and test is
+    /// unaffected unless it opts in.
+    pub fn with_read_output_delay(mut self, sck: u8) -> Self {
+        self.read_output_delay_sck = sck;
+        self
     }
 
     /// GPIO pin number for MISO.
@@ -199,6 +275,7 @@ impl Psram {
         self.latched_mosi = false;
         self.miso_bit = false;
         self.driving_miso = false;
+        self.read_delay_remaining = 0;
     }
 
     /// Observe the current GPIO pin state. Call on every emulator tick
@@ -265,6 +342,7 @@ impl Psram {
         self.addr = 0;
         self.driving_miso = false;
         self.miso_bit = false;
+        self.read_delay_remaining = 0;
     }
 
     fn end_frame(&mut self) {
@@ -279,6 +357,7 @@ impl Psram {
         self.shift_out_bits = 0;
         self.driving_miso = false;
         self.miso_bit = false;
+        self.read_delay_remaining = 0;
     }
 
     // --- Clock-edge handlers -------------------------------------------------
@@ -296,6 +375,25 @@ impl Psram {
     }
 
     fn on_sck_falling(&mut self) {
+        // Fast Read output-start delay (see module docs): withhold the
+        // real pop for `read_delay_remaining` falling edges after the
+        // dummy phase ends. Reaching 0 turns `driving_miso` on — the
+        // chip's output has "started appearing" — but does not itself
+        // pop a bit; the first real bit still needs its own falling
+        // edge, same as every other bit. `miso_bit` is forced to a
+        // deterministic `0` for the transition edge rather than left
+        // as whatever it last held, so this window reads the same as
+        // the pre-existing "don't-care but deterministic" dummy-phase
+        // convention, not leftover state from a prior byte/frame.
+        if self.read_delay_remaining > 0 {
+            self.read_delay_remaining -= 1;
+            if self.read_delay_remaining == 0 {
+                self.driving_miso = true;
+                self.miso_bit = false;
+            }
+            return;
+        }
+
         // On falling edge, the PSRAM latches out the next MISO bit.
         // This happens *after* the master has sampled the previous bit
         // on the last rising edge.
@@ -326,9 +424,15 @@ impl Psram {
             Phase::ReadAddr => self.handle_addr_byte(byte, /*is_read=*/ true),
             Phase::ReadDummy => {
                 // One byte of dummy cycles — accept and advance. We don't
-                // care what the MOSI bits are.
+                // care what the MOSI bits are. Loading the byte to shift
+                // out happens immediately regardless of
+                // `read_output_delay_sck` (there's no externally
+                // observable effect from *when* we peek `buffer`, only
+                // from when `driving_miso` turns on) — see
+                // `on_sck_falling` for the actual delay mechanics.
                 self.phase = Phase::ReadData;
-                self.driving_miso = true;
+                self.read_delay_remaining = self.read_output_delay_sck;
+                self.driving_miso = self.read_delay_remaining == 0;
                 self.advance_read_byte();
             }
             Phase::ReadData => {
@@ -345,6 +449,7 @@ impl Psram {
     fn handle_command(&mut self, byte: u8) {
         match byte {
             CMD_RESET_ENABLE => {
+                self.cmd_reset_enable_count += 1;
                 self.reset_armed = true;
                 // Command complete; frame continues until CS rises. Any
                 // further bytes inside this frame are ignored (treat as
@@ -353,6 +458,7 @@ impl Psram {
                 self.phase = Phase::SilentNop;
             }
             CMD_RESET => {
+                self.cmd_reset_count += 1;
                 if self.reset_armed {
                     // Reset the state machine — clears the in-progress
                     // phase but preserves buffer. `reset_state()` also
@@ -365,12 +471,14 @@ impl Psram {
                 }
             }
             CMD_WRITE => {
+                self.cmd_write_count += 1;
                 self.reset_armed = false;
                 self.phase = Phase::WriteAddr;
                 self.addr_bytes_seen = 0;
                 self.addr = 0;
             }
             CMD_FAST_READ => {
+                self.cmd_fast_read_count += 1;
                 self.reset_armed = false;
                 self.phase = Phase::ReadAddr;
                 self.addr_bytes_seen = 0;
@@ -378,6 +486,7 @@ impl Psram {
             }
             _ => {
                 // Unknown command — silent nop for the rest of the frame.
+                self.cmd_unknown_count += 1;
                 self.reset_armed = false;
                 self.phase = Phase::SilentNop;
             }
@@ -468,6 +577,34 @@ mod tests {
         out
     }
 
+    /// Clock one bit continuously — no trailing "drop SCK" reset
+    /// between calls, unlike [`clock_byte`]. Needed to test
+    /// `read_output_delay_sck`: a delay-sensitive assertion must land
+    /// on real per-bit falling-edge boundaries, and `clock_byte`'s
+    /// trailing low tick after every byte would itself consume one
+    /// falling edge — silently absorbing the very delay the test is
+    /// trying to observe if it were used across the dummy→data
+    /// boundary.
+    fn clock_bit(psram: &mut Psram, pins: &mut u32, mosi_bit: bool) -> bool {
+        *pins = (*pins & !(1 << PIN_MOSI)) | ((mosi_bit as u32) << PIN_MOSI);
+        *pins &= !(1 << PIN_SCK);
+        let _ = psram.tick(*pins);
+        *pins |= 1 << PIN_SCK;
+        psram.tick(*pins).unwrap_or(false)
+    }
+
+    /// One MSB-first byte via [`clock_bit`], continuously (no gap
+    /// before/after relative to neighbouring calls).
+    fn clock_byte_continuous(psram: &mut Psram, pins: &mut u32, byte: u8) -> u8 {
+        let mut out = 0u8;
+        for i in 0..8 {
+            let bit = (byte >> (7 - i)) & 1 != 0;
+            let sample = clock_bit(psram, pins, bit);
+            out = (out << 1) | (sample as u8);
+        }
+        out
+    }
+
     /// Drive CS low to open a frame.
     fn cs_fall(psram: &mut Psram, pins: &mut u32) {
         *pins &= !(1 << PIN_CS);
@@ -543,6 +680,61 @@ mod tests {
         cs_rise(&mut psram, &mut pins);
         assert_eq!(&psram.buffer[0x10..0x14], &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(psram.bytes_written(), 4);
+        assert_eq!(psram.cmd_write_count, 1);
+        assert_eq!(psram.cmd_fast_read_count, 0);
+        assert_eq!(psram.cmd_unknown_count, 0);
+    }
+
+    /// Observation-only command-decode counters (added for Gate 3 PSRAM
+    /// PIO-integration diagnostics) must tally each command byte
+    /// exactly once per frame, and must not perturb existing protocol
+    /// behaviour (buffer contents / `bytes_written` unaffected).
+    #[test]
+    fn cmd_decode_counters_tally_each_command_byte() {
+        let (mut psram, mut pins) = fresh();
+
+        cs_fall(&mut psram, &mut pins);
+        clock_byte(&mut psram, &mut pins, 0x66); // Reset Enable
+        cs_rise(&mut psram, &mut pins);
+        assert_eq!(psram.cmd_reset_enable_count, 1);
+
+        cs_fall(&mut psram, &mut pins);
+        clock_byte(&mut psram, &mut pins, 0x99); // Reset
+        cs_rise(&mut psram, &mut pins);
+        assert_eq!(psram.cmd_reset_count, 1);
+
+        cs_fall(&mut psram, &mut pins);
+        clock_byte(&mut psram, &mut pins, 0x02); // WRITE
+        clock_byte(&mut psram, &mut pins, 0x00);
+        clock_byte(&mut psram, &mut pins, 0x00);
+        clock_byte(&mut psram, &mut pins, 0x00);
+        clock_byte(&mut psram, &mut pins, 0xAB);
+        cs_rise(&mut psram, &mut pins);
+        assert_eq!(psram.cmd_write_count, 1);
+        assert_eq!(psram.buffer[0x00], 0xAB, "counters must not change behaviour");
+
+        cs_fall(&mut psram, &mut pins);
+        clock_byte(&mut psram, &mut pins, 0x0B); // Fast Read
+        clock_byte(&mut psram, &mut pins, 0x00);
+        clock_byte(&mut psram, &mut pins, 0x00);
+        clock_byte(&mut psram, &mut pins, 0x00);
+        clock_byte(&mut psram, &mut pins, 0x00); // dummy
+        let _ = clock_byte(&mut psram, &mut pins, 0x00);
+        cs_rise(&mut psram, &mut pins);
+        assert_eq!(psram.cmd_fast_read_count, 1);
+
+        cs_fall(&mut psram, &mut pins);
+        clock_byte(&mut psram, &mut pins, 0x9F); // unrecognised (READ-ID)
+        cs_rise(&mut psram, &mut pins);
+        assert_eq!(psram.cmd_unknown_count, 1);
+
+        // Every counter reflects exactly one occurrence — none double
+        // counted, none cross-contaminated.
+        assert_eq!(psram.cmd_reset_enable_count, 1);
+        assert_eq!(psram.cmd_reset_count, 1);
+        assert_eq!(psram.cmd_write_count, 1);
+        assert_eq!(psram.cmd_fast_read_count, 1);
+        assert_eq!(psram.cmd_unknown_count, 1);
     }
 
     #[test]
@@ -704,5 +896,90 @@ mod tests {
             assert!(drive.is_none());
         }
         assert!(psram.phase_is_idle());
+    }
+
+    /// `read_output_delay_sck` (Sol's approved fix for Gate 3's read-path
+    /// bug): `0` (default) must reproduce the original zero-delay
+    /// stream exactly; `1` must shift the *entire* Fast Read output
+    /// stream later by exactly one bit — a deterministic `0` inserted
+    /// at the front, with the original stream's last bit falling off
+    /// the end of however many bits are sampled. This is the
+    /// "1 SCK for output to start appearing" the `spi_psram_fudge` PIO
+    /// program's own comment documents, modelled as a pure output-timing
+    /// shift rather than any change to command/address decoding.
+    #[test]
+    fn read_output_delay_shifts_fast_read_stream_by_one_bit() {
+        let addr: u32 = 0x30;
+        let byte0 = 0xABu8;
+        let byte1 = 0xCDu8;
+
+        let mut psram0 = Psram::picogus(); // delay = 0 (default)
+        psram0.buffer[addr as usize] = byte0;
+        psram0.buffer[addr as usize + 1] = byte1;
+
+        let mut psram1 = Psram::picogus().with_read_output_delay(1);
+        psram1.buffer[addr as usize] = byte0;
+        psram1.buffer[addr as usize + 1] = byte1;
+
+        // Drive an identical Fast Read frame into both instances,
+        // continuously clocked (no gap between bytes — see
+        // `clock_bit`'s doc comment for why that matters here), then
+        // read 2 data bytes back.
+        fn drive_fast_read(psram: &mut Psram, addr: u32) -> (u8, u8) {
+            let mut pins = 1u32 << PIN_CS;
+            cs_fall(psram, &mut pins);
+            clock_byte_continuous(psram, &mut pins, 0x0B); // Fast Read
+            clock_byte_continuous(psram, &mut pins, (addr >> 16) as u8);
+            clock_byte_continuous(psram, &mut pins, (addr >> 8) as u8);
+            clock_byte_continuous(psram, &mut pins, addr as u8);
+            clock_byte_continuous(psram, &mut pins, 0x00); // dummy
+            let b0 = clock_byte_continuous(psram, &mut pins, 0x00);
+            let b1 = clock_byte_continuous(psram, &mut pins, 0x00);
+            cs_rise(psram, &mut pins);
+            (b0, b1)
+        }
+
+        let delay0 = drive_fast_read(&mut psram0, addr);
+        assert_eq!(
+            delay0,
+            (byte0, byte1),
+            "delay=0 must reproduce the original, unshifted behaviour — \
+             regression guard for the (unchanged) default"
+        );
+
+        let delay1 = drive_fast_read(&mut psram1, addr);
+        let expected_stream: u16 = ((byte0 as u16) << 8) | (byte1 as u16);
+        let shifted: u16 = expected_stream >> 1; // 0-fill MSB, drop trailing LSB
+        let expected = ((shifted >> 8) as u8, shifted as u8);
+        assert_eq!(
+            delay1, expected,
+            "delay=1 must shift the entire output stream later by \
+             exactly one bit"
+        );
+        assert_ne!(
+            delay1,
+            (byte0, byte1),
+            "sanity: the delayed read must actually differ from the \
+             undelayed one for this data"
+        );
+    }
+
+    /// `with_read_output_delay` must not perturb command/address
+    /// decoding or the write path — only Fast Read's output timing.
+    #[test]
+    fn read_output_delay_does_not_affect_write_path() {
+        let mut psram = Psram::picogus().with_read_output_delay(1);
+        let mut pins = 1u32 << PIN_CS;
+        cs_fall(&mut psram, &mut pins);
+        clock_byte(&mut psram, &mut pins, 0x02); // WRITE
+        clock_byte(&mut psram, &mut pins, 0x00);
+        clock_byte(&mut psram, &mut pins, 0x00);
+        clock_byte(&mut psram, &mut pins, 0x10);
+        clock_byte(&mut psram, &mut pins, 0x77);
+        cs_rise(&mut psram, &mut pins);
+
+        assert_eq!(psram.buffer[0x10], 0x77);
+        assert_eq!(psram.bytes_written(), 1);
+        assert_eq!(psram.cmd_write_count, 1);
     }
 }

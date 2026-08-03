@@ -58,3 +58,63 @@ pub const VIEWPORT_HEIGHT: usize = 320;
 pub const fn level(levels: u32, pin: u8) -> bool {
     (levels >> pin) & 1 != 0
 }
+
+/// PicoCalc off-chip SPI PSRAM (APS6404L, 8 MiB) wiring.
+///
+/// Transcribed from ClockworkPi's official
+/// `picocalc_helloworld/CMakeLists.txt`:
+///
+/// ```text
+/// target_compile_definitions(picocalc_helloworld PRIVATE
+///     PSRAM_MUTEX=1
+///     PSRAM_ASYNC=0
+///     PSRAM_PIN_CS=20
+///     PSRAM_PIN_SCK=21
+///     PSRAM_PIN_MOSI=2
+///     PSRAM_PIN_MISO=3
+/// )
+/// ```
+///
+/// `main.c` drives the PSRAM over `pio1` via
+/// `psram_spi_init_clkdiv(pio1, -1, 1.0f, true)` — the `true` fourth
+/// argument selects `rp2040-psram`'s `spi_psram_fudge` PIO program (not
+/// the plain `spi_psram` program). See the `picoem-devices::psram`
+/// module docs for how the emulator-side model's falling/rising edge
+/// convention interacts with this choice, and [`psram_picocalc`]'s doc
+/// comment for why that program requires a 1-SCK Fast Read output
+/// delay on this board.
+/// Chip select, active low. `PSRAM_PIN_CS`.
+pub const PSRAM_PIN_CS: u8 = 20;
+/// Serial clock, driven by `pio1`. `PSRAM_PIN_SCK`.
+pub const PSRAM_PIN_SCK: u8 = 21;
+/// Controller → chip data (MOSI). `PSRAM_PIN_MOSI`.
+pub const PSRAM_PIN_MOSI: u8 = 2;
+/// Chip → controller data (MISO). `PSRAM_PIN_MISO`.
+pub const PSRAM_PIN_MISO: u8 = 3;
+
+/// Build a [`picoem_devices::Psram`] wired the way PicoCalc solders it
+/// (CS=GP20, SCK=GP21, MOSI=GP2, MISO=GP3). `Psram::new`'s parameter
+/// order is `(miso, cs, sck, mosi)` — this helper exists so call sites
+/// never have to remember that ordering or repeat the raw pin numbers.
+///
+/// Configured with `read_output_delay_sck = 1`. `main.c` selects the
+/// `spi_psram_fudge` PIO program (see [`PSRAM_PIN_CS`]'s doc comment),
+/// and `rp2040-psram`'s `psram_spi.pio` documents — on the chip
+/// vendor's own authority — exactly why that program needs it, in the
+/// comment on its extra `nop` before the read loop:
+///
+/// ```text
+/// nop  side 0b10  ; Fudge factor of extra clock cycle; the PSRAM
+///                 ; needs 1 extra for output to start appearing
+/// ```
+///
+/// This is PicoCalc-specific only in the sense that PicoCalc's
+/// firmware happens to select the fudge program; the delay itself is
+/// a property of the real APS6404L chip's output settling time, not
+/// of this board's wiring. A future board whose firmware selects the
+/// plain (non-fudge) `spi_psram` program should build its `Psram` with
+/// the default (`read_output_delay_sck = 0`) instead.
+pub fn psram_picocalc() -> picoem_devices::Psram {
+    picoem_devices::Psram::new(PSRAM_PIN_MISO, PSRAM_PIN_CS, PSRAM_PIN_SCK, PSRAM_PIN_MOSI)
+        .with_read_output_delay(1)
+}
