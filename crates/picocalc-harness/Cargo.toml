@@ -1,0 +1,23 @@
+[package]
+name = "picocalc-harness"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Internal harness crate for the PicoCalc firmware-conformance work
+# (picocalc_emu Milestone 1). Path-only dep on `rp2040-emu`; not
+# publishable in its current form.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Serial execution model only — the PicoCalc conformance track uses
+# Serial as the correctness reference (see picocalc_emu
+# docs/IMPLEMENTATION_PLAN.md §3.1). No `threading` feature.
+rp2040-emu = { path = "../rp2040-emu" }
+
+[[bin]]
+name = "picocalc-run"
+path = "src/main.rs"

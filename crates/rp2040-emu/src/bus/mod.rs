@@ -283,6 +283,13 @@ pub mod invalidation_regions {
     pub const BULK: u8 = 1 << 7;
 }
 
+/// Maximum number of distinct `(addr, pc)` pairs retained by the
+/// opt-in unsupported-MMIO accumulator (`Bus::unsupported_mmio_log`).
+/// Bounds harness memory for firmware that faults across a wide
+/// address window; occurrence counts for already-recorded pairs keep
+/// accumulating past the cap.
+pub const UNSUPPORTED_MMIO_LOG_CAP: usize = 4096;
+
 /// RP2040 AHB-Lite bus fabric.
 pub struct Bus {
     pub memory: Memory,
@@ -443,6 +450,24 @@ pub struct Bus {
     /// [`Self::mmio_trace_sink`] (defaults to stdout when `None`). Zero overhead
     /// when `false` — the hot path short-circuits before any formatting.
     pub mmio_trace_enabled: bool,
+    /// Unsupported-MMIO observation toggle (headless firmware runner,
+    /// `picocalc-harness`). When `true`, every [`Self::set_bus_fault`]
+    /// — the single funnel for accesses that hit no decoded region —
+    /// records `(addr, active_pc)` into [`Self::unsupported_mmio_log`]
+    /// with an occurrence count. Purely observational: the emulated
+    /// program sees exactly the same bus behaviour either way (the
+    /// fault is still sticky, still escalates to HardFault in
+    /// `CortexM0Plus::step`). Zero cost when `false`.
+    ///
+    /// Coverage note: this records accesses to *undecoded* addresses.
+    /// A peripheral that is decoded but only partially modelled does
+    /// not fault and therefore does not appear here — use
+    /// `mmio_trace_enabled` for the full access log.
+    pub unsupported_mmio_log_enabled: bool,
+    /// `(addr, pc) -> count` accumulator filled while
+    /// [`Self::unsupported_mmio_log_enabled`] is set. Read back with
+    /// [`Self::unsupported_mmio_log`] (sorted, deterministic).
+    unsupported_mmio_log: HashMap<(u32, u32), u64>,
     /// Per-core, per-instruction PC snapshot. Indexed by `active_core`
     /// so that a scheduler switch (`set_active_core(0→1→0)`) does not
     /// alias one core's decode PC onto the other. Set by the core's
@@ -524,6 +549,8 @@ impl Bus {
             core0_bank_touched: 0,
             contention_check_active: false,
             mmio_trace_enabled: false,
+            unsupported_mmio_log_enabled: false,
+            unsupported_mmio_log: HashMap::new(),
             active_pc: [0; 2],
             mmio_trace_sink: None,
             // 16 entries up front — STM tops out at 13 registers; 16
@@ -686,8 +713,50 @@ impl Bus {
     #[inline]
     fn set_bus_fault(&mut self, addr: u32) {
         debug!(addr = format_args!("{:#010x}", addr), "unmapped bus access");
+        if self.unsupported_mmio_log_enabled {
+            self.record_unsupported_mmio(addr);
+        }
         self.bus_fault = true;
         self.bus_fault_addr = addr;
+    }
+
+    /// Cold-path accumulator for [`Self::unsupported_mmio_log`]. Split
+    /// out of `set_bus_fault` so the disabled path stays a single
+    /// predictable branch. Capped at [`UNSUPPORTED_MMIO_LOG_CAP`]
+    /// distinct `(addr, pc)` pairs — a firmware faulting in a tight
+    /// loop over a large address window must not grow the map without
+    /// bound. Counts for already-known pairs keep accumulating after
+    /// the cap is hit.
+    #[inline(never)]
+    #[cold]
+    fn record_unsupported_mmio(&mut self, addr: u32) {
+        let pc = self.active_pc[self.active_core];
+        let key = (addr, pc);
+        if let Some(count) = self.unsupported_mmio_log.get_mut(&key) {
+            *count = count.saturating_add(1);
+        } else if self.unsupported_mmio_log.len() < UNSUPPORTED_MMIO_LOG_CAP {
+            self.unsupported_mmio_log.insert(key, 1);
+        }
+    }
+
+    /// Snapshot of the unsupported-MMIO accumulator as
+    /// `(addr, pc, count)`, sorted by `(addr, pc)` so repeated runs of
+    /// the same firmware produce byte-identical reports. Empty unless
+    /// [`Self::unsupported_mmio_log_enabled`] was set during the run.
+    pub fn unsupported_mmio_log(&self) -> Vec<(u32, u32, u64)> {
+        let mut out: Vec<(u32, u32, u64)> = self
+            .unsupported_mmio_log
+            .iter()
+            .map(|(&(addr, pc), &count)| (addr, pc, count))
+            .collect();
+        out.sort_unstable_by_key(|&(addr, pc, _)| (addr, pc));
+        out
+    }
+
+    /// `true` if the accumulator hit [`UNSUPPORTED_MMIO_LOG_CAP`] and
+    /// may therefore be missing distinct `(addr, pc)` pairs.
+    pub fn unsupported_mmio_log_truncated(&self) -> bool {
+        self.unsupported_mmio_log.len() >= UNSUPPORTED_MMIO_LOG_CAP
     }
 
     // --- Direct peek/poke (bypasses decode, still routes through regions)

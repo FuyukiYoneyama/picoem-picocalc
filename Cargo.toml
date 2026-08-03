@@ -4,6 +4,7 @@ members = ["crates/*"]
 # default-members so `cargo build` at the root keeps working on hosts
 # without clang. Build it explicitly: `cargo build -p epio-sys`.
 default-members = [
+    "crates/picocalc-harness",
     "crates/picoem-common",
     "crates/picoem-debug",
     "crates/picoem-devices",

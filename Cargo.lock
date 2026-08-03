@@ -1827,6 +1827,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "picocalc-harness"
+version = "0.1.0"
+dependencies = [
+ "rp2040-emu",
+]
+
+[[package]]
 name = "picoem-common"
 version = "0.2.2"
 dependencies = [
