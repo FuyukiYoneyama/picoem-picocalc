@@ -1164,6 +1164,23 @@ impl Emulator {
     ///   latch is intentionally preserved (one-shot wake) when no
     ///   waiter is parked: the SEV-before-WFE idiom requires the latch
     ///   to survive until the next WFE consumes it.
+    /// - **WFE IRQ wake** — ARMv6-M ARM §B1.5.18 lists, alongside SEV
+    ///   and the event register, "an asynchronous exception at a
+    ///   priority that preempts any currently active exceptions" as a
+    ///   WFE wake-up event. So a parked core must also un-park when an
+    ///   enabled+pending IRQ appears on its own NVIC, exactly like the
+    ///   WFI case below; the exception is then taken on the next
+    ///   `step()` via `try_take_any_pending_exception`. The event
+    ///   register is NOT consumed on this path — only a WFE that
+    ///   actually finds the latch set clears it. Without this arm the
+    ///   Pico SDK `sleep_until` idiom (arm a TIMER alarm, then
+    ///   `while (!done) __wfe();` with the alarm ISR setting `done`)
+    ///   dead-locks: the alarm IRQ latches in the NVIC, which both
+    ///   fails to wake the WFE-parked core AND disqualifies the
+    ///   tech_debt §1649 clock-advance branch below (it requires no
+    ///   pending IRQ), so the master clock freezes forever.
+    ///   PRIMASK is intentionally not consulted, mirroring the WFI
+    ///   decision documented in `core/execute.rs`.
     /// - **WFI wake** — if the core is halted and an enabled+pending
     ///   IRQ exists on its NVIC, un-halt. The pending bit is consumed
     ///   on the next `step()` via `try_take_any_pending_exception`. The
@@ -1181,6 +1198,12 @@ impl Emulator {
             // WFE wake: parked core + latched event = consume + un-park.
             if self.bus.wfe_waiting[core] && self.bus.event_flag[core] {
                 self.bus.event_flag[core] = false;
+                self.bus.wfe_waiting[core] = false;
+            }
+            // WFE IRQ wake: parked core + pending+enabled IRQ = un-park,
+            // leaving `event_flag` untouched (ARMv6-M ARM §B1.5.18 — an
+            // interrupt-driven wake is not an event-register consume).
+            if self.bus.wfe_waiting[core] && self.bus.nvics[core].pending_and_enabled() != 0 {
                 self.bus.wfe_waiting[core] = false;
             }
             // WFI wake: halted core + pending+enabled IRQ = un-halt.
