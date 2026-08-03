@@ -55,6 +55,38 @@ use std::collections::VecDeque;
 
 use picoem_common::clocks::ClockTree;
 
+/// An off-chip SPI slave attached to one of the RP2040 SSP instances.
+///
+/// Generic hook: `rp2040-emu` knows nothing about what the device is or
+/// which GPIOs frame its transactions. Board-level crates implement this
+/// trait and decide, from the pin snapshot handed to
+/// [`SpiExternalDevice::observe_pins`], whether a given word is addressed
+/// to them.
+///
+/// Lifecycle inside one [`SpiRegs::tick`]:
+///
+/// 1. The bus calls [`SpiExternalDevice::observe_pins`] with the merged
+///    SIO/PIO pad-output levels *before* any TX FIFO drain, so the device
+///    sees the chip-select / command-data levels the CPU had established
+///    by the end of the instruction burst that queued the word. Sampling
+///    them after the drain (or one `step()` later, from a runner) would
+///    frame the word with the *next* transaction's control lines.
+/// 2. Every word popped off the TX FIFO is handed to
+///    [`SpiExternalDevice::transfer`]; the returned word is pushed into
+///    the RX FIFO — non-loopback only, because in loopback the PL022 ties
+///    TX to RX inside the chip and the off-chip pins are bypassed.
+pub trait SpiExternalDevice: Send {
+    /// Shift one frame out to the device and return the frame shifted
+    /// back in on MISO. `bits` is the configured frame width taken from
+    /// `SSPCR0.DSS` (4..=16).
+    fn transfer(&mut self, word: u16, bits: u8) -> u16;
+
+    /// Observe the current GPIO pad-output levels (bit *n* = GPIO *n*).
+    /// Called once per [`SpiRegs::tick`], before the FIFO drain. Devices
+    /// with no side-band pins can ignore it.
+    fn observe_pins(&mut self, _gpio_out_levels: u32) {}
+}
+
 /// Offset: `SSPCR0` — frame format / clock rate.
 pub const SSPCR0: u32 = 0x000;
 /// Offset: `SSPCR1` — enable / LBM / MS / SOD.
@@ -122,6 +154,10 @@ pub struct SpiRegs {
     rx_fifo: VecDeque<u32>,
     tx_cycle_accum: u64,
     nvic_irq: u32,
+    /// Optional off-chip slave. `None` — the default — reproduces the
+    /// pre-hook behaviour exactly: drained words are discarded and
+    /// nothing is ever pushed into the RX FIFO.
+    device: Option<Box<dyn SpiExternalDevice>>,
 }
 
 impl SpiRegs {
@@ -139,12 +175,49 @@ impl SpiRegs {
             rx_fifo: VecDeque::with_capacity(SSP_FIFO_DEPTH),
             tx_cycle_accum: 0,
             nvic_irq,
+            device: None,
         }
     }
 
     pub fn reset(&mut self) {
         let irq = self.nvic_irq;
+        // The attached device models a *board*, not a chip register: an
+        // MCU-side peripheral reset does not unsolder it. Carry it
+        // across so `Emulator::reset` cannot silently detach it.
+        let device = self.device.take();
         *self = Self::new(irq);
+        self.device = device;
+    }
+
+    /// Attach (or replace) the off-chip slave on this instance.
+    /// Returns whatever was attached before, if anything.
+    pub fn attach_device(
+        &mut self,
+        device: Box<dyn SpiExternalDevice>,
+    ) -> Option<Box<dyn SpiExternalDevice>> {
+        self.device.replace(device)
+    }
+
+    /// True iff an off-chip slave is attached.
+    #[inline]
+    pub fn has_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Forward the merged GPIO pad-output snapshot to the attached
+    /// device. No-op when nothing is attached.
+    #[inline]
+    pub fn observe_pins(&mut self, gpio_out_levels: u32) {
+        if let Some(dev) = self.device.as_mut() {
+            dev.observe_pins(gpio_out_levels);
+        }
+    }
+
+    /// Frame width in bits per `SSPCR0.DSS`, clamped to the PL022's
+    /// legal range exactly the way [`Self::frame_data_mask`] does.
+    #[inline]
+    fn frame_bits(&self) -> u8 {
+        ((self.cr0 & 0xF).max(3) + 1) as u8
     }
 
     /// True iff no outstanding work — TX and RX FIFOs empty.
@@ -390,13 +463,32 @@ impl SpiRegs {
             return;
         }
         let spw = self.sysclks_per_word(clock_tree);
+        let mask = self.frame_data_mask();
+        let bits = self.frame_bits();
+        let loopback = self.is_loopback();
         self.tx_cycle_accum = self.tx_cycle_accum.saturating_add(cycles as u64);
         while self.tx_cycle_accum >= spw && !self.tx_fifo.is_empty() {
             self.tx_cycle_accum -= spw;
             // Drain one word out of the TX FIFO. In loopback mode the
             // RX copy was pushed at `push_dr` time so no extra work
             // here.
-            let _ = self.tx_fifo.pop_front();
+            let word = self.tx_fifo.pop_front().unwrap_or(0);
+            // Off-chip slave, if any. Loopback bypasses it electrically
+            // (TX is tied to RX inside the PL022), so the device is
+            // neither driven nor sampled and the RX copy is not
+            // duplicated.
+            if !loopback && let Some(dev) = self.device.as_mut() {
+                let rx = (dev.transfer(word as u16, bits) as u32) & mask;
+                if self.rx_fifo.len() < SSP_FIFO_DEPTH {
+                    self.rx_fifo.push_back(rx);
+                } else {
+                    // PL022: a push-on-full latches the sticky overrun
+                    // flag and the incoming frame is lost. Write-only
+                    // streaming firmware (pico-sdk `spi_write_fast`)
+                    // depends on exactly this, then clears RORIC.
+                    self.ris |= SSP_INT_ROR;
+                }
+            }
         }
         self.refresh_tx_rx_interrupts();
         self.route_irq(irqs);
@@ -624,5 +716,155 @@ mod tests {
         assert_eq!(s.read32(SSPPERIPHID0), 0x22);
         assert_eq!(s.read32(SSPPCELLID0), 0x0D);
         assert_eq!(s.read32(SSPPCELLID3), 0xB1);
+    }
+
+    // --- external device hook ----------------------------------------
+
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Probe {
+        seen: Vec<(u16, u8)>,
+        pins: Vec<u32>,
+        reply_base: u16,
+    }
+
+    struct DummyDevice(Arc<Mutex<Probe>>);
+
+    impl SpiExternalDevice for DummyDevice {
+        fn transfer(&mut self, word: u16, bits: u8) -> u16 {
+            let mut p = self.0.lock().unwrap();
+            p.seen.push((word, bits));
+            p.reply_base.wrapping_add(word)
+        }
+        fn observe_pins(&mut self, levels: u32) {
+            self.0.lock().unwrap().pins.push(levels);
+        }
+    }
+
+    /// Enabled, 8-bit frames, fast baud so one `tick` drains everything.
+    fn armed(loopback: bool) -> (SpiRegs, u32) {
+        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut irqs = 0;
+        s.write32(SSPCR0, 0x07, 0, &mut irqs);
+        s.write32(SSPCPSR, 2, 0, &mut irqs);
+        let cr1 = if loopback {
+            SSPCR1_SSE | SSPCR1_LBM
+        } else {
+            SSPCR1_SSE
+        };
+        s.write32(SSPCR1, cr1, 0, &mut irqs);
+        (s, irqs)
+    }
+
+    #[test]
+    fn attached_device_receives_tx_words_and_drives_rx() {
+        let probe = Arc::new(Mutex::new(Probe {
+            reply_base: 0x10,
+            ..Default::default()
+        }));
+        let (mut s, mut irqs) = armed(false);
+        s.attach_device(Box::new(DummyDevice(probe.clone())));
+        assert!(s.has_device());
+        s.write32(SSPDR, 0x5A, 0, &mut irqs);
+        s.write32(SSPDR, 0x01, 0, &mut irqs);
+        // Nothing reaches the device until the FIFO drains.
+        assert!(probe.lock().unwrap().seen.is_empty());
+        s.tick(10_000, &tree(), &mut irqs);
+        let seen = probe.lock().unwrap().seen.clone();
+        assert_eq!(seen, vec![(0x5A, 8), (0x01, 8)]);
+        // Returned words land in the RX FIFO, in order.
+        assert_eq!(s.read32(SSPDR), 0x6A);
+        assert_eq!(s.read32(SSPDR), 0x11);
+    }
+
+    #[test]
+    fn device_frame_width_follows_cr0_dss() {
+        let probe = Arc::new(Mutex::new(Probe::default()));
+        let mut s = SpiRegs::new(SPI0_IRQ);
+        let mut irqs = 0;
+        // DSS = 15 → 16-bit frames.
+        s.write32(SSPCR0, 0x0F, 0, &mut irqs);
+        s.write32(SSPCPSR, 2, 0, &mut irqs);
+        s.write32(SSPCR1, SSPCR1_SSE, 0, &mut irqs);
+        s.attach_device(Box::new(DummyDevice(probe.clone())));
+        s.write16(SSPDR, 0xBEEF, &mut irqs);
+        s.tick(10_000, &tree(), &mut irqs);
+        assert_eq!(probe.lock().unwrap().seen, vec![(0xBEEF, 16)]);
+    }
+
+    #[test]
+    fn observe_pins_reaches_the_device_and_is_a_noop_when_detached() {
+        let probe = Arc::new(Mutex::new(Probe::default()));
+        let (mut s, _) = armed(false);
+        // Detached: must not panic, must not record anything.
+        s.observe_pins(0xDEAD_BEEF);
+        assert!(probe.lock().unwrap().pins.is_empty());
+        s.attach_device(Box::new(DummyDevice(probe.clone())));
+        s.observe_pins(0x0000_E000);
+        assert_eq!(probe.lock().unwrap().pins, vec![0x0000_E000]);
+    }
+
+    #[test]
+    fn loopback_bypasses_the_device_and_does_not_double_push_rx() {
+        let probe = Arc::new(Mutex::new(Probe {
+            reply_base: 0x10,
+            ..Default::default()
+        }));
+        let (mut s, mut irqs) = armed(true);
+        s.attach_device(Box::new(DummyDevice(probe.clone())));
+        s.write32(SSPDR, 0x5A, 0, &mut irqs);
+        s.tick(10_000, &tree(), &mut irqs);
+        // Device never driven; RX holds exactly one word, the LBM copy.
+        assert!(probe.lock().unwrap().seen.is_empty());
+        assert_eq!(s.rx_fifo.len(), 1);
+        assert_eq!(s.read32(SSPDR), 0x5A);
+    }
+
+    #[test]
+    fn detached_tick_still_discards_tx_and_leaves_rx_empty() {
+        let (mut s, mut irqs) = armed(false);
+        for i in 0..4u32 {
+            s.write32(SSPDR, i, 0, &mut irqs);
+        }
+        s.tick(10_000, &tree(), &mut irqs);
+        assert!(s.tx_fifo.is_empty());
+        assert!(s.rx_fifo.is_empty(), "no device ⇒ no RX response");
+        assert_eq!(s.ris & SSP_INT_ROR, 0);
+    }
+
+    #[test]
+    fn device_rx_overrun_latches_ror_and_drops_the_frame() {
+        let probe = Arc::new(Mutex::new(Probe::default()));
+        let (mut s, mut irqs) = armed(false);
+        s.attach_device(Box::new(DummyDevice(probe.clone())));
+        // 8-deep TX FIFO → 8 responses into an 8-deep RX FIFO fills it;
+        // a second burst overruns.
+        for i in 0..8u32 {
+            s.write32(SSPDR, i, 0, &mut irqs);
+        }
+        s.tick(10_000, &tree(), &mut irqs);
+        assert_eq!(s.rx_fifo.len(), SSP_FIFO_DEPTH);
+        assert_eq!(s.ris & SSP_INT_ROR, 0);
+        s.write32(SSPDR, 0xFF, 0, &mut irqs);
+        s.tick(10_000, &tree(), &mut irqs);
+        assert_eq!(s.rx_fifo.len(), SSP_FIFO_DEPTH);
+        assert_ne!(s.ris & SSP_INT_ROR, 0, "push-on-full latches ROR");
+    }
+
+    #[test]
+    fn reset_keeps_the_soldered_device_attached() {
+        let probe = Arc::new(Mutex::new(Probe::default()));
+        let (mut s, mut irqs) = armed(false);
+        s.attach_device(Box::new(DummyDevice(probe.clone())));
+        s.reset();
+        assert!(s.has_device());
+        // And it still works after re-arming.
+        s.write32(SSPCR0, 0x07, 0, &mut irqs);
+        s.write32(SSPCPSR, 2, 0, &mut irqs);
+        s.write32(SSPCR1, SSPCR1_SSE, 0, &mut irqs);
+        s.write32(SSPDR, 0x22, 0, &mut irqs);
+        s.tick(10_000, &tree(), &mut irqs);
+        assert_eq!(probe.lock().unwrap().seen, vec![(0x22, 8)]);
     }
 }

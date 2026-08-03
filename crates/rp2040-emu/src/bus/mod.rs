@@ -1785,6 +1785,53 @@ impl Bus {
         self.gpio_in
     }
 
+    /// Merged SIO + PIO pad-output levels (bit *n* = GPIO *n*), masked
+    /// to the RP2040's 30-pin range.
+    ///
+    /// Same merge `Emulator::update_gpio` performs, minus the off-chip
+    /// PSRAM MISO splice and the harness `external_gpio_in_*` override —
+    /// i.e. strictly "what the chip is driving onto the pads right now",
+    /// which is what an attached slave sees on its side-band pins.
+    /// Available on `Bus` (not just `Emulator`) so peripheral ticking can
+    /// consult it *before* draining a FIFO.
+    #[inline]
+    pub fn pad_out_levels(&self) -> u32 {
+        let mut out = self.sio.gpio_out & self.sio.gpio_oe;
+        for pio in &self.pio {
+            let pio_mask = pio.pad_oe;
+            out = (out & !pio_mask) | (pio.pad_out & pio_mask);
+        }
+        out & 0x3FFF_FFFF
+    }
+
+    /// Attach an off-chip SPI slave to instance `instance` (0 = SPI0,
+    /// 1 = SPI1). Returns the previously attached device, if any, or an
+    /// error for an out-of-range instance.
+    ///
+    /// Board-level crates own the device model; this crate only routes
+    /// words and the pad snapshot to it (see
+    /// [`crate::peripherals::spi::SpiExternalDevice`]).
+    pub fn attach_spi_device(
+        &mut self,
+        instance: usize,
+        device: Box<dyn crate::peripherals::spi::SpiExternalDevice>,
+    ) -> Result<Option<Box<dyn crate::peripherals::spi::SpiExternalDevice>>, usize> {
+        match instance {
+            0 => Ok(self.spi0.attach_device(device)),
+            1 => Ok(self.spi1.attach_device(device)),
+            other => Err(other),
+        }
+    }
+
+    /// True iff instance `instance` has an off-chip slave attached.
+    pub fn spi_has_device(&self, instance: usize) -> bool {
+        match instance {
+            0 => self.spi0.has_device(),
+            1 => self.spi1.has_device(),
+            _ => false,
+        }
+    }
+
     /// Signal SEV to both cores.
     pub fn signal_sev(&mut self) {
         self.event_flag[0] = true;
@@ -2003,6 +2050,20 @@ impl Bus {
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
         self.uart1
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        // Off-chip SPI slaves sample their side-band pins (chip-select,
+        // command/data, reset, …) *before* the FIFO drain below. The
+        // CPU cannot have moved those lines past the queued word yet:
+        // pico-sdk's `spi_write_blocking` spins on `SSPSR.BSY`, which
+        // stays set while the TX FIFO is non-empty, so control-line
+        // changes always land on the far side of a drain. Sampling
+        // after the drain would frame each word with the *next*
+        // transaction's control lines. Skipped entirely — including the
+        // pad merge — when nothing is attached.
+        if self.spi0.has_device() || self.spi1.has_device() {
+            let pads = self.pad_out_levels();
+            self.spi0.observe_pins(pads);
+            self.spi1.observe_pins(pads);
+        }
         self.spi0
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
         self.spi1

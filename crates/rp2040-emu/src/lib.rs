@@ -1153,6 +1153,19 @@ impl Emulator {
             out = (out & !ext_mask) | (self.bus.external_gpio_in_override & ext_mask);
         }
         self.bus.gpio_in = out;
+
+        // Off-chip SPI slaves also watch side-band pins that move while
+        // the SSP is completely idle — an LCD's hardware RESET pulse,
+        // for instance, happens long before the first frame is queued,
+        // and an idle SPI means `tick_peripherals` (which does its own
+        // pre-drain sample) is skipped by the fast path. Sampling here
+        // as well is idempotent: nothing executes between the two call
+        // sites within a `step`, so both see the same pad levels.
+        if self.bus.spi_has_device(0) || self.bus.spi_has_device(1) {
+            let pads = self.bus.pad_out_levels();
+            self.bus.spi0.observe_pins(pads);
+            self.bus.spi1.observe_pins(pads);
+        }
     }
 
     /// WFE/SEV / WFI quantum-end wake check. See `wrk_docs/2026.04.26

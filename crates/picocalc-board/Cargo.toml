@@ -1,0 +1,20 @@
+[package]
+name = "picocalc-board"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Board-level models for the ClockworkPi PicoCalc. Everything PicoCalc-
+# specific lives here: pin assignments, the ST7365P display controller,
+# framebuffer extraction. `rp2040-emu` stays board-agnostic.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rp2040-emu = { path = "../rp2040-emu" }
+# Deterministic PNG output: `png` writes IHDR/IDAT/IEND only — no tIME
+# chunk, no encoder banner — so the same framebuffer always produces the
+# same file. Version pinned by Cargo.lock (plan Gate 2 §5).
+png = "0.18"

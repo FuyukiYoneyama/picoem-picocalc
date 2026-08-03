@@ -17,6 +17,8 @@ workspace = true
 # Serial as the correctness reference (see picocalc_emu
 # docs/IMPLEMENTATION_PLAN.md §3.1). No `threading` feature.
 rp2040-emu = { path = "../rp2040-emu" }
+# Board models (ST7365P display, pin map, framebuffer/PNG, shared sha256).
+picocalc-board = { path = "../picocalc-board" }
 
 [[bin]]
 name = "picocalc-run"

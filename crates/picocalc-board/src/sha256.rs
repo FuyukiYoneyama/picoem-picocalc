@@ -1,5 +1,8 @@
 //! Minimal SHA-256 (FIPS 180-4).
 //!
+//! Lives here rather than in the runner so the framebuffer canonical
+//! hash and the runner report share one implementation.
+//!
 //! Deliberately dependency-free: the runner's only job for hashing is
 //! to fingerprint a firmware image and a UART byte stream so repeated
 //! runs can be compared, and pulling `sha2` (plus its `digest` /
