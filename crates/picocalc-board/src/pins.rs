@@ -141,3 +141,21 @@ pub const KEYBOARD_I2C_INSTANCE: usize = 1;
 pub const KEYBOARD_PIN_SDA: u8 = 6;
 /// SCL pin. `I2C_KBD_SCL`.
 pub const KEYBOARD_PIN_SCL: u8 = 7;
+
+// --- SD card (SPI0) ----------------------------------------------------
+//
+// From : the card sits on SPI0 with the CPU driving
+// chip select, and card detect is an input on GP22.
+
+/// SPI instance the SD card is wired to.
+pub const SD_SPI_INSTANCE: usize = 0;
+/// MISO: card data out.
+pub const SD_PIN_MISO: u8 = 16;
+/// Chip select, driven by the CPU (active low).
+pub const SD_PIN_CS: u8 = 17;
+/// SCK.
+pub const SD_PIN_SCK: u8 = 18;
+/// MOSI: host data out.
+pub const SD_PIN_MOSI: u8 = 19;
+/// Card detect. Low means a card is present.
+pub const SD_PIN_DETECT: u8 = 22;

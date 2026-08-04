@@ -61,6 +61,7 @@ const CMD_RESET_ENABLE: u8 = 0x66;
 const CMD_RESET: u8 = 0x99;
 const CMD_WRITE: u8 = 0x02;
 const CMD_FAST_READ: u8 = 0x0B;
+const CMD_READ_ID: u8 = 0x9F;
 
 /// SPI frame-phase state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +80,11 @@ enum Phase {
     ReadDummy,
     /// Inside a fast-read: clocking data bytes out on MISO.
     ReadData,
+    /// Inside Read ID: clocking in the three address bytes the
+    /// command carries but does not use.
+    IdAddr,
+    /// Inside Read ID: clocking the eight identity bytes out.
+    IdData,
     /// Unrecognised command — silent NOP for the rest of the frame.
     SilentNop,
 }
@@ -158,8 +164,22 @@ pub struct Psram {
     pub cmd_fast_read_count: u64,
     pub cmd_reset_enable_count: u64,
     pub cmd_reset_count: u64,
-    /// Any command byte other than `0x66`/`0x99`/`0x02`/`0x0B`.
+    /// Read ID (`0x9F`) commands seen.
+    pub cmd_read_id_count: u64,
+    /// Any command byte other than `0x66`/`0x99`/`0x02`/`0x0B`/`0x9F`.
     pub cmd_unknown_count: u64,
+
+    /// The eight identity bytes `0x9F` returns: manufacturer, known-good
+    /// die, then a six-byte EID.
+    ///
+    /// The default is the value read from the PicoCalc's own chip during
+    /// the 2026-08-05 hardware correlation run, so firmware that prints
+    /// the ID shows what the device shows. Nothing in the conformance
+    /// track depends on the EID bytes; the first two are the meaningful
+    /// ones.
+    pub identity: [u8; 8],
+    /// How far through `identity` the current Read ID frame has got.
+    id_index: usize,
 
     /// Number of SCK falling edges to withhold `driving_miso` for
     /// after the Fast Read dummy phase ends, before the real first
@@ -218,7 +238,12 @@ impl Psram {
             cmd_fast_read_count: 0,
             cmd_reset_enable_count: 0,
             cmd_reset_count: 0,
+            cmd_read_id_count: 0,
             cmd_unknown_count: 0,
+            // apmemory APS6404L as fitted to the PicoCalc: 0x0D
+            // manufacturer, 0x5D known-good die, then the EID.
+            identity: [0x0D, 0x5D, 0x53, 0x32, 0xC6, 0x81, 0x79, 0x46],
+            id_index: 0,
             read_output_delay_sck: 0,
             read_delay_remaining: 0,
         }
@@ -276,6 +301,7 @@ impl Psram {
         self.miso_bit = false;
         self.driving_miso = false;
         self.read_delay_remaining = 0;
+        self.id_index = 0;
     }
 
     /// Observe the current GPIO pin state. Call on every emulator tick
@@ -343,6 +369,7 @@ impl Psram {
         self.driving_miso = false;
         self.miso_bit = false;
         self.read_delay_remaining = 0;
+        self.id_index = 0;
     }
 
     fn end_frame(&mut self) {
@@ -358,6 +385,7 @@ impl Psram {
         self.driving_miso = false;
         self.miso_bit = false;
         self.read_delay_remaining = 0;
+        self.id_index = 0;
     }
 
     // --- Clock-edge handlers -------------------------------------------------
@@ -402,8 +430,13 @@ impl Psram {
             self.shift_out <<= 1;
             self.shift_out_bits -= 1;
             if self.shift_out_bits == 0 {
-                // Byte fully shifted out — queue the next read byte.
-                self.advance_read_byte();
+                // Byte fully shifted out — queue the next one from
+                // whichever source this frame is reading.
+                if self.phase == Phase::IdData {
+                    self.advance_id_byte();
+                } else {
+                    self.advance_read_byte();
+                }
             }
         }
     }
@@ -439,6 +472,24 @@ impl Psram {
                 // Master can keep clocking to read further bytes; the
                 // input bits are don't-care. Nothing to do here — the
                 // falling-edge handler drives MISO.
+            }
+            Phase::IdAddr => {
+                // Read ID carries three address bytes that the chip
+                // ignores; only their count matters.
+                self.addr_bytes_seen += 1;
+                if self.addr_bytes_seen == 3 {
+                    self.phase = Phase::IdData;
+                    // Same output-settling delay as Fast Read: it is a
+                    // property of the chip's output driver, not of which
+                    // command asked for the data.
+                    self.read_delay_remaining = self.read_output_delay_sck;
+                    self.driving_miso = self.read_delay_remaining == 0;
+                    self.advance_id_byte();
+                }
+            }
+            Phase::IdData => {
+                // Further clocking walks the identity bytes; inputs are
+                // don't-care.
             }
             Phase::Idle | Phase::SilentNop => {
                 // Silent — accept bits, produce nothing.
@@ -484,6 +535,13 @@ impl Psram {
                 self.addr_bytes_seen = 0;
                 self.addr = 0;
             }
+            CMD_READ_ID => {
+                self.cmd_read_id_count += 1;
+                self.reset_armed = false;
+                self.phase = Phase::IdAddr;
+                self.addr_bytes_seen = 0;
+                self.id_index = 0;
+            }
             _ => {
                 // Unknown command — silent nop for the rest of the frame.
                 self.cmd_unknown_count += 1;
@@ -511,6 +569,16 @@ impl Psram {
 
     /// Load the next read byte into `shift_out` so the falling-edge
     /// handler can clock it out bit-by-bit.
+    /// Load the next identity byte for shifting out. Past the end of
+    /// the eight-byte identity the chip repeats nothing meaningful, so
+    /// zeros are deterministic and obvious.
+    fn advance_id_byte(&mut self) {
+        self.shift_out = self.identity.get(self.id_index).copied().unwrap_or(0);
+        self.shift_out_bits = 8;
+        self.id_index += 1;
+        self.bytes_read += 1;
+    }
+
     fn advance_read_byte(&mut self) {
         let off = (self.addr as usize) & (PSRAM_SIZE - 1);
         self.shift_out = self.buffer[off];
@@ -689,6 +757,45 @@ mod tests {
     /// PIO-integration diagnostics) must tally each command byte
     /// exactly once per frame, and must not perturb existing protocol
     /// behaviour (buffer contents / `bytes_written` unaffected).
+    /// The Canonical BSP's `read_id` sends the opcode plus three address
+    /// bytes it does not use, then clocks eight bytes back. Hardware
+    /// answered 0d5d5332c6817946 on 2026-08-05; the model reports the
+    /// same so firmware that prints the ID shows what the device shows.
+    #[test]
+    fn read_id_returns_the_identity_the_hardware_reports() {
+        let mut pins = 0u32;
+        let mut psram = Psram::new(0, 1, 2, 3);
+        cs_fall(&mut psram, &mut pins);
+        clock_byte(&mut psram, &mut pins, 0x9F);
+        for _ in 0..3 {
+            clock_byte(&mut psram, &mut pins, 0x00);
+        }
+        let mut got = [0u8; 8];
+        for slot in got.iter_mut() {
+            *slot = clock_byte(&mut psram, &mut pins, 0x00);
+        }
+        cs_rise(&mut psram, &mut pins);
+        assert_eq!(got, [0x0D, 0x5D, 0x53, 0x32, 0xC6, 0x81, 0x79, 0x46]);
+        assert_eq!(psram.cmd_read_id_count, 1);
+        assert_eq!(psram.cmd_unknown_count, 0, "0x9F must not be unknown");
+    }
+
+    /// Reading past the identity yields zeros rather than stale bytes.
+    #[test]
+    fn read_id_past_the_end_is_zero() {
+        let mut pins = 0u32;
+        let mut psram = Psram::new(0, 1, 2, 3);
+        cs_fall(&mut psram, &mut pins);
+        clock_byte(&mut psram, &mut pins, 0x9F);
+        for _ in 0..3 {
+            clock_byte(&mut psram, &mut pins, 0x00);
+        }
+        for _ in 0..8 {
+            let _ = clock_byte(&mut psram, &mut pins, 0x00);
+        }
+        assert_eq!(clock_byte(&mut psram, &mut pins, 0x00), 0);
+    }
+
     #[test]
     fn cmd_decode_counters_tally_each_command_byte() {
         let (mut psram, mut pins) = fresh();
@@ -723,8 +830,15 @@ mod tests {
         cs_rise(&mut psram, &mut pins);
         assert_eq!(psram.cmd_fast_read_count, 1);
 
+        // Read ID is a real command: hardware answers it, and the
+        // Canonical BSP driver prints what comes back.
         cs_fall(&mut psram, &mut pins);
-        clock_byte(&mut psram, &mut pins, 0x9F); // unrecognised (READ-ID)
+        clock_byte(&mut psram, &mut pins, 0x9F);
+        cs_rise(&mut psram, &mut pins);
+        assert_eq!(psram.cmd_read_id_count, 1);
+
+        cs_fall(&mut psram, &mut pins);
+        clock_byte(&mut psram, &mut pins, 0x77); // genuinely unrecognised
         cs_rise(&mut psram, &mut pins);
         assert_eq!(psram.cmd_unknown_count, 1);
 

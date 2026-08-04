@@ -34,7 +34,8 @@ use std::sync::{Arc, Mutex};
 
 use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{
-    Framebuffer, Keyboard, KeyboardWire, LcdPioWire, St7365p, St7365pWire, pins,
+    Framebuffer, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire, St7365p,
+    St7365pWire, pins,
 };
 use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 
@@ -200,6 +201,7 @@ struct Args {
     psram: bool,
     psram_verify_range: Option<(u32, u32)>,
     keyboard: bool,
+    sd: bool,
     keys: Option<String>,
 }
 
@@ -275,12 +277,20 @@ fn parse_args() -> Result<Args, String> {
     // Variant B is the Canonical BSP default; variant A is what the
     // official sample uses. Selected explicitly so a report always
     // records which transport produced it.
+    //
+    // The choice is not cosmetic. Variant B attaches a pin-watching
+    // device, which switches the serial loop to per-cycle GPIO
+    // observation -- correct for B, but a large slowdown for firmware
+    // that never drives the display from PIO. Running the official
+    // sample without naming variant A costs roughly a third of the
+    // reachable cycles.
     let mut lcd_variant = LcdVariant::B;
     let mut fb_png: Option<PathBuf> = None;
     let mut quantum: Option<u32> = None;
     let mut psram = false;
     let mut psram_verify_range: Option<(u32, u32)> = None;
     let mut keyboard = false;
+    let mut sd = false;
     let mut keys: Option<String> = None;
 
     let mut i = 0;
@@ -330,6 +340,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--psram" => psram = true,
             "--keyboard" => keyboard = true,
+            "--sd" => sd = true,
             "--keys" => keys = Some(value("--keys")?),
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
@@ -370,6 +381,7 @@ fn parse_args() -> Result<Args, String> {
         psram,
         psram_verify_range,
         keyboard,
+        sd,
         keys,
     })
 }
@@ -472,6 +484,7 @@ fn boot(
     lcd_variant: LcdVariant,
     psram: bool,
     keyboard: Option<Arc<Mutex<Keyboard>>>,
+    sd: Option<Arc<Mutex<SdCard>>>,
 ) -> Result<(Emulator, BootMode, Option<Arc<Mutex<St7365p>>>), String> {
     let mut builder = EmulatorBuilder::new(Config {
         sys_clk_hz: DEFAULT_SYS_CLK_HZ,
@@ -526,6 +539,18 @@ fn boot(
         emu.bus
             .attach_i2c_device(pins::KEYBOARD_I2C_INSTANCE, Box::new(KeyboardWire::new(kbd)))
             .map_err(|i| format!("no I2C instance {i} on RP2040"))?;
+    }
+
+    // The card sits on SPI0. Card detect is an input to the chip, so it
+    // is forced low here rather than driven by the device: the slot
+    // reports "occupied" for as long as a card is attached.
+    if let Some(card) = sd {
+        emu.bus
+            .attach_spi_device(pins::SD_SPI_INSTANCE, Box::new(SdCardWire::new(card)))
+            .map_err(|i| format!("no SPI instance {i} on RP2040"))?;
+        let detect = 1u32 << pins::SD_PIN_DETECT;
+        emu.bus.external_gpio_in_mask |= detect;
+        emu.bus.external_gpio_in_override &= !detect;
     }
 
     // Loaded, never executed — see the module docs.
@@ -1249,6 +1274,10 @@ fn run() -> Result<(), String> {
         kbd
     });
 
+    // A blank card. FatFs formats it on first mount, so the smoke test
+    // brings its own filesystem rather than needing a prepared image.
+    let sd_card = args.sd.then(|| Arc::new(Mutex::new(SdCard::default())));
+
     let (mut emu, boot_mode, lcd) = boot(
         firmware,
         &bootrom,
@@ -1257,6 +1286,7 @@ fn run() -> Result<(), String> {
         args.lcd_variant,
         args.psram,
         keyboard.clone(),
+        sd_card.clone(),
     )?;
     emu.bus.unsupported_mmio_log_enabled = true;
 
