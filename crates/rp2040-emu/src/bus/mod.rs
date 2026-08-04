@@ -303,6 +303,17 @@ pub mod invalidation_regions {
 pub const UNSUPPORTED_MMIO_LOG_CAP: usize = 4096;
 
 /// RP2040 AHB-Lite bus fabric.
+/// A device wired straight to the chip's pads.
+///
+/// Controllers like SPI or I2C hand a device whole words through their
+/// FIFOs, but a PIO program drives pins directly, so a device on the far
+/// end of one can only be observed by watching the pads change. `tick`
+/// is called once per system cycle with the merged pad output; return
+/// `Some((pin, level))` to drive an input pin back.
+pub trait PinWatchingDevice: Send {
+    fn tick(&mut self, gpio_out: u32) -> Option<(u8, bool)>;
+}
+
 pub struct Bus {
     pub memory: Memory,
     /// GPIO input state after merging SIO output with PIO outputs
@@ -360,6 +371,8 @@ pub struct Bus {
     /// `0x5030_0000` (see [`PIO0_BASE`] / [`PIO1_BASE`]); output pins are
     /// merged into [`Self::gpio_in`] by [`crate::Emulator::update_gpio`].
     pub pio: [PioBlock; 2],
+    /// Off-chip devices watching the pads (see [`PinWatchingDevice`]).
+    pub pin_devices: Vec<Box<dyn PinWatchingDevice>>,
     /// WATCHDOG_TICK register model (Phase 1 scope — HLD V7 §5.5). Only
     /// the `TICK` register at offset `0x2C` is modelled today; the rest
     /// of the WATCHDOG block reads as 0.
@@ -539,6 +552,7 @@ impl Bus {
             ssi_flash: ssi_flash::SsiFlash::new(),
             peripheral_regs: HashMap::new(),
             pio: [PioBlock::new(), PioBlock::new()],
+            pin_devices: Vec::new(),
             watchdog_tick: WatchdogTickRegs::new(),
             timer: TimerRegs::new(),
             uart0: UartRegs::new(IRQ_UART0_IRQ),
@@ -1872,6 +1886,11 @@ impl Bus {
 
     /// Read-only view of the PWM block, for reporting which slices
     /// firmware configured.
+    /// Attach a device that watches the pads directly.
+    pub fn attach_pin_device(&mut self, device: Box<dyn PinWatchingDevice>) {
+        self.pin_devices.push(device);
+    }
+
     pub fn pwm(&self) -> &crate::peripherals::pwm::PwmRegs {
         &self.pwm
     }
@@ -2007,7 +2026,7 @@ impl Bus {
     /// I2S codec) can opt in without another call-site change.
     #[inline]
     pub fn has_pin_watching_device(&self) -> bool {
-        self.psram.is_some()
+        self.psram.is_some() || !self.pin_devices.is_empty()
     }
 
     /// Collect the current DREQ (data-request) bitmap for all 64 TREQ

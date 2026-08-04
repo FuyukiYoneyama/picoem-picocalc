@@ -33,7 +33,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use picocalc_board::sha256::sha256_hex;
-use picocalc_board::{Framebuffer, Keyboard, KeyboardWire, St7365p, St7365pWire, pins};
+use picocalc_board::{
+    Framebuffer, Keyboard, KeyboardWire, LcdPioWire, St7365p, St7365pWire, pins,
+};
 use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 
 /// Report schema version. Bump on any breaking field change.
@@ -151,6 +153,38 @@ impl Board {
     }
 }
 
+
+/// Which display transport the firmware uses.
+///
+/// The panel is the same part in both cases; only how bytes reach it
+/// differs. Variant A is the official sample's hardware SPI1 path with
+/// an RGB666 three-byte container. Variant B is the Canonical BSP
+/// default: a PIO0 shift program, RGB565, two bytes per pixel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LcdVariant {
+    A,
+    B,
+}
+
+impl LcdVariant {
+    fn as_str(self) -> &'static str {
+        match self {
+            LcdVariant::A => "hwspi-rgb888",
+            LcdVariant::B => "pio-rgb565",
+        }
+    }
+
+    fn parse(s: &str) -> Result<LcdVariant, String> {
+        match s {
+            "hwspi-rgb888" | "a" | "A" => Ok(LcdVariant::A),
+            "pio-rgb565" | "b" | "B" => Ok(LcdVariant::B),
+            other => Err(format!(
+                "unknown --lcd-variant '{other}' (expected hwspi-rgb888|pio-rgb565)"
+            )),
+        }
+    }
+}
+
 struct Args {
     bin: PathBuf,
     bootrom: PathBuf,
@@ -160,6 +194,7 @@ struct Args {
     uart: Option<PathBuf>,
     backend_commit: Option<String>,
     board: Board,
+    lcd_variant: LcdVariant,
     fb_png: Option<PathBuf>,
     quantum: Option<u32>,
     psram: bool,
@@ -237,6 +272,10 @@ fn parse_args() -> Result<Args, String> {
     let mut uart: Option<PathBuf> = None;
     let mut backend_commit: Option<String> = None;
     let mut board = Board::None;
+    // Variant B is the Canonical BSP default; variant A is what the
+    // official sample uses. Selected explicitly so a report always
+    // records which transport produced it.
+    let mut lcd_variant = LcdVariant::B;
     let mut fb_png: Option<PathBuf> = None;
     let mut quantum: Option<u32> = None;
     let mut psram = false;
@@ -277,6 +316,7 @@ fn parse_args() -> Result<Args, String> {
             "--uart" => uart = Some(PathBuf::from(value("--uart")?)),
             "--backend-commit" => backend_commit = Some(value("--backend-commit")?),
             "--board" => board = Board::parse(&value("--board")?)?,
+            "--lcd-variant" => lcd_variant = LcdVariant::parse(&value("--lcd-variant")?)?,
             "--fb-png" => fb_png = Some(PathBuf::from(value("--fb-png")?)),
             "--quantum" => {
                 let raw = value("--quantum")?;
@@ -324,6 +364,7 @@ fn parse_args() -> Result<Args, String> {
         uart,
         backend_commit,
         board,
+        lcd_variant,
         fb_png,
         quantum,
         psram,
@@ -428,6 +469,7 @@ fn boot(
     bootrom: &[u8],
     step_quantum: u32,
     board: Board,
+    lcd_variant: LcdVariant,
     psram: bool,
     keyboard: Option<Arc<Mutex<Keyboard>>>,
 ) -> Result<(Emulator, BootMode, Option<Arc<Mutex<St7365p>>>), String> {
@@ -449,16 +491,31 @@ fn boot(
     // keeps an attached device (a soldered part survives an MCU reset),
     // so either order works — attaching first just makes the panel
     // observe the firmware's very first pin move.
+    // One panel, two possible transports. Variant A (the official
+    // sample) drives it from SPI1; variant B (the Canonical BSP default)
+    // drives it from a PIO0 program, where nothing passes through a
+    // controller FIFO and the traffic is only visible on the pads. The
+    // two wires stay separate — the plan forbids folding them into one
+    // transfer path — but they share the panel model, because the
+    // display and its command set are the same part either way.
     let lcd = match board {
         Board::None => None,
         Board::PicoCalc => {
             let lcd = Arc::new(Mutex::new(St7365p::new()));
-            emu.bus
-                .attach_spi_device(
-                    pins::LCD_SPI_INSTANCE,
-                    Box::new(St7365pWire::new(lcd.clone())),
-                )
-                .map_err(|i| format!("no SPI instance {i} on RP2040"))?;
+            match lcd_variant {
+                LcdVariant::A => {
+                    emu.bus
+                        .attach_spi_device(
+                            pins::LCD_SPI_INSTANCE,
+                            Box::new(St7365pWire::new(lcd.clone())),
+                        )
+                        .map_err(|i| format!("no SPI instance {i} on RP2040"))?;
+                }
+                LcdVariant::B => {
+                    emu.bus
+                        .attach_pin_device(Box::new(LcdPioWire::new(lcd.clone())));
+                }
+            }
             Some(lcd)
         }
     };
@@ -772,6 +829,66 @@ fn verify_psram_range(buffer: &[u8], start: u32, len: u32) -> PsramVerifyReport 
 }
 
 /// The `psram` report section.
+/// The `pio` report section (Gate 7).
+///
+/// Variant B of the PicoCalc display driver pushes pixels through a PIO
+/// state machine rather than the SSP, and firmware waits on `FSTAT`
+/// before touching CS or DC. When a run stalls in that wait, the useful
+/// question is whether the state machine is enabled and moving at all.
+struct PioReport {
+    blocks: Vec<(usize, u32, [bool; 4], [u8; 4])>,
+}
+
+impl PioReport {
+    fn collect(bus: &mut rp2040_emu::Bus) -> Self {
+        let mut blocks = Vec::new();
+        for (index, base) in [
+            (0usize, rp2040_emu::bus::PIO0_BASE),
+            (1usize, rp2040_emu::bus::PIO1_BASE),
+        ] {
+            let fstat = bus.read32(base + 0x004);
+            let mut enabled = [false; 4];
+            let mut pcs = [0u8; 4];
+            for sm in 0..4 {
+                enabled[sm] = bus.pio[index].sm[sm].enabled();
+                pcs[sm] = bus.pio[index].sm[sm].pc();
+            }
+            if enabled.iter().any(|e| *e) || fstat != 0x0F00_0F00 {
+                blocks.push((index, fstat, enabled, pcs));
+            }
+        }
+        Self { blocks }
+    }
+
+    fn to_json(&self) -> String {
+        let mut s = String::new();
+        s.push_str("  \"pio\": [");
+        for (i, (index, fstat, enabled, pcs)) in self.blocks.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "\n    {{\"block\": {index}, \"fstat\": \"0x{fstat:08x}\", \"sm_enabled\": [{}], \"sm_pc\": [{}]}}",
+                enabled
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                pcs.iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if self.blocks.is_empty() {
+            s.push_str("],\n");
+        } else {
+            s.push_str("\n  ],\n");
+        }
+        s
+    }
+}
+
 /// The `pwm` report section (Gate 5).
 ///
 /// `picocalc_helloworld` initialises the two audio slices but never
@@ -955,6 +1072,7 @@ fn build_report(
     psram: Option<&PsramReport>,
     keyboard: Option<&KeyboardReport>,
     pwm: Option<&PwmReport>,
+    pio: Option<&PioReport>,
 ) -> String {
     let mut s = String::new();
     s.push_str("{\n");
@@ -1048,6 +1166,9 @@ fn build_report(
     if let Some(pwm) = pwm {
         s.push_str(&pwm.to_json());
     }
+    if let Some(pio) = pio {
+        s.push_str(&pio.to_json());
+    }
 
     s.push_str(&format!(
         "  \"uart\": {{\"bytes\": {}, \"sha256\": {}}}\n",
@@ -1133,6 +1254,7 @@ fn run() -> Result<(), String> {
         &bootrom,
         step_quantum,
         args.board,
+        args.lcd_variant,
         args.psram,
         keyboard.clone(),
     )?;
@@ -1197,6 +1319,8 @@ fn run() -> Result<(), String> {
     // observable.
     let pwm_report = (args.board == Board::PicoCalc).then(|| PwmReport::collect(&emu.bus));
 
+    let pio_report = (args.board == Board::PicoCalc).then(|| PioReport::collect(&mut emu.bus));
+
     let unsupported = emu.bus.unsupported_mmio_log();
     let unsupported_truncated = emu.bus.unsupported_mmio_log_truncated();
     let uart_sha = sha256_hex(&outcome.uart_bytes);
@@ -1232,6 +1356,7 @@ fn run() -> Result<(), String> {
         psram_report.as_ref(),
         keyboard_report.as_ref(),
         pwm_report.as_ref(),
+        pio_report.as_ref(),
     );
 
     match &args.json {

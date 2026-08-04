@@ -28,6 +28,7 @@
 
 pub mod framebuffer;
 pub mod keyboard;
+pub mod lcd_pio_wire;
 pub mod pins;
 pub mod sha256;
 pub mod st7365p;
@@ -36,4 +37,5 @@ pub mod wire;
 pub use framebuffer::{Framebuffer, PngError};
 pub use keyboard::{KeyEvent, KeyState, Keyboard, KeyboardWire};
 pub use st7365p::{Colmod, St7365p};
+pub use lcd_pio_wire::LcdPioWire;
 pub use wire::St7365pWire;

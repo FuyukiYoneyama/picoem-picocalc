@@ -1193,6 +1193,16 @@ impl Emulator {
             let mask = 1u32 << pin;
             out = (out & !mask) | ((miso as u32) << pin);
         }
+        // Devices wired to pins the chip drives directly, rather than
+        // through a controller's FIFO. A PIO-driven display is the case
+        // this exists for: nothing passes through SPI, so the only way
+        // to see the traffic is to watch the pads.
+        for device in &mut self.bus.pin_devices {
+            if let Some((pin, level)) = device.tick(out) {
+                let mask = 1u32 << pin;
+                out = (out & !mask) | ((level as u32) << pin);
+            }
+        }
         let ext_mask = self.bus.external_gpio_in_mask;
         if ext_mask != 0 {
             out = (out & !ext_mask) | (self.bus.external_gpio_in_override & ext_mask);

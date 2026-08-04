@@ -186,6 +186,18 @@ impl StateMachine {
     /// Read-only view of the SM's program counter (5-bit, 0..=31).
     /// Diagnostic — chip-side observers (PicoGUS bring-up harness) need
     /// to track PC advances per system clock without going through MMIO.
+    /// True while this state machine is stalled waiting for data that
+    /// never came out of an empty TX FIFO — a blocking `PULL`, or an
+    /// `OUT` with autopull enabled.
+    ///
+    /// `FDEBUG.TXSTALL` latches from this. Firmware uses that latch to
+    /// tell "the FIFO is empty" (which is also true the instant before
+    /// the last word is consumed) apart from "the shift engine has run
+    /// dry", which is the real end-of-transfer signal.
+    pub fn stalled_on_empty_tx(&self) -> bool {
+        self.stalled && matches!(self.stall_kind, StallKind::Pull)
+    }
+
     pub fn pc(&self) -> u8 {
         self.pc
     }

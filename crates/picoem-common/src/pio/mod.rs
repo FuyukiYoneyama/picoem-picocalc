@@ -4,6 +4,10 @@ pub mod sm;
 
 use sm::{StallKind, StateMachine};
 
+/// Bit position of `FDEBUG.TXSTALL` for state machine 0; SM *n* uses
+/// `FDEBUG_TXSTALL_LSB + n`.
+const FDEBUG_TXSTALL_LSB: u32 = 24;
+
 /// One PIO block (RP2350 has three: PIO0, PIO1, PIO2).
 pub struct PioBlock {
     /// Per-SM state. `StateMachine` fields are `pub(crate)` — invariants
@@ -367,9 +371,26 @@ impl PioBlock {
                 );
             }
         }
+        self.latch_tx_stalls();
         self.merge_pin_outputs();
         #[cfg(feature = "pio-pad-diag")]
         self.bump_pad_out_diag();
+    }
+
+    /// Latch `FDEBUG.TXSTALL` for any state machine that is stalled on
+    /// an empty TX FIFO.
+    ///
+    /// The bit is sticky and write-1-to-clear, which is exactly how
+    /// firmware uses it: clear the bit, push a transfer, then wait for
+    /// it to come back to know the shift engine has drained. `FSTAT`'s
+    /// TXEMPTY cannot answer that question, because it goes true while
+    /// the last word is still being shifted out.
+    fn latch_tx_stalls(&mut self) {
+        for i in 0..4 {
+            if self.sm[i].stalled_on_empty_tx() {
+                self.fdebug |= 1 << (FDEBUG_TXSTALL_LSB + i as u32);
+            }
+        }
     }
 
     /// Advance PIO block by `n` system clocks. Quantum-end variant of

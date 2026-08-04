@@ -106,14 +106,22 @@ impl Colmod {
         }
     }
 
-    /// Decode a `COLMOD` register value. Only the pixel-format field
-    /// (bits [2:0] of the DPI/DBI nibbles) is meaningful here; anything
-    /// this model cannot unpack is reported as `None` and leaves the
-    /// previous format in force.
+    /// Decode a `COLMOD` register value.
+    ///
+    /// The register carries two independent widths: bits [6:4] set the
+    /// RGB (DPI) interface and bits [2:0] set the MCU (DBI) interface.
+    /// Everything here arrives over the serial MCU interface, so only
+    /// the DBI field matters — which is why `0x65` (18-bit RGB, 16-bit
+    /// MCU, what the Canonical BSP writes) has to decode as RGB565 just
+    /// like `0x55` does. Reading the whole byte instead would leave the
+    /// previous format in force and silently misread every pixel.
+    ///
+    /// A DBI width this model cannot unpack returns `None` and leaves
+    /// the current format alone.
     pub const fn from_reg(value: u8) -> Option<Colmod> {
-        match value {
-            0x55 => Some(Colmod::Rgb565),
-            0x66 => Some(Colmod::Rgb666),
+        match value & 0x07 {
+            0x5 => Some(Colmod::Rgb565),
+            0x6 => Some(Colmod::Rgb666),
             _ => None,
         }
     }
@@ -187,6 +195,9 @@ pub struct St7365p {
     /// True until the master has clocked the dummy byte that follows
     /// RAMRD.
     ramrd_dummy_pending: bool,
+    /// Whether a dummy byte precedes RAMRD pixel data (see
+    /// []).
+    ramrd_emits_dummy: bool,
     /// Which of the three bytes of the current pixel comes next.
     ramrd_phase: u8,
     /// Pixel currently being shifted out, expanded to 6-bit channels.
@@ -247,6 +258,7 @@ impl St7365p {
             ramwr_count: 0,
             ramrd_count: 0,
             ramrd_dummy_pending: false,
+            ramrd_emits_dummy: true,
             ramrd_phase: 0,
             ramrd_pixel: [0; 3],
             madctl_count: 0,
@@ -269,6 +281,25 @@ impl St7365p {
     ///
     /// A RESET low→high edge re-initialises the controller, counting one
     /// [`Self::reset_pulses`].
+    /// True while RESET is asserted (the pin is low).
+    pub fn in_reset(&self) -> bool {
+        self.reset_asserted
+    }
+
+    /// Whether RAMRD emits its dummy byte before pixel data.
+    ///
+    /// The panel always sends one, but where it lands depends on how the
+    /// transport delivers replies. Variant A's SPI hook answers within
+    /// the same transfer, so the dummy occupies the byte right after the
+    /// opcode, exactly as the datasheet describes. Variant B's wire is
+    /// bit-level full duplex, so a reply is already one byte behind —
+    /// counting the dummy again would push pixel data a byte late and
+    /// the firmware would read the tail of one pixel and the head of the
+    /// next. Set this false for such a transport.
+    pub fn set_ramrd_dummy(&mut self, emit: bool) {
+        self.ramrd_emits_dummy = emit;
+    }
+
     pub fn set_control_lines(&mut self, cs: bool, dc: bool, reset: bool) {
         self.cs_asserted = !cs;
         self.dc_data = dc;
@@ -313,16 +344,26 @@ impl St7365p {
             self.ramrd_dummy_pending = false;
             return 0;
         }
+        // Readback width follows the pixel format the firmware selected,
+        // the same as writes: RGB666 hands back three bytes per pixel,
+        // RGB565 two.
+        let width = self.colmod.bytes_per_pixel() as u8;
         if self.ramrd_phase == 0 {
             let colour = self.peek_pixel();
-            let r = (((colour >> 11) & 0x1F) as u8) << 3;
-            let g = (((colour >> 5) & 0x3F) as u8) << 2;
-            let b = ((colour & 0x1F) as u8) << 3;
-            self.ramrd_pixel = [b, g, r];
+            self.ramrd_pixel = match self.colmod {
+                Colmod::Rgb666 => {
+                    let r = (((colour >> 11) & 0x1F) as u8) << 3;
+                    let g = (((colour >> 5) & 0x3F) as u8) << 2;
+                    let b = ((colour & 0x1F) as u8) << 3;
+                    [b, g, r]
+                }
+                // Big-endian on the wire, matching RAMWR.
+                Colmod::Rgb565 => [(colour >> 8) as u8, colour as u8, 0],
+            };
             self.advance_pointer();
         }
         let byte = self.ramrd_pixel[self.ramrd_phase as usize];
-        self.ramrd_phase = (self.ramrd_phase + 1) % 3;
+        self.ramrd_phase = (self.ramrd_phase + 1) % width;
         byte
     }
 
@@ -387,7 +428,7 @@ impl St7365p {
                 self.y = self.row_start;
                 // The first byte the master clocks after RAMRD is a
                 // dummy; pixel data starts on the one after it.
-                self.ramrd_dummy_pending = true;
+                self.ramrd_dummy_pending = self.ramrd_emits_dummy;
                 self.ramrd_phase = 0;
             }
             CMD_MADCTL => self.madctl_count += 1,
