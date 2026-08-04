@@ -24,6 +24,7 @@ pub mod peripheral_dispatch;
 pub mod ppb;
 pub mod resets;
 pub mod sio;
+pub mod ssi_flash;
 pub mod systick;
 
 use std::collections::HashMap;
@@ -103,6 +104,17 @@ pub const TIMER_BASE: u32 = 0x4005_4000;
 pub const WATCHDOG_BASE: u32 = 0x4005_8000;
 pub const XIP_CTRL_BASE: u32 = 0x1400_0000;
 pub const SSI_BASE: u32 = 0x1800_0000;
+/// XIP_SSI register offsets touched by the boot-time flash helpers.
+const SSI_SSIENR: u32 = 0x08;
+const SSI_TXFLR: u32 = 0x20;
+const SSI_RXFLR: u32 = 0x24;
+const SSI_SR: u32 = 0x28;
+const SSI_DR0: u32 = 0x60;
+/// SSI_SR bits: transmit FIFO not full, transmit FIFO empty, receive
+/// FIFO not empty.
+const SSI_SR_TFNF: u32 = 1 << 1;
+const SSI_SR_TFE: u32 = 1 << 2;
+const SSI_SR_RFNE: u32 = 1 << 3;
 pub const XIP_SRAM_BASE: u32 = 0x1500_0000;
 pub const XIP_SRAM_END: u32 = 0x1500_4000; // 16 KB
 /// XIP flash window base. Aliases at `+0x0100_0000`, `+0x0200_0000`,
@@ -336,6 +348,9 @@ pub struct Bus {
     xip_ctrl_regs: HashMap<u32, u32>,
     /// SSI register backing store (stub).
     ssi_regs: HashMap<u32, u32>,
+    /// SPI flash as seen through XIP_SSI, for the boot-time commands
+    /// firmware asks the chip rather than reading from the XIP window.
+    pub ssi_flash: ssi_flash::SsiFlash,
     /// Catch-all APB peripheral register backing store for blocks we
     /// don't model in detail (PSM / BUSCTRL / SYSCFG / IO_QSPI / PADS_QSPI /
     /// UART / SPI / I2C / ADC / PWM / TIMER / WATCHDOG / RTC / VREG / TBMAN).
@@ -521,6 +536,7 @@ impl Bus {
             xip_sram: Box::new([0u8; XIP_SRAM_SIZE]),
             xip_ctrl_regs: HashMap::new(),
             ssi_regs: HashMap::new(),
+            ssi_flash: ssi_flash::SsiFlash::new(),
             peripheral_regs: HashMap::new(),
             pio: [PioBlock::new(), PioBlock::new()],
             watchdog_tick: WatchdogTickRegs::new(),
@@ -1078,17 +1094,48 @@ impl Bus {
         self.xip_ctrl_regs.insert(offset, val);
     }
 
-    fn ssi_read(&self, offset: u32) -> u32 {
-        // SSI_SR (offset 0x28) is polled frequently; report TFE|BF set so
-        // firmware transmit-wait loops terminate. Other regs return 0.
+    fn ssi_read(&mut self, offset: u32) -> u32 {
         match offset {
-            0x28 => 0x04 | 0x01, // TFE | BUSY-cleared
+            // SR: transfers complete as soon as they are issued, so the
+            // TX side always reports empty and not-full, and BUSY stays
+            // clear. RFNE follows the modelled flash's reply queue —
+            // without it, `flash_do_cmd` waits for a byte that never
+            // arrives.
+            SSI_SR => {
+                let mut status = SSI_SR_TFNF | SSI_SR_TFE;
+                if self.ssi_flash.has_rx() {
+                    status |= SSI_SR_RFNE;
+                }
+                status
+            }
+            // FIFO levels. The bootrom transfer loop reads these rather
+            // than the status flags to decide how much it may push and
+            // how much has come back. Transmit completes as it is
+            // issued, so the transmit level is always zero.
+            SSI_TXFLR => 0,
+            SSI_RXFLR => self.ssi_flash.rx_len(),
+            SSI_DR0 => self.ssi_flash.pop_rx() as u32,
             _ => *self.ssi_regs.get(&offset).unwrap_or(&0),
         }
     }
 
     fn ssi_write(&mut self, offset: u32, val: u32) {
-        self.ssi_regs.insert(offset, val);
+        match offset {
+            // Disabling the controller ends whatever transaction was in
+            // flight. The boot helpers bracket every command with an
+            // SSIENR toggle, which is what delimits one command from the
+            // next here.
+            SSI_SSIENR => {
+                if val & 1 == 0 {
+                    self.ssi_flash.end_transaction();
+                }
+                self.ssi_regs.insert(offset, val);
+            }
+            SSI_DR0 => self.ssi_flash.push_tx(val as u8),
+            _ => {
+                self.ssi_regs.insert(offset, val);
+            }
+        }
     }
 
     // ----------------------------------------------------------------

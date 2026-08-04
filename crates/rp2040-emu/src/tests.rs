@@ -5029,7 +5029,7 @@ mod stage2_bus_coverage {
         assert_eq!(bus.read16(XIP_CTRL_BASE + 0x4), 0x1234);
 
         // SSI byte / halfword reads cover the non-word widths.
-        assert_eq!(bus.read8(SSI_BASE + 0x28) & 0x5, 0x5);
+        assert_eq!(bus.read8(SSI_BASE + 0x28) & 0x7, 0x6);
 
         // XIP flash byte / halfword after load.
         bus.load_flash(&[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -5449,7 +5449,10 @@ mod stage2_bus_coverage {
     #[test]
     fn ssi_sr_read_returns_flags() {
         let mut bus = Bus::new();
-        assert_eq!(bus.read32(SSI_BASE + 0x28) & 0x5, 0x5);
+        // TFE|TFNF with BUSY clear. The earlier stub reported BUSY set
+        // permanently, which no real controller does and which hangs any
+        // firmware that waits for a transfer to finish.
+        assert_eq!(bus.read32(SSI_BASE + 0x28) & 0x7, 0x6);
         // Other SSI offsets default to 0.
         let _ = bus.read32(SSI_BASE);
     }
