@@ -33,7 +33,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use picocalc_board::sha256::sha256_hex;
-use picocalc_board::{Framebuffer, St7365p, St7365pWire, pins};
+use picocalc_board::{Framebuffer, Keyboard, KeyboardWire, St7365p, St7365pWire, pins};
 use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 
 /// Report schema version. Bump on any breaking field change.
@@ -41,7 +41,7 @@ use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 /// * 1 — Gate 1: boot / UART / unsupported-MMIO report.
 /// * 2 — Gate 2: optional `lcd` + `framebuffer` sections, `board` field.
 /// * 3 — Gate 3: optional `psram` section (`--psram` / `--psram-verify-range`).
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Default 16 KB RP2040 bootrom image, relative to the repo root.
 const DEFAULT_BOOTROM_PATH: &str = "roms/rp2040/bootrom-rp2040-b2.bin";
@@ -164,6 +164,8 @@ struct Args {
     quantum: Option<u32>,
     psram: bool,
     psram_verify_range: Option<(u32, u32)>,
+    keyboard: bool,
+    keys: Option<String>,
 }
 
 /// Parse a `start:len` range, e.g. `0:10000` or `0x100:0x2000` (either
@@ -239,6 +241,8 @@ fn parse_args() -> Result<Args, String> {
     let mut quantum: Option<u32> = None;
     let mut psram = false;
     let mut psram_verify_range: Option<(u32, u32)> = None;
+    let mut keyboard = false;
+    let mut keys: Option<String> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -285,6 +289,8 @@ fn parse_args() -> Result<Args, String> {
                 quantum = Some(n);
             }
             "--psram" => psram = true,
+            "--keyboard" => keyboard = true,
+            "--keys" => keys = Some(value("--keys")?),
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
                 psram_verify_range = Some(parse_range(&raw)?);
@@ -304,6 +310,10 @@ fn parse_args() -> Result<Args, String> {
     if psram_verify_range.is_some() && !psram {
         return Err("--psram-verify-range requires --psram".to_string());
     }
+    // Queueing keys implies the controller they arrive through.
+    if keys.is_some() {
+        keyboard = true;
+    }
 
     Ok(Args {
         bin: bin.ok_or_else(|| "missing required --bin <path>".to_string())?,
@@ -318,6 +328,8 @@ fn parse_args() -> Result<Args, String> {
         quantum,
         psram,
         psram_verify_range,
+        keyboard,
+        keys,
     })
 }
 
@@ -410,12 +422,14 @@ impl BootMode {
 }
 
 /// Build the emulator and perform the direct-boot handoff.
+#[allow(clippy::type_complexity)]
 fn boot(
     firmware: Vec<u8>,
     bootrom: &[u8],
     step_quantum: u32,
     board: Board,
     psram: bool,
+    keyboard: Option<Arc<Mutex<Keyboard>>>,
 ) -> Result<(Emulator, BootMode, Option<Arc<Mutex<St7365p>>>), String> {
     let mut builder = EmulatorBuilder::new(Config {
         sys_clk_hz: DEFAULT_SYS_CLK_HZ,
@@ -448,6 +462,14 @@ fn boot(
             Some(lcd)
         }
     };
+
+    // The keyboard/power controller hangs off I2C1 regardless of the
+    // display model, same as the real mainboard.
+    if let Some(kbd) = keyboard {
+        emu.bus
+            .attach_i2c_device(pins::KEYBOARD_I2C_INSTANCE, Box::new(KeyboardWire::new(kbd)))
+            .map_err(|i| format!("no I2C instance {i} on RP2040"))?;
+    }
 
     // Loaded, never executed — see the module docs.
     emu.load_bootrom(bootrom);
@@ -750,6 +772,51 @@ fn verify_psram_range(buffer: &[u8], start: u32, len: u32) -> PsramVerifyReport 
 }
 
 /// The `psram` report section.
+/// The `keyboard` report section (Gate 4).
+struct KeyboardReport {
+    attached: bool,
+    addr: u16,
+    reg_selects: u64,
+    key_events_delivered: u64,
+    key_events_remaining: usize,
+    battery_reads: u64,
+    backlight_writes: u64,
+    backlight: u8,
+    unknown_reg_selects: u64,
+    last_unknown_reg: Option<u8>,
+}
+
+impl KeyboardReport {
+    fn to_json(&self) -> String {
+        let mut s = String::new();
+        s.push_str("  \"keyboard\": {\n");
+        s.push_str(&format!(
+            "    \"attached\": {}, \"addr\": \"0x{:02x}\",\n",
+            self.attached, self.addr
+        ));
+        s.push_str(&format!(
+            "    \"reg_selects\": {}, \"key_events_delivered\": {}, \"key_events_remaining\": {},\n",
+            self.reg_selects, self.key_events_delivered, self.key_events_remaining
+        ));
+        s.push_str(&format!(
+            "    \"battery_reads\": {}, \"backlight_writes\": {}, \"backlight\": {},\n",
+            self.battery_reads, self.backlight_writes, self.backlight
+        ));
+        match self.last_unknown_reg {
+            Some(reg) => s.push_str(&format!(
+                "    \"unknown_reg_selects\": {}, \"last_unknown_reg\": \"0x{:02x}\"\n",
+                self.unknown_reg_selects, reg
+            )),
+            None => s.push_str(&format!(
+                "    \"unknown_reg_selects\": {}, \"last_unknown_reg\": null\n",
+                self.unknown_reg_selects
+            )),
+        }
+        s.push_str("  },\n");
+        s
+    }
+}
+
 struct PsramReport {
     attached: bool,
     tick_count: u64,
@@ -831,6 +898,7 @@ fn build_report(
     lcd: Option<&LcdReport>,
     fb: Option<&FramebufferReport>,
     psram: Option<&PsramReport>,
+    keyboard: Option<&KeyboardReport>,
 ) -> String {
     let mut s = String::new();
     s.push_str("{\n");
@@ -918,6 +986,9 @@ fn build_report(
     if let Some(psram) = psram {
         s.push_str(&psram.to_json());
     }
+    if let Some(keyboard) = keyboard {
+        s.push_str(&keyboard.to_json());
+    }
 
     s.push_str(&format!(
         "  \"uart\": {{\"bytes\": {}, \"sha256\": {}}}\n",
@@ -984,7 +1055,28 @@ fn run() -> Result<(), String> {
         (None, false, false, Board::None) => QUANTUM_FREE_RUN,
     };
 
-    let (mut emu, boot_mode, lcd) = boot(firmware, &bootrom, step_quantum, args.board, args.psram)?;
+    let keyboard = args.keyboard.then(|| {
+        let kbd = Arc::new(Mutex::new(Keyboard::picocalc()));
+        if let Some(keys) = args.keys.as_deref() {
+            let mut guard = kbd.lock().expect("keyboard mutex");
+            for ch in keys.chars() {
+                // Only 8-bit codes cross the wire; the controller has no
+                // encoding for anything wider.
+                let code = u8::try_from(ch as u32).unwrap_or(b'?');
+                guard.press_and_release(code);
+            }
+        }
+        kbd
+    });
+
+    let (mut emu, boot_mode, lcd) = boot(
+        firmware,
+        &bootrom,
+        step_quantum,
+        args.board,
+        args.psram,
+        keyboard.clone(),
+    )?;
     emu.bus.unsupported_mmio_log_enabled = true;
 
     let outcome = run_loop(&mut emu, args.cycles, args.stop_pc);
@@ -1025,6 +1117,22 @@ fn run() -> Result<(), String> {
         None
     };
 
+    let keyboard_report = keyboard.as_ref().map(|kbd| {
+        let k = kbd.lock().expect("keyboard mutex");
+        KeyboardReport {
+            attached: true,
+            addr: picocalc_board::keyboard::KEYBOARD_I2C_ADDR,
+            reg_selects: k.reg_selects,
+            key_events_delivered: k.key_events_delivered,
+            key_events_remaining: k.queued(),
+            battery_reads: k.battery_reads,
+            backlight_writes: k.backlight_writes,
+            backlight: k.backlight,
+            unknown_reg_selects: k.unknown_reg_selects,
+            last_unknown_reg: k.last_unknown_reg,
+        }
+    });
+
     let unsupported = emu.bus.unsupported_mmio_log();
     let unsupported_truncated = emu.bus.unsupported_mmio_log_truncated();
     let uart_sha = sha256_hex(&outcome.uart_bytes);
@@ -1058,6 +1166,7 @@ fn run() -> Result<(), String> {
         lcd_report.as_ref(),
         fb_report.as_ref(),
         psram_report.as_ref(),
+        keyboard_report.as_ref(),
     );
 
     match &args.json {

@@ -118,3 +118,26 @@ pub fn psram_picocalc() -> picoem_devices::Psram {
     picoem_devices::Psram::new(PSRAM_PIN_MISO, PSRAM_PIN_CS, PSRAM_PIN_SCK, PSRAM_PIN_MOSI)
         .with_read_output_delay(1)
 }
+
+// ---------------------------------------------------------------------
+// Keyboard / power controller (STM32) on I2C1
+// ---------------------------------------------------------------------
+//
+// From `picocalc_helloworld/i2ckbd/i2ckbd.h`:
+//
+//     #define I2C_KBD_MOD   i2c1
+//     #define I2C_KBD_SDA   6
+//     #define I2C_KBD_SCL   7
+//     #define I2C_KBD_SPEED 10000   // 10 kHz when both I2C blocks are in use
+//     #define I2C_KBD_ADDR  0x1F
+//
+// The Canonical BSP drives the same controller at 400 kHz with a
+// repeated START; the bus speed does not change the byte sequence, so
+// one model serves both.
+
+/// I2C controller index the keyboard hangs off (`i2c1`).
+pub const KEYBOARD_I2C_INSTANCE: usize = 1;
+/// SDA pin. `I2C_KBD_SDA`.
+pub const KEYBOARD_PIN_SDA: u8 = 6;
+/// SCL pin. `I2C_KBD_SCL`.
+pub const KEYBOARD_PIN_SCL: u8 = 7;

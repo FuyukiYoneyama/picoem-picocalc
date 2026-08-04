@@ -1823,6 +1823,34 @@ impl Bus {
         }
     }
 
+    /// Attach an off-chip I2C slave to controller `instance` (0 or 1),
+    /// returning whatever was attached before. `Err(instance)` for an
+    /// out-of-range controller.
+    pub fn attach_i2c_device(
+        &mut self,
+        instance: usize,
+        device: Box<dyn crate::peripherals::i2c::I2cExternalDevice>,
+    ) -> Result<Option<Box<dyn crate::peripherals::i2c::I2cExternalDevice>>, usize> {
+        match instance {
+            0 => Ok(self.i2c0.attach_device(device)),
+            1 => Ok(self.i2c1.attach_device(device)),
+            other => Err(other),
+        }
+    }
+
+    /// Mutably borrow the slave attached to I2C `instance`, e.g. to
+    /// inject input from a scenario.
+    pub fn i2c_device_mut(
+        &mut self,
+        instance: usize,
+    ) -> Option<&mut (dyn crate::peripherals::i2c::I2cExternalDevice + 'static)> {
+        match instance {
+            0 => self.i2c0.device_mut(),
+            1 => self.i2c1.device_mut(),
+            _ => None,
+        }
+    }
+
     /// True iff instance `instance` has an off-chip slave attached.
     pub fn spi_has_device(&self, instance: usize) -> bool {
         match instance {

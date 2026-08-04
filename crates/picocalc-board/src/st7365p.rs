@@ -21,7 +21,7 @@
 //! | `0x2A` | CASET    | Column window, 4 parameter bytes.             |
 //! | `0x2B` | RASET    | Row window, 4 parameter bytes.                |
 //! | `0x2C` | RAMWR    | Pixel stream into the window.                 |
-//! | `0x2E` | RAMRD    | Counted; returns 0 (see below).               |
+//! | `0x2E` | RAMRD    | Pixel stream out of the window (see below).   |
 //! | `0x36` | MADCTL   | Recorded (see below).                         |
 //! | `0x3A` | COLMOD   | Pixel format; selects bytes-per-pixel.        |
 //!
@@ -47,11 +47,17 @@
 //!   the PicoCalc glass needs it to show `BLACK` as black. Applying an
 //!   inversion to the decoded stream would produce a white background,
 //!   the opposite of the device. Recorded, not applied.
-//! * **RAMRD (`0x2E`)** — the read path (`read_buffer_spi`, used only by
-//!   `scroll_lcd_spi`) is counted but returns zero bytes. Modelling the
-//!   ST7365P read protocol needs the dummy-byte / byte-order behaviour
-//!   confirmed against silicon. `Hello World PicoCalc` never scrolls, so
-//!   a non-zero `ramrd_count` is the signal that this gap became live.
+//! # RAMRD byte order
+//!
+//! `read_buffer_spi` clocks one dummy byte after `0x2E`, then three
+//! bytes per pixel, and finally swaps each triple's first and third
+//! byte before `draw_buffer_spi` writes it straight back with RAMWR.
+//! `scroll_lcd_spi` moves a line through exactly that read-swap-write
+//! round trip, so for a scrolled line to keep its colour the panel has
+//! to answer in the reverse of the RAMWR order: blue first, red last.
+//! That is what this model does, and
+//! `ramrd_round_trip_through_the_drivers_byte_swap_preserves_colour`
+//! pins it down.
 //!
 //! # Framing
 //!
@@ -178,6 +184,13 @@ pub struct St7365p {
     pub raset_count: u32,
     pub ramwr_count: u32,
     pub ramrd_count: u32,
+    /// True until the master has clocked the dummy byte that follows
+    /// RAMRD.
+    ramrd_dummy_pending: bool,
+    /// Which of the three bytes of the current pixel comes next.
+    ramrd_phase: u8,
+    /// Pixel currently being shifted out, expanded to 6-bit channels.
+    ramrd_pixel: [u8; 3],
     pub madctl_count: u32,
     pub colmod_count: u32,
     pub pixels_written: u64,
@@ -233,6 +246,9 @@ impl St7365p {
             raset_count: 0,
             ramwr_count: 0,
             ramrd_count: 0,
+            ramrd_dummy_pending: false,
+            ramrd_phase: 0,
+            ramrd_pixel: [0; 3],
             madctl_count: 0,
             colmod_count: 0,
             pixels_written: 0,
@@ -272,11 +288,52 @@ impl St7365p {
             return 0;
         }
         if self.dc_data {
+            // A read in progress takes priority: the master keeps DC
+            // high and clocks dummy bytes out to receive pixel data.
+            if self.command == CMD_RAMRD {
+                return self.ramrd_byte();
+            }
             self.data_byte(byte);
         } else {
             self.command_byte(byte);
         }
         0
+    }
+
+    /// Produce the next byte of a RAMRD stream.
+    ///
+    /// The panel answers with three bytes per pixel, one 6-bit channel
+    /// each in the top bits, and the driver in `read_buffer_spi` swaps
+    /// the first and third before writing them back with RAMWR. For a
+    /// read-modify-write scroll to preserve colour, the order on the
+    /// wire must therefore be the reverse of what RAMWR consumes — blue
+    /// first, red last.
+    fn ramrd_byte(&mut self) -> u8 {
+        if self.ramrd_dummy_pending {
+            self.ramrd_dummy_pending = false;
+            return 0;
+        }
+        if self.ramrd_phase == 0 {
+            let colour = self.peek_pixel();
+            let r = (((colour >> 11) & 0x1F) as u8) << 3;
+            let g = (((colour >> 5) & 0x3F) as u8) << 2;
+            let b = ((colour & 0x1F) as u8) << 3;
+            self.ramrd_pixel = [b, g, r];
+            self.advance_pointer();
+        }
+        let byte = self.ramrd_pixel[self.ramrd_phase as usize];
+        self.ramrd_phase = (self.ramrd_phase + 1) % 3;
+        byte
+    }
+
+    /// Frame-memory contents at the read pointer, without advancing it.
+    fn peek_pixel(&self) -> u16 {
+        let (x, y) = (self.x as usize, self.y as usize);
+        if x < GRAM_WIDTH && y < GRAM_HEIGHT {
+            self.gram[y * GRAM_WIDTH + x]
+        } else {
+            0
+        }
     }
 
     // --- decoder ------------------------------------------------------
@@ -322,7 +379,17 @@ impl St7365p {
                 self.x = self.col_start;
                 self.y = self.row_start;
             }
-            CMD_RAMRD => self.ramrd_count += 1,
+            CMD_RAMRD => {
+                self.ramrd_count += 1;
+                // Same pointer reset as RAMWR: the driver sets a window
+                // with CASET/RASET and then streams pixels out of it.
+                self.x = self.col_start;
+                self.y = self.row_start;
+                // The first byte the master clocks after RAMRD is a
+                // dummy; pixel data starts on the one after it.
+                self.ramrd_dummy_pending = true;
+                self.ramrd_phase = 0;
+            }
             CMD_MADCTL => self.madctl_count += 1,
             CMD_COLMOD => self.colmod_count += 1,
             other => self.note_unknown(other),
@@ -493,6 +560,14 @@ mod tests {
         d.set_control_lines(true, false, true);
         d.set_control_lines(false, false, true);
         d
+    }
+
+    /// Set a CASET/RASET window from inclusive pixel coordinates.
+    fn set_window(d: &mut St7365p, x0: u16, y0: u16, x1: u16, y1: u16) {
+        cmd(d, CMD_CASET);
+        data(d, &[(x0 >> 8) as u8, x0 as u8, (x1 >> 8) as u8, x1 as u8]);
+        cmd(d, CMD_RASET);
+        data(d, &[(y0 >> 8) as u8, y0 as u8, (y1 >> 8) as u8, y1 as u8]);
     }
 
     fn cmd(d: &mut St7365p, code: u8) {
@@ -728,12 +803,79 @@ mod tests {
     }
 
     #[test]
-    fn ramrd_is_counted_and_returns_zero() {
+    fn ramrd_is_counted_and_starts_with_a_dummy_byte() {
         let mut d = ready();
         cmd(&mut d, CMD_RAMRD);
         d.set_control_lines(false, true, true);
-        assert_eq!(d.transfer_byte(0xFF), 0);
+        assert_eq!(d.transfer_byte(0xFF), 0, "first byte after RAMRD is dummy");
         assert_eq!(d.ramrd_count, 1);
+    }
+
+    /// `read_buffer_spi` reads three bytes per pixel, swaps the first
+    /// and third, and `draw_buffer_spi` writes the result straight back.
+    /// That round trip is how `scroll_lcd_spi` moves a line, so it has
+    /// to return the pixel unchanged.
+    #[test]
+    fn ramrd_round_trip_through_the_drivers_byte_swap_preserves_colour() {
+        let mut d = ready();
+        // Paint one known pixel at the origin.
+        set_window(&mut d, 0, 0, 0, 0);
+        cmd(&mut d, CMD_RAMWR);
+        d.set_control_lines(false, true, true);
+        // RGB666 wire order for RAMWR is R, G, B.
+        for b in [0xF8u8, 0x40, 0x08] {
+            d.transfer_byte(b);
+        }
+        let stored = d.gram[0];
+
+        // Read it back the way the driver does.
+        set_window(&mut d, 0, 0, 0, 0);
+        cmd(&mut d, CMD_RAMRD);
+        d.set_control_lines(false, true, true);
+        let _dummy = d.transfer_byte(0xFF);
+        let mut got = [0u8; 3];
+        for slot in got.iter_mut() {
+            *slot = d.transfer_byte(0xFF);
+        }
+        // The driver's swap: p[0] and p[2] exchange places.
+        got.swap(0, 2);
+
+        // Write the swapped buffer back to a different pixel.
+        set_window(&mut d, 5, 5, 5, 5);
+        cmd(&mut d, CMD_RAMWR);
+        d.set_control_lines(false, true, true);
+        for b in got {
+            d.transfer_byte(b);
+        }
+        assert_eq!(
+            d.gram[5 * GRAM_WIDTH + 5],
+            stored,
+            "a scrolled line must keep its colour"
+        );
+    }
+
+    #[test]
+    fn ramrd_walks_the_window_pixel_by_pixel() {
+        let mut d = ready();
+        set_window(&mut d, 0, 0, 1, 0);
+        cmd(&mut d, CMD_RAMWR);
+        d.set_control_lines(false, true, true);
+        for b in [0xF8u8, 0x00, 0x00, 0x00, 0x00, 0xF8] {
+            d.transfer_byte(b);
+        }
+
+        set_window(&mut d, 0, 0, 1, 0);
+        cmd(&mut d, CMD_RAMRD);
+        d.set_control_lines(false, true, true);
+        let _dummy = d.transfer_byte(0xFF);
+        let first: Vec<u8> = (0..3).map(|_| d.transfer_byte(0xFF)).collect();
+        let second: Vec<u8> = (0..3).map(|_| d.transfer_byte(0xFF)).collect();
+        // Wire order is B, G, R: a red pixel leads with zero blue and a
+        // blue pixel leads with full blue.
+        assert_eq!(first[0], 0x00, "first pixel is red, so blue is zero");
+        assert_ne!(first[2], 0x00, "first pixel is red, so red is set");
+        assert_ne!(second[0], 0x00, "second pixel is blue");
+        assert_eq!(second[2], 0x00, "second pixel has no red");
     }
 
     #[test]

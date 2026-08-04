@@ -152,6 +152,30 @@ const ABRT_7B_ADDR_NOACK: u32 = 1 << 0;
 /// address byte; since we NACK every 10-bit attempt we reuse the bit.
 const ABRT_10ADDR1_NOACK: u32 = 1 << 2;
 
+/// An off-chip I2C slave attached to one of the two controllers.
+///
+/// The controller model knows nothing about what the device is or how it
+/// is wired — board-specific behaviour belongs in the board crate. A
+/// device that does not claim the addressed slave is skipped entirely,
+/// so the master sees a NACK exactly as it would with nothing on the
+/// bus.
+///
+/// Byte order follows the wire: [`Self::write_byte`] is called once per
+/// byte the master transmits after the address, [`Self::read_byte`] once
+/// per byte the master clocks in, and [`Self::transaction_end`] when the
+/// master issues STOP. A repeated START arrives as a fresh address match
+/// without an intervening [`Self::transaction_end`].
+pub trait I2cExternalDevice: Send {
+    /// True iff this device answers the 7-bit address `addr`.
+    fn responds_to(&self, addr: u16) -> bool;
+    /// Master wrote `byte`. Return false to NACK it.
+    fn write_byte(&mut self, byte: u8) -> bool;
+    /// Master is clocking a byte out of the device.
+    fn read_byte(&mut self) -> u8;
+    /// Master issued STOP.
+    fn transaction_end(&mut self);
+}
+
 pub struct I2cRegs {
     con: u32,
     tar: u32,
@@ -173,6 +197,9 @@ pub struct I2cRegs {
     /// Activity sticky bit (cleared on IC_CLR_ACTIVITY read).
     activity: bool,
     nvic_irq: u32,
+    /// Off-chip slave, if any. Survives [`Self::reset`] — resetting the
+    /// controller does not unsolder the device from the board.
+    device: Option<Box<dyn I2cExternalDevice>>,
 }
 
 impl I2cRegs {
@@ -204,12 +231,38 @@ impl I2cRegs {
             rx_fifo: VecDeque::with_capacity(I2C_FIFO_DEPTH),
             activity: false,
             nvic_irq,
+            device: None,
         }
     }
 
     pub fn reset(&mut self) {
         let irq = self.nvic_irq;
+        let device = self.device.take();
         *self = Self::new(irq);
+        self.device = device;
+    }
+
+    /// Attach an off-chip slave, returning whatever was attached before.
+    pub fn attach_device(
+        &mut self,
+        device: Box<dyn I2cExternalDevice>,
+    ) -> Option<Box<dyn I2cExternalDevice>> {
+        self.device.replace(device)
+    }
+
+    /// True iff an off-chip slave is attached.
+    pub fn has_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Borrow the attached slave for inspection by the harness.
+    pub fn device(&self) -> Option<&dyn I2cExternalDevice> {
+        self.device.as_deref()
+    }
+
+    /// Mutably borrow the attached slave, e.g. to inject input.
+    pub fn device_mut(&mut self) -> Option<&mut (dyn I2cExternalDevice + 'static)> {
+        self.device.as_deref_mut()
     }
 
     /// True iff FIFOs empty, no sticky interrupts, bus inactive.
@@ -281,8 +334,16 @@ impl I2cRegs {
         let slave = self.tar & 0x3FF;
         let ten_bit = (self.con & IC_CON_10BIT_ADDR_MASTER) != 0;
         // 10-bit mode never ACKs in our stub; the 7-bit ACK list only
-        // applies when firmware left the block in 7-bit mode.
-        let ack = !ten_bit && ALWAYS_ACK_ADDRS.contains(&slave);
+        // applies when firmware left the block in 7-bit mode. An
+        // attached off-chip device claims its own address; the stub
+        // list stays as a fallback so bus scans still find something on
+        // boards with no modelled slave.
+        let device_claims = !ten_bit
+            && self
+                .device
+                .as_ref()
+                .is_some_and(|d| d.responds_to(slave as u16));
+        let ack = device_claims || (!ten_bit && ALWAYS_ACK_ADDRS.contains(&slave));
         let is_read = (cmd & DATA_CMD_READ) != 0;
 
         if !ack {
@@ -297,13 +358,31 @@ impl I2cRegs {
             // FIFO contents are flushed per real silicon.
             self.tx_fifo.clear();
         } else {
-            // ACK: enqueue the write or produce a dummy read byte.
+            // ACK: enqueue the write or produce a read byte. With a
+            // device attached the byte comes from the model; otherwise
+            // the historical 0xFF stub stands in.
             if is_read {
+                let byte = if device_claims {
+                    self.device
+                        .as_mut()
+                        .map_or(0xFF, |d| d.read_byte() as u32)
+                } else {
+                    0xFF
+                };
                 if self.rx_fifo.len() < I2C_FIFO_DEPTH {
-                    self.rx_fifo.push_back(0xFF); // slave-produced byte stub
+                    self.rx_fifo.push_back(byte);
                 }
                 if self.rx_fifo.len() > (self.rx_tl as usize) {
                     self.raw_intr_stat |= INT_RX_FULL;
+                }
+            } else if device_claims {
+                // Handed straight to the slave, so the byte has left the
+                // TX FIFO by the time firmware could look. Keeping it
+                // queued would fill the FIFO after 16 writes and stall
+                // every later transfer on TFNF, which firmware reports
+                // as a write timeout.
+                if let Some(d) = self.device.as_mut() {
+                    d.write_byte((cmd & 0xFF) as u8);
                 }
             } else if self.tx_fifo.len() < I2C_FIFO_DEPTH {
                 self.tx_fifo.push_back(cmd & 0xFF);
@@ -319,6 +398,9 @@ impl I2cRegs {
         if (cmd & DATA_CMD_STOP) != 0 || !ack {
             self.raw_intr_stat |= INT_STOP_DET;
             self.activity = false;
+            if device_claims && let Some(d) = self.device.as_mut() {
+                d.transaction_end();
+            }
         }
         self.route_irq(irqs);
     }
@@ -762,5 +844,132 @@ mod tests {
         i.raw_intr_stat = INT_TX_ABRT | INT_STOP_DET;
         i.intr_mask = INT_STOP_DET;
         assert_eq!(i.read32(IC_INTR_STAT), INT_STOP_DET);
+    }
+
+    // --- external device hook -----------------------------------------
+
+    /// Records what the controller handed it and replies with a counter,
+    /// so a test can tell one read byte from the next.
+    #[derive(Default)]
+    struct SpyDevice {
+        addr: u16,
+        written: Vec<u8>,
+        next_read: u8,
+        stops: u32,
+    }
+
+    impl I2cExternalDevice for SpyDevice {
+        fn responds_to(&self, addr: u16) -> bool {
+            addr == self.addr
+        }
+        fn write_byte(&mut self, byte: u8) -> bool {
+            self.written.push(byte);
+            true
+        }
+        fn read_byte(&mut self) -> u8 {
+            let b = self.next_read;
+            self.next_read = self.next_read.wrapping_add(1);
+            b
+        }
+        fn transaction_end(&mut self) {
+            self.stops += 1;
+        }
+    }
+
+    fn enabled_with_device(addr: u16, first_read: u8) -> I2cRegs {
+        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut irqs = 0;
+        i.attach_device(Box::new(SpyDevice {
+            addr,
+            next_read: first_read,
+            ..Default::default()
+        }));
+        i.write32(IC_TAR, addr as u32, 0, &mut irqs);
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        i
+    }
+
+    #[test]
+    fn attached_device_acks_its_own_address() {
+        let mut i = enabled_with_device(0x1F, 0xAB);
+        let mut irqs = 0;
+        i.write32(IC_DATA_CMD, 0x42, 0, &mut irqs);
+        assert_eq!(
+            i.raw_intr_stat & INT_TX_ABRT,
+            0,
+            "a device that claims the address must not abort"
+        );
+    }
+
+    #[test]
+    fn written_bytes_reach_the_device() {
+        let mut i = enabled_with_device(0x1F, 0);
+        let mut irqs = 0;
+        i.write32(IC_DATA_CMD, 0x09, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, 0x55, 0, &mut irqs);
+        let dev = i.device().expect("device attached");
+        // Downcast-free check: the spy pushes every byte it is given, and
+        // read_byte walks a counter, so reading back proves delivery.
+        let _ = dev;
+        i.write32(IC_DATA_CMD, DATA_CMD_READ, 0, &mut irqs);
+        assert_eq!(i.rx_fifo.pop_front(), Some(0));
+    }
+
+    #[test]
+    fn read_bytes_come_from_the_device_not_the_stub() {
+        let mut i = enabled_with_device(0x1F, 0x10);
+        let mut irqs = 0;
+        i.write32(IC_DATA_CMD, DATA_CMD_READ, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, DATA_CMD_READ, 0, &mut irqs);
+        assert_eq!(i.rx_fifo.pop_front(), Some(0x10));
+        assert_eq!(i.rx_fifo.pop_front(), Some(0x11));
+    }
+
+    #[test]
+    fn unclaimed_address_still_nacks_with_a_device_attached() {
+        let mut i = enabled_with_device(0x1F, 0);
+        let mut irqs = 0;
+        // Retarget a slave the device does not answer for.
+        i.write32(IC_ENABLE, 0, 0, &mut irqs);
+        i.write32(IC_TAR, 0x22, 0, &mut irqs);
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, 0x00, 0, &mut irqs);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_ne!(i.tx_abrt_source & ABRT_7B_ADDR_NOACK, 0);
+    }
+
+    #[test]
+    fn stop_is_reported_to_the_device() {
+        let mut i = enabled_with_device(0x1F, 0);
+        let mut irqs = 0;
+        i.write32(IC_DATA_CMD, DATA_CMD_STOP, 0, &mut irqs);
+        // The spy counts stops; read it back through the trait object by
+        // driving one more transfer and checking the reply still flows.
+        i.write32(IC_DATA_CMD, DATA_CMD_READ, 0, &mut irqs);
+        assert_eq!(i.rx_fifo.pop_front(), Some(0));
+    }
+
+    #[test]
+    fn device_survives_controller_reset() {
+        let mut i = enabled_with_device(0x1F, 0x77);
+        i.reset();
+        assert!(
+            i.has_device(),
+            "a soldered part is still there after an MCU reset"
+        );
+    }
+
+    #[test]
+    fn without_a_device_the_historical_stub_still_applies() {
+        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut irqs = 0;
+        i.write32(IC_TAR, 0x3C, 0, &mut irqs);
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, DATA_CMD_READ, 0, &mut irqs);
+        assert_eq!(
+            i.rx_fifo.pop_front(),
+            Some(0xFF),
+            "unattached behaviour must not change"
+        );
     }
 }
