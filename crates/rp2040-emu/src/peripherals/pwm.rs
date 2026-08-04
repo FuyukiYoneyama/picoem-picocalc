@@ -143,6 +143,17 @@ pub struct PwmRegs {
 }
 
 impl PwmRegs {
+    /// Read-only view of one slice, for harnesses that need to report
+    /// whether firmware configured PWM without driving the audio path.
+    pub fn slice(&self, index: usize) -> Option<&PwmSlice> {
+        self.slices.get(index)
+    }
+
+    /// Interrupt-enable bitmap, one bit per slice.
+    pub fn inte(&self) -> u8 {
+        self.inte
+    }
+
     /// Construct a fresh PWM at power-on defaults. `nvic_irq` is the
     /// shared NVIC line (4 for PWM_IRQ_WRAP on RP2040).
     pub fn new(nvic_irq: u32) -> Self {

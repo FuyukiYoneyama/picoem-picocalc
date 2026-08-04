@@ -772,6 +772,61 @@ fn verify_psram_range(buffer: &[u8], start: u32, len: u32) -> PsramVerifyReport 
 }
 
 /// The `psram` report section.
+/// The `pwm` report section (Gate 5).
+///
+/// `picocalc_helloworld` initialises the two audio slices but never
+/// starts sample playback, so the acceptance condition is that the
+/// configuration is observable — not that anything is audible.
+struct PwmReport {
+    configured_slices: Vec<(usize, u32, u16, u32)>,
+    inte: u8,
+}
+
+impl PwmReport {
+    fn collect(bus: &rp2040_emu::Bus) -> Self {
+        let pwm = bus.pwm();
+        let mut configured_slices = Vec::new();
+        for index in 0..rp2040_emu::peripherals::pwm::PWM_SLICE_COUNT {
+            if let Some(slice) = pwm.slice(index) {
+                let touched = slice.csr != 0 || slice.top != TOP_RESET_VALUE || slice.cc != 0;
+                if touched {
+                    configured_slices.push((index, slice.csr, slice.top, slice.cc));
+                }
+            }
+        }
+        Self {
+            configured_slices,
+            inte: pwm.inte(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        let mut s = String::new();
+        s.push_str("  \"pwm\": {\n");
+        s.push_str(&format!("    \"inte\": \"0x{:02x}\",\n", self.inte));
+        s.push_str("    \"configured_slices\": [");
+        for (i, (index, csr, top, cc)) in self.configured_slices.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "\n      {{\"slice\": {index}, \"csr\": \"0x{csr:08x}\", \"top\": {top}, \"cc\": \"0x{cc:08x}\"}}"
+            ));
+        }
+        if self.configured_slices.is_empty() {
+            s.push_str("]\n");
+        } else {
+            s.push_str("\n    ]\n");
+        }
+        s.push_str("  },\n");
+        s
+    }
+}
+
+/// TOP register reset value; a slice still holding it was never given a
+/// wrap point.
+const TOP_RESET_VALUE: u16 = 0xFFFF;
+
 /// The `keyboard` report section (Gate 4).
 struct KeyboardReport {
     attached: bool,
@@ -899,6 +954,7 @@ fn build_report(
     fb: Option<&FramebufferReport>,
     psram: Option<&PsramReport>,
     keyboard: Option<&KeyboardReport>,
+    pwm: Option<&PwmReport>,
 ) -> String {
     let mut s = String::new();
     s.push_str("{\n");
@@ -988,6 +1044,9 @@ fn build_report(
     }
     if let Some(keyboard) = keyboard {
         s.push_str(&keyboard.to_json());
+    }
+    if let Some(pwm) = pwm {
+        s.push_str(&pwm.to_json());
     }
 
     s.push_str(&format!(
@@ -1133,6 +1192,11 @@ fn run() -> Result<(), String> {
         }
     });
 
+    // Always reported when a board model is attached: the official
+    // sample configures PWM during init, and Gate 5 requires that to be
+    // observable.
+    let pwm_report = (args.board == Board::PicoCalc).then(|| PwmReport::collect(&emu.bus));
+
     let unsupported = emu.bus.unsupported_mmio_log();
     let unsupported_truncated = emu.bus.unsupported_mmio_log_truncated();
     let uart_sha = sha256_hex(&outcome.uart_bytes);
@@ -1167,6 +1231,7 @@ fn run() -> Result<(), String> {
         fb_report.as_ref(),
         psram_report.as_ref(),
         keyboard_report.as_ref(),
+        pwm_report.as_ref(),
     );
 
     match &args.json {

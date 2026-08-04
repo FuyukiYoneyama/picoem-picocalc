@@ -1823,6 +1823,12 @@ impl Bus {
         }
     }
 
+    /// Read-only view of the PWM block, for reporting which slices
+    /// firmware configured.
+    pub fn pwm(&self) -> &crate::peripherals::pwm::PwmRegs {
+        &self.pwm
+    }
+
     /// Attach an off-chip I2C slave to controller `instance` (0 or 1),
     /// returning whatever was attached before. `Err(instance)` for an
     /// out-of-range controller.
