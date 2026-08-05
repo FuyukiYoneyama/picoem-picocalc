@@ -1150,6 +1150,23 @@ mod tests {
     }
 
     #[test]
+    fn official_modifier_report_codes_are_exact() {
+        let mut kbd = Keyboard::picocalc();
+        for (modifier, code) in [
+            (Modifier::Alt, KEY_MOD_ALT),
+            (Modifier::LeftShift, KEY_MOD_LEFT_SHIFT),
+            (Modifier::RightShift, KEY_MOD_RIGHT_SHIFT),
+            (Modifier::Symbol, KEY_MOD_SYMBOL),
+            (Modifier::Control, KEY_MOD_CONTROL),
+        ] {
+            kbd.modifier_event(modifier, KeyState::Pressed);
+            assert_eq!(read_event(&mut kbd), KeyEvent::pressed(code));
+            kbd.modifier_event(modifier, KeyState::Released);
+            assert_eq!(read_event(&mut kbd), KeyEvent::released(code));
+        }
+    }
+
+    #[test]
     fn alt_shortcuts_and_hold_repeat_match_the_official_transition() {
         let mut kbd = Keyboard::picocalc();
         kbd.set_internal_config(CFG_USE_MODS);
