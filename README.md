@@ -75,9 +75,13 @@ pixel, and framebuffer-region conditions while firmware is executing.
 The primary reference for keyboard-controller behavior is ClockworkPi's official
 [`PicoCalc/Code/picocalc_keyboard`](https://github.com/clockworkpi/PicoCalc/tree/master/Code/picocalc_keyboard)
 STM32F103R8T6 firmware. In this workspace it is checked out at
-`/home/fuyuki/pico_dvl/codex/PicoCalc/Code/picocalc_keyboard`. The Rust device currently models the
-consumer-visible subset used by the tested RP2040 firmware; full register, modifier, repeat, and
-configurable-overflow conformance is tracked by `picocalc_emu` Milestone R1.
+`/home/fuyuki/pico_dvl/codex/PicoCalc/Code/picocalc_keyboard`. R1 conformance is complete: the Rust
+device pins the consumer-visible `0x01..0x0e` replies, 31-event FIFO, official matrix/button map,
+state and modifier transformations, strict hold/repeat thresholds, both overflow policies,
+backlights, battery, reset, C64, and power-off behavior to that source. It deliberately does not
+simulate STM32 GPIO electrical scanning, debounce and 16 ms polling, or the PMU battery/power-key
+lifecycle. CFG/INT/DEB/FRQ remain internal because the official `receiveEvent()` switch does not
+expose them over I2C.
 
 ```bash
 cargo run --release -p picocalc-harness --bin picocalc-run -- \
@@ -94,13 +98,17 @@ and current hardening work are owned by
 [`picocalc_emu/docs/MILESTONES.md`](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/MILESTONES.md),
 not duplicated here.
 
-Report schema 7 makes that judgement normative. A conformance invocation supplies an accepted
-stop with `--expect-stop` and may repeat `--expect-uart` for required firmware markers. A raw
-cycle-limit run without any acceptance criterion is `cannot_judge`, not pass. Exception, emulator
-error, unsupported or truncated MMIO, keyboard event loss, scenario failure, stop mismatch, and
-missing UART markers cannot silently pass. The report's `verdict.status` and process status use the
-same mapping: 0=`pass`, 1=`fail`, 2=`cannot_judge`. A scenario infrastructure fault also exits 2;
-an assertion, timeout, or incomplete scenario exits 1.
+Report schema 8 makes that judgement normative. Schema 7 introduced the fail-closed verdict;
+schema 8 additionally binds each report to the commit and dirty state compiled into the runner via
+`backend_build`. A conformance invocation supplies an accepted stop with `--expect-stop` and may
+repeat `--expect-uart` for required firmware markers. A raw cycle-limit run without any acceptance
+criterion is `cannot_judge`, not pass. Exception, emulator error, unsupported or truncated MMIO,
+keyboard event loss, scenario failure, stop mismatch, and missing UART markers cannot silently
+pass. The report's `verdict.status` and process status use the same mapping: 0=`pass`, 1=`fail`,
+2=`cannot_judge`. A scenario infrastructure fault also exits 2; an assertion, timeout, or
+incomplete scenario exits 1. Registered cross-repository runs should normally use
+`picocalc_emu/tools/picocalc.py test --mode firmware --target ...`, which verifies schema 8,
+backend/source identity, artifact hashes, device arguments, and report expectations together.
 
 ## Quick Start
 

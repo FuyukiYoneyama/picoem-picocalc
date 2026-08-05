@@ -14,6 +14,22 @@ public release simply ships those current versions.
 
 ## [Unreleased]
 
+### Added
+
+- Add the headless `picocalc-run` RP2040 firmware runner, deterministic JSON scenarios, framebuffer
+  and UART artifacts, and schema 8 structured reports with normative verdicts and compiled-backend
+  provenance.
+- Add PicoCalc board models for both LCD transports, 8 MiB PSRAM, SPI SD, PWM observation, and the
+  I2C keyboard/power controller. The keyboard model is conformance-tested against ClockworkPi's
+  official STM32 firmware, including its 31-event FIFO, key transformations, repeat, and overflow.
+
+### Changed
+
+- Make the generated 64 MiB test SD card FAT32 by default to represent the filesystem choice for
+  PicoCalc's bundled 32 GB card; retain FAT16 as an explicit compatibility profile.
+- Make firmware acceptance fail closed on exceptions, emulator errors, unsupported or truncated
+  MMIO, keyboard loss/protocol errors, scenario failures, stop mismatches, and missing UART markers.
+
 ## [2026-05-09] — fifth release
 
 Catch-up patch republication of the three library crates that were
