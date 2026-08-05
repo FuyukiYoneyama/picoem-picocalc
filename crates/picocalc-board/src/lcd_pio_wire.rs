@@ -74,10 +74,7 @@ impl LcdPioWire {
         // This transport is bit-level full duplex, so a reply is
         // already one byte behind the request; the panel must not also
         // count a dummy byte. See .
-        panel
-            .lock()
-            .expect("panel mutex")
-            .set_ramrd_dummy(false);
+        panel.lock().expect("panel mutex").set_ramrd_dummy(false);
         Self {
             panel,
             last: 0,
