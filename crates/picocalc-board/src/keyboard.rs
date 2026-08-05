@@ -502,29 +502,35 @@ impl Keyboard {
             } else if self.caps_lock && primary.is_ascii_uppercase() {
                 // Caps lock leaves the matrix's uppercase primary value.
             } else if alt {
-                match primary {
-                    b',' => {
-                        output = false;
-                        if state == KeyState::Released {
-                            self.lcd_backlight = self.lcd_backlight.saturating_sub(16).max(16);
+                // The official shortcut branches only inspect Pressed and
+                // Released. Held falls through to the ordinary repeat path.
+                if state != KeyState::Held {
+                    match primary {
+                        b',' => {
+                            output = false;
+                            if state == KeyState::Released {
+                                self.lcd_backlight =
+                                    self.lcd_backlight.saturating_sub(16).max(16);
+                            }
                         }
-                    }
-                    b'.' => {
-                        output = false;
-                        if state == KeyState::Released {
-                            self.lcd_backlight = self.lcd_backlight.saturating_add(16).min(240);
+                        b'.' => {
+                            output = false;
+                            if state == KeyState::Released {
+                                self.lcd_backlight =
+                                    self.lcd_backlight.saturating_add(16).min(240);
+                            }
                         }
-                    }
-                    b' ' => {
-                        output = false;
-                        if state == KeyState::Released {
-                            let next = self.backlight as u16 + 32;
-                            self.backlight = if next > 240 { 0 } else { next as u8 };
+                        b' ' => {
+                            output = false;
+                            if state == KeyState::Released {
+                                let next = self.backlight as u16 + 32;
+                                self.backlight = if next > 240 { 0 } else { next as u8 };
+                            }
                         }
+                        b'B' => output = false,
+                        b'I' => code = KEY_INSERT,
+                        _ => {}
                     }
-                    b'B' => output = false,
-                    b'I' => code = KEY_INSERT,
-                    _ => {}
                 }
             } else if !shift && primary.is_ascii_uppercase() {
                 code = primary.to_ascii_lowercase();
@@ -695,6 +701,10 @@ impl rp2040_emu::peripherals::i2c::I2cExternalDevice for Keyboard {
                 REG_POWER_OFF => self.power_off_delay_s = Some(byte.max(6)),
                 // The selected register's reply builder performs reset.
                 REG_RESET => {}
+                // These official cases ignore the write flag but still
+                // prepare their ordinary reply (FIFO therefore still pops).
+                REG_VERSION | REG_KEY_COUNT | REG_KEY_FIFO | REG_BATTERY
+                | REG_C64_MATRIX | REG_C64_JOYSTICK => {}
                 _ => {
                     self.unknown_reg_writes += 1;
                     self.last_unknown_reg = Some(reg);
@@ -1153,6 +1163,13 @@ mod tests {
         assert_eq!(kbd.backlight, 32);
         assert_eq!(kbd.queued(), 0);
 
+        // The source only applies Alt shortcuts on Pressed/Released;
+        // Held follows the ordinary repeatable-key path.
+        kbd.mapped_key_event(b' ', 0, KeyState::Held);
+        assert_eq!(read_event(&mut kbd), KeyEvent::pressed(b' '));
+        kbd.mapped_key_event(b'I', 0, KeyState::Held);
+        assert_eq!(read_event(&mut kbd), KeyEvent::pressed(b'I'));
+
         kbd.modifier_event(Modifier::Alt, KeyState::Released);
         kbd.mapped_key_event(b'A', 0, KeyState::Held);
         assert_eq!(read_event(&mut kbd), KeyEvent::pressed(b'a'));
@@ -1185,5 +1202,18 @@ mod tests {
         write_register(&mut kbd, 0x77, 0x12);
         assert_eq!(kbd.unknown_reg_writes, 1);
         assert_eq!(kbd.last_unknown_reg, Some(0x77));
+    }
+
+    #[test]
+    fn write_flag_on_an_official_read_case_is_not_a_protocol_error() {
+        let mut kbd = Keyboard::picocalc();
+        write_register(&mut kbd, REG_VERSION, 0xAA);
+        assert_eq!(read_word(&mut kbd), 0x1600);
+        assert_eq!(kbd.unknown_reg_writes, 0);
+
+        kbd.push_event(KeyEvent::pressed(b'q'));
+        write_register(&mut kbd, REG_KEY_FIFO, 0);
+        assert_eq!(read_word(&mut kbd), 0x7101);
+        assert_eq!(kbd.unknown_reg_writes, 0);
     }
 }
