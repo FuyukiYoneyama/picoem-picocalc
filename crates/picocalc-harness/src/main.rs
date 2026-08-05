@@ -583,6 +583,7 @@ fn judge_run(
     unsupported_count: usize,
     unsupported_truncated: bool,
     key_events_dropped: u64,
+    keyboard_protocol_errors: u64,
     scenario_passed: Option<bool>,
     scenario_fault: bool,
     expected_stop: Option<StopReason>,
@@ -594,6 +595,7 @@ fn judge_run(
     if unsupported_count > 0 { reasons.push("unsupported_mmio"); }
     if unsupported_truncated { reasons.push("unsupported_mmio_log_truncated"); }
     if key_events_dropped > 0 { reasons.push("keyboard_events_dropped"); }
+    if keyboard_protocol_errors > 0 { reasons.push("keyboard_protocol_error"); }
     if scenario_passed == Some(false) && !scenario_fault { reasons.push("scenario_failed"); }
     if scenario_fault { reasons.push("scenario_unrunnable"); }
     if !scenario_fault && expected_stop.is_some_and(|expected| outcome.stop_reason != expected) {
@@ -1362,10 +1364,17 @@ struct KeyboardReport {
     key_events_delivered: u64,
     key_events_remaining: usize,
     key_events_dropped: u64,
+    key_events_overwritten: u64,
     battery_reads: u64,
     backlight_writes: u64,
     backlight: u8,
+    lcd_backlight: u8,
+    config: u8,
+    interrupt_status: u8,
+    caps_lock: bool,
+    num_lock: bool,
     unknown_reg_selects: u64,
+    unknown_reg_writes: u64,
     last_unknown_reg: Option<u8>,
 }
 
@@ -1382,21 +1391,25 @@ impl KeyboardReport {
             self.reg_selects, self.key_events_delivered, self.key_events_remaining
         ));
         s.push_str(&format!(
-            "    \"key_events_dropped\": {},\n",
-            self.key_events_dropped
+            "    \"key_events_dropped\": {}, \"key_events_overwritten\": {},\n",
+            self.key_events_dropped, self.key_events_overwritten
         ));
         s.push_str(&format!(
-            "    \"battery_reads\": {}, \"backlight_writes\": {}, \"backlight\": {},\n",
-            self.battery_reads, self.backlight_writes, self.backlight
+            "    \"battery_reads\": {}, \"backlight_writes\": {}, \"backlight\": {}, \"lcd_backlight\": {},\n",
+            self.battery_reads, self.backlight_writes, self.backlight, self.lcd_backlight
+        ));
+        s.push_str(&format!(
+            "    \"config\": \"0x{:02x}\", \"interrupt_status\": \"0x{:02x}\", \"caps_lock\": {}, \"num_lock\": {},\n",
+            self.config, self.interrupt_status, self.caps_lock, self.num_lock
         ));
         match self.last_unknown_reg {
             Some(reg) => s.push_str(&format!(
-                "    \"unknown_reg_selects\": {}, \"last_unknown_reg\": \"0x{:02x}\"\n",
-                self.unknown_reg_selects, reg
+                "    \"unknown_reg_selects\": {}, \"unknown_reg_writes\": {}, \"last_unknown_reg\": \"0x{:02x}\"\n",
+                self.unknown_reg_selects, self.unknown_reg_writes, reg
             )),
             None => s.push_str(&format!(
-                "    \"unknown_reg_selects\": {}, \"last_unknown_reg\": null\n",
-                self.unknown_reg_selects
+                "    \"unknown_reg_selects\": {}, \"unknown_reg_writes\": {}, \"last_unknown_reg\": null\n",
+                self.unknown_reg_selects, self.unknown_reg_writes
             )),
         }
         s.push_str("  },\n");
@@ -1811,10 +1824,17 @@ fn run() -> Result<Verdict, String> {
             key_events_delivered: k.key_events_delivered,
             key_events_remaining: k.queued(),
             key_events_dropped: k.key_events_dropped,
+            key_events_overwritten: k.key_events_overwritten,
             battery_reads: k.battery_reads,
             backlight_writes: k.backlight_writes,
             backlight: k.backlight,
+            lcd_backlight: k.lcd_backlight,
+            config: k.config,
+            interrupt_status: k.interrupt_status,
+            caps_lock: k.caps_lock,
+            num_lock: k.num_lock,
             unknown_reg_selects: k.unknown_reg_selects,
+            unknown_reg_writes: k.unknown_reg_writes,
             last_unknown_reg: k.last_unknown_reg,
         }
     });
@@ -1854,11 +1874,15 @@ fn run() -> Result<Verdict, String> {
     let scenario_passed = engine.as_ref().map(|value| value.passed());
     let key_events_dropped = keyboard_report.as_ref()
         .map_or(0, |value| value.key_events_dropped);
+    let keyboard_protocol_errors = keyboard_report.as_ref().map_or(0, |value| {
+        value.unknown_reg_selects + value.unknown_reg_writes
+    });
     let verdict = judge_run(
         &outcome,
         unsupported.len(),
         unsupported_truncated,
         key_events_dropped,
+        keyboard_protocol_errors,
         scenario_passed,
         scenario_fault,
         effective_expected_stop,
@@ -1967,7 +1991,7 @@ mod tests {
     #[test]
     fn a_raw_cycle_limit_is_not_a_pass() {
         let result = judge_run(
-            &outcome(StopReason::CycleLimit, b"ready"), 0, false, 0,
+            &outcome(StopReason::CycleLimit, b"ready"), 0, false, 0, 0,
             None, false, None, &[],
         );
         assert!(result.status == Verdict::CannotJudge);
@@ -1977,7 +2001,7 @@ mod tests {
     #[test]
     fn an_explicit_cycle_limit_and_present_markers_pass() {
         let result = judge_run(
-            &outcome(StopReason::CycleLimit, b"boot lcd=pass ready"), 0, false, 0,
+            &outcome(StopReason::CycleLimit, b"boot lcd=pass ready"), 0, false, 0, 0,
             None, false, Some(StopReason::CycleLimit),
             &["lcd=pass".to_string(), "ready".to_string()],
         );
@@ -1989,7 +2013,7 @@ mod tests {
     #[test]
     fn a_marker_without_an_accepted_stop_cannot_pass() {
         let result = judge_run(
-            &outcome(StopReason::CycleLimit, b"ready"), 0, false, 0,
+            &outcome(StopReason::CycleLimit, b"ready"), 0, false, 0, 0,
             None, false, None, &["ready".to_string()],
         );
         assert!(result.status == Verdict::CannotJudge);
@@ -1999,7 +2023,7 @@ mod tests {
     #[test]
     fn missing_uart_marker_and_stop_mismatch_fail() {
         let result = judge_run(
-            &outcome(StopReason::PcMatch, b"boot only"), 0, false, 0,
+            &outcome(StopReason::PcMatch, b"boot only"), 0, false, 0, 0,
             None, false, Some(StopReason::CycleLimit), &["lcd=pass".to_string()],
         );
         assert!(result.status == Verdict::Fail);
@@ -2011,19 +2035,19 @@ mod tests {
         let mut run = outcome(StopReason::Exception, b"ready");
         run.exception = Some("HardFault");
         let result = judge_run(
-            &run, 1, true, 2, Some(true), false, Some(StopReason::Exception), &[],
+            &run, 1, true, 2, 1, Some(true), false, Some(StopReason::Exception), &[],
         );
         assert!(result.status == Verdict::Fail);
         assert_eq!(result.reasons, [
             "exception", "unsupported_mmio", "unsupported_mmio_log_truncated",
-            "keyboard_events_dropped"
+            "keyboard_events_dropped", "keyboard_protocol_error"
         ]);
     }
 
     #[test]
     fn an_unrunnable_scenario_is_cannot_judge() {
         let result = judge_run(
-            &outcome(StopReason::ScenarioDone, b""), 0, false, 0,
+            &outcome(StopReason::ScenarioDone, b""), 0, false, 0, 0,
             Some(false), true, Some(StopReason::ScenarioDone), &["ready".to_string()],
         );
         assert!(result.status == Verdict::CannotJudge);
@@ -2033,7 +2057,7 @@ mod tests {
     #[test]
     fn a_failed_scenario_is_a_judged_failure() {
         let result = judge_run(
-            &outcome(StopReason::CycleLimit, b""), 0, false, 0,
+            &outcome(StopReason::CycleLimit, b""), 0, false, 0, 0,
             Some(false), false, Some(StopReason::ScenarioDone), &[],
         );
         assert!(result.status == Verdict::Fail);
