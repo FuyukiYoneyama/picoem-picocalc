@@ -8,6 +8,7 @@ rust-version.workspace = true
 # (picocalc_emu Milestone 1). Path-only dep on `rp2040-emu`; not
 # publishable in its current form.
 publish = false
+build = "build.rs"
 
 [lints]
 workspace = true

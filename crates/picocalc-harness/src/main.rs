@@ -51,7 +51,8 @@ mod scenario;
 ///   `scenario_done` stop reason.
 /// * 6 — R1: optional `sd` section with the provisioned filesystem format.
 /// * 7 — R1: top-level verdict, reasons, and explicit stop/UART expectations.
-const SCHEMA_VERSION: u32 = 7;
+/// * 8 — R2: compile-time backend identity and dirty-state provenance.
+const SCHEMA_VERSION: u32 = 8;
 
 /// Default 16 KB RP2040 bootrom image, relative to the repo root.
 const DEFAULT_BOOTROM_PATH: &str = "roms/rp2040/bootrom-rp2040-b2.bin";
@@ -132,7 +133,23 @@ const UART_DRAIN_INTERVAL: u64 = 256;
 /// build …`), overridable per-run with `--backend-commit`. Never
 /// shelled out to at run time: the report must be a pure function of
 /// its inputs.
-const BUILT_IN_BACKEND_COMMIT: Option<&str> = option_env!("PICOEM_BACKEND_COMMIT");
+const BUILT_BACKEND_COMMIT: &str = env!("PICOEM_BUILT_COMMIT");
+
+fn built_backend_dirty() -> bool {
+    env!("PICOEM_BUILT_DIRTY") == "true"
+}
+
+fn validate_backend_identity(expected: &str, built: &str, dirty: bool) -> Result<(), String> {
+    if built != expected {
+        return Err(format!(
+            "runner was built from backend {built} but {expected} was required"
+        ));
+    }
+    if dirty {
+        return Err("runner was built from a dirty backend worktree".to_string());
+    }
+    Ok(())
+}
 
 /// Which off-chip board model to attach. `None` keeps the Gate 1
 /// behaviour: a bare RP2040 with nothing on its pins.
@@ -200,7 +217,7 @@ struct Args {
     stop_pc: Option<u32>,
     json: Option<PathBuf>,
     uart: Option<PathBuf>,
-    backend_commit: Option<String>,
+    expected_backend_commit: Option<String>,
     board: Board,
     lcd_variant: LcdVariant,
     fb_png: Option<PathBuf>,
@@ -259,7 +276,7 @@ fn print_usage() {
          --json <path>            Write the JSON report here. Default: stdout.\n\
          --uart <path>            Write raw UART0 TX bytes here. Default: discarded\n\
                                   (byte count + sha256 still reported).\n\
-         --backend-commit <str>   Value for the report's backend_commit field.\n\
+         --backend-commit <str>   Require the runner's compile-time Git identity to match.\n\
          --board <none|picocalc>  Attach an off-chip board model. 'picocalc' hangs the\n\
                                   ST7365P display off SPI1 (CS=GP13, DC=GP14, RST=GP15)\n\
                                   and adds the 'lcd' + 'framebuffer' report sections.\n\
@@ -308,7 +325,7 @@ fn parse_args() -> Result<Args, String> {
     let mut stop_pc: Option<u32> = None;
     let mut json: Option<PathBuf> = None;
     let mut uart: Option<PathBuf> = None;
-    let mut backend_commit: Option<String> = None;
+    let mut expected_backend_commit: Option<String> = None;
     let mut board = Board::None;
     // Variant B is the Canonical BSP default; variant A is what the
     // official sample uses. Selected explicitly so a report always
@@ -366,7 +383,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--json" => json = Some(PathBuf::from(value("--json")?)),
             "--uart" => uart = Some(PathBuf::from(value("--uart")?)),
-            "--backend-commit" => backend_commit = Some(value("--backend-commit")?),
+            "--backend-commit" => {
+                expected_backend_commit = Some(value("--backend-commit")?)
+            }
             "--board" => board = Board::parse(&value("--board")?)?,
             "--lcd-variant" => lcd_variant = LcdVariant::parse(&value("--lcd-variant")?)?,
             "--fb-png" => fb_png = Some(PathBuf::from(value("--fb-png")?)),
@@ -460,7 +479,7 @@ fn parse_args() -> Result<Args, String> {
         stop_pc,
         json,
         uart,
-        backend_commit,
+        expected_backend_commit,
         board,
         lcd_variant,
         fb_png,
@@ -1482,6 +1501,7 @@ impl PsramReport {
 #[allow(clippy::too_many_arguments)]
 fn build_report(
     backend_commit: &str,
+    backend_dirty: bool,
     firmware_name: &str,
     firmware_sha: &str,
     bootrom_name: &str,
@@ -1512,6 +1532,10 @@ fn build_report(
     s.push_str(&format!(
         "  \"backend_commit\": {},\n",
         json_string(backend_commit)
+    ));
+    s.push_str(&format!(
+        "  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n",
+        json_string(backend_commit), backend_dirty
     ));
     s.push_str(&format!(
         "  \"firmware\": {{\"basename\": {}, \"sha256\": {}}},\n",
@@ -1673,6 +1697,10 @@ fn build_framebuffer_report(
 
 fn run() -> Result<Verdict, String> {
     let mut args = parse_args().inspect_err(|_| print_usage())?;
+
+    if let Some(expected) = &args.expected_backend_commit {
+        validate_backend_identity(expected, BUILT_BACKEND_COMMIT, built_backend_dirty())?;
+    }
 
     let scenario = match &args.scenario {
         Some(path) => Some(scenario::load(path)?),
@@ -1855,11 +1883,7 @@ fn run() -> Result<Verdict, String> {
             .map_err(|e| format!("writing UART log {}: {e}", path.display()))?;
     }
 
-    let backend_commit = args
-        .backend_commit
-        .as_deref()
-        .or(BUILT_IN_BACKEND_COMMIT)
-        .unwrap_or("unknown");
+    let backend_commit = BUILT_BACKEND_COMMIT;
 
     let effective_expected_stop = args.expected_stop.or_else(|| {
         if args.stop_pc.is_some() {
@@ -1891,6 +1915,7 @@ fn run() -> Result<Verdict, String> {
 
     let report = build_report(
         backend_commit,
+        built_backend_dirty(),
         &basename(&args.bin),
         &firmware_sha,
         &basename(&args.bootrom),
@@ -1964,7 +1989,7 @@ fn run() -> Result<Verdict, String> {
 mod tests {
     use super::{
         RunOutcome, SdReport, StopReason, Verdict, fatal_exception_name, json_escape, judge_run,
-        validate_sd_selection,
+        validate_backend_identity, validate_sd_selection,
     };
     use picocalc_board::SdFormat;
 
@@ -2107,5 +2132,15 @@ mod tests {
         assert!(report.contains("\"format\": \"fat32\""));
         assert!(report.contains("\"block_size\": 512"));
         assert!(report.contains("\"blocks_written\": 1"));
+    }
+
+    #[test]
+    fn backend_identity_must_match_the_clean_compiled_source() {
+        let expected = "0123456789012345678901234567890123456789";
+        assert_eq!(validate_backend_identity(expected, expected, false), Ok(()));
+        assert!(validate_backend_identity(expected, "wrong", false)
+            .unwrap_err().contains("was required"));
+        assert!(validate_backend_identity(expected, expected, true)
+            .unwrap_err().contains("dirty"));
     }
 }
