@@ -2,8 +2,10 @@
 //!
 //! The PicoCalc mainboard puts an STM32 between the QWERTY matrix and the
 //! Pico. It answers at 7-bit address `0x1F` on I2C1 (GP6 SDA / GP7 SCL).
-//! The register set modelled here is the one the two known firmware
-//! families actually use:
+//! The primary behavioral reference is ClockworkPi's official
+//! `PicoCalc/Code/picocalc_keyboard` STM32F103R8T6 firmware. RP2040
+//! applications are consumer-side evidence. This model currently implements
+//! only the subset those consumers exercise:
 //!
 //! | Register | Direction | Meaning |
 //! |----------|-----------|---------|
@@ -44,12 +46,9 @@ pub const REG_KEY_COUNT: u8 = 0x04;
 
 /// Deepest the key FIFO may get.
 ///
-/// The count register carries the depth in its low five bits — the
-/// Canonical BSP reads it as `key_info[0] & 0x1f`, and that masking is
-/// hardware-verified. A controller holding 32 events would therefore
-/// report zero and its own firmware could never drain it, so a real
-/// controller cannot be in that state: the queue is bounded at or below
-/// what the field can express.
+/// The official controller firmware defines `FIFO_SIZE` as 31 and
+/// `KEY_COUNT_MASK` as `0x1F`. The Canonical BSP correspondingly reads the
+/// count as `key_info[0] & 0x1f`.
 ///
 /// Leaving the model's queue unbounded made it reachable. A scenario
 /// that queued key bursts faster than the firmware consumed them drove
@@ -57,9 +56,10 @@ pub const REG_KEY_COUNT: u8 = 0x04;
 /// permanently blind on an emulator-only state. Found by the PicoTetris
 /// line-clear scenario; see `picocalc_emu/docs/SCENARIO_RUNNER.md`.
 ///
-/// What is *not* established is which end a full controller discards.
-/// This model drops the arriving event, which at least loses input the
-/// user just gave rather than input the program was about to read.
+/// The official default configuration leaves `CFG_OVERFLOW_ON` clear, so a
+/// full FIFO drops the arriving event. If software enables that bit, the
+/// controller overwrites the oldest event; this model does not yet implement
+/// the configuration register and therefore models only the default policy.
 pub const MAX_QUEUED_EVENTS: usize = 31;
 /// Register: pop one key event.
 pub const REG_KEY_FIFO: u8 = 0x09;
@@ -348,7 +348,7 @@ mod overflow_tests {
     fn the_queue_never_exceeds_what_the_count_register_can_express() {
         let mut kbd = Keyboard::picocalc();
         for i in 0..200u32 {
-            kbd.press_and_release((b'a' + (i % 26) as u8) as u8);
+            kbd.press_and_release(b'a' + (i % 26) as u8);
         }
         assert_eq!(kbd.queued(), MAX_QUEUED_EVENTS);
         assert_eq!(kbd.key_events_dropped, 400 - MAX_QUEUED_EVENTS as u64);
@@ -362,7 +362,7 @@ mod overflow_tests {
     fn a_full_controller_never_reports_itself_empty() {
         let mut kbd = Keyboard::picocalc();
         for i in 0..500u32 {
-            kbd.push_event(KeyEvent::pressed((b'a' + (i % 26) as u8) as u8));
+            kbd.push_event(KeyEvent::pressed(b'a' + (i % 26) as u8));
             assert_ne!(
                 bsp_key_count(&mut kbd),
                 0,

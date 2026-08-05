@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{
-    Framebuffer, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire, St7365p,
+    Framebuffer, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire, SdFormat, St7365p,
     St7365pWire, pins,
 };
 use rp2040_emu::{Config, Emulator, EmulatorBuilder};
@@ -48,7 +48,8 @@ mod scenario;
 /// * 3 — Gate 3: optional `psram` section (`--psram` / `--psram-verify-range`).
 /// * 5 — Milestone 3: optional `scenario` section (`--scenario`), and the
 ///   `scenario_done` stop reason.
-const SCHEMA_VERSION: u32 = 5;
+/// * 6 — R1: optional `sd` section with the provisioned filesystem format.
+const SCHEMA_VERSION: u32 = 6;
 
 /// Default 16 KB RP2040 bootrom image, relative to the repo root.
 const DEFAULT_BOOTROM_PATH: &str = "roms/rp2040/bootrom-rp2040-b2.bin";
@@ -206,6 +207,7 @@ struct Args {
     psram_verify_range: Option<(u32, u32)>,
     keyboard: bool,
     sd: bool,
+    sd_format: SdFormat,
     keys: Option<String>,
     scenario: Option<PathBuf>,
     snapshot_dir: PathBuf,
@@ -227,6 +229,13 @@ fn parse_range(raw: &str) -> Result<(u32, u32), String> {
         }
     };
     Ok((parse_num(start_raw)?, parse_num(len_raw)?))
+}
+
+fn validate_sd_selection(sd: bool, format_explicit: bool) -> Result<(), String> {
+    if format_explicit && !sd {
+        return Err("--sd-format requires --sd".to_string());
+    }
+    Ok(())
 }
 
 fn print_usage() {
@@ -270,7 +279,10 @@ fn print_usage() {
          --keys <string>          Queue these characters as key events before the run\n\
                                   starts. Implies --keyboard. For input that has to be\n\
                                   timed against what the program is doing, use --scenario.\n\
-         --sd                     Attach an SD card on SPI0, pre-formatted FAT16.\n\
+         --sd                     Attach an SD card on SPI0, pre-formatted FAT32 by default.\n\
+         --sd-format <fat32|fat16>\n\
+                                  Initial filesystem profile. FAT32 is the default, matching\n\
+                                  PicoCalc's bundled 32 GB card. Requires --sd.\n\
          --scenario <path>        Run a JSON scenario: timed key input, and pixel / region\n\
                                   / UART assertions checked inside the run loop. Adds the\n\
                                   'scenario' report section. Exit 1 if any step fails.\n\
@@ -309,6 +321,8 @@ fn parse_args() -> Result<Args, String> {
     let mut psram_verify_range: Option<(u32, u32)> = None;
     let mut keyboard = false;
     let mut sd = false;
+    let mut sd_format = SdFormat::default();
+    let mut sd_format_explicit = false;
     let mut keys: Option<String> = None;
     let mut scenario: Option<PathBuf> = None;
     let mut snapshot_dir: Option<PathBuf> = None;
@@ -361,6 +375,11 @@ fn parse_args() -> Result<Args, String> {
             "--psram" => psram = true,
             "--keyboard" => keyboard = true,
             "--sd" => sd = true,
+            "--sd-format" => {
+                let raw = value("--sd-format")?;
+                sd_format = raw.parse::<SdFormat>()?;
+                sd_format_explicit = true;
+            }
             "--keys" => keys = Some(value("--keys")?),
             "--scenario" => scenario = Some(PathBuf::from(value("--scenario")?)),
             "--snapshot-dir" => snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
@@ -383,6 +402,7 @@ fn parse_args() -> Result<Args, String> {
     if psram_verify_range.is_some() && !psram {
         return Err("--psram-verify-range requires --psram".to_string());
     }
+    validate_sd_selection(sd, sd_format_explicit)?;
     // Queueing keys implies the controller they arrive through.
     if keys.is_some() {
         keyboard = true;
@@ -407,6 +427,7 @@ fn parse_args() -> Result<Args, String> {
         psram_verify_range,
         keyboard,
         sd,
+        sd_format,
         keys,
         scenario,
         snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
@@ -1113,6 +1134,67 @@ impl PwmReport {
 /// wrap point.
 const TOP_RESET_VALUE: u16 = 0xFFFF;
 
+/// The attached SD card and the initial filesystem profile supplied to it.
+struct SdReport {
+    format: SdFormat,
+    block_count: usize,
+    commands_seen: u64,
+    blocks_read: u64,
+    blocks_written: u64,
+    unknown_commands: Vec<(u8, u32)>,
+}
+
+impl SdReport {
+    fn snapshot(card: &SdCard) -> Self {
+        let mut unknown_commands = card.unknown_commands.clone();
+        unknown_commands.sort_by_key(|&(command, _)| command);
+        Self {
+            format: card.format(),
+            block_count: card.block_count(),
+            commands_seen: card.commands_seen,
+            blocks_read: card.blocks_read,
+            blocks_written: card.blocks_written,
+            unknown_commands,
+        }
+    }
+
+    fn to_json(&self) -> String {
+        let mut s = String::new();
+        s.push_str("  \"sd\": {\n");
+        s.push_str(&format!(
+            "    \"attached\": true, \"format\": {}, \"block_size\": {}, \"block_count\": {},\n",
+            json_string(self.format.as_str()),
+            picocalc_board::sdcard::BLOCK_SIZE,
+            self.block_count
+        ));
+        s.push_str(&format!(
+            "    \"commands_seen\": {}, \"blocks_read\": {}, \"blocks_written\": {},\n",
+            self.commands_seen, self.blocks_read, self.blocks_written
+        ));
+        s.push_str("    \"unknown_commands\": [");
+        if self.unknown_commands.is_empty() {
+            s.push_str("]\n");
+        } else {
+            for (index, (command, count)) in self.unknown_commands.iter().enumerate() {
+                if index == 0 {
+                    s.push('\n');
+                }
+                s.push_str(&format!(
+                    "      {{\"command\": {}, \"count\": {}}}",
+                    command, count
+                ));
+                if index + 1 < self.unknown_commands.len() {
+                    s.push(',');
+                }
+                s.push('\n');
+            }
+            s.push_str("    ]\n");
+        }
+        s.push_str("  },\n");
+        s
+    }
+}
+
 /// The `keyboard` report section (Gate 4).
 struct KeyboardReport {
     attached: bool,
@@ -1245,6 +1327,7 @@ fn build_report(
     lcd: Option<&LcdReport>,
     fb: Option<&FramebufferReport>,
     psram: Option<&PsramReport>,
+    sd: Option<&SdReport>,
     keyboard: Option<&KeyboardReport>,
     pwm: Option<&PwmReport>,
     pio: Option<&PioReport>,
@@ -1351,6 +1434,9 @@ fn build_report(
     if let Some(psram) = psram {
         s.push_str(&psram.to_json());
     }
+    if let Some(sd) = sd {
+        s.push_str(&sd.to_json());
+    }
     if let Some(keyboard) = keyboard {
         s.push_str(&keyboard.to_json());
     }
@@ -1361,7 +1447,7 @@ fn build_report(
         s.push_str(&pio.to_json());
     }
     if let Some((engine, file)) = scenario {
-        s.push_str(&engine.to_json(&file, |t| json_string(t)));
+        s.push_str(&engine.to_json(&file, json_string));
     }
 
     s.push_str(&format!(
@@ -1475,9 +1561,15 @@ fn run() -> Result<Verdict, String> {
         kbd
     });
 
-    // A blank card. FatFs formats it on first mount, so the smoke test
-    // brings its own filesystem rather than needing a prepared image.
-    let sd_card = args.sd.then(|| Arc::new(Mutex::new(SdCard::default())));
+    // The BSP mounts but does not format (FF_USE_MKFS=0), so the card
+    // constructor supplies the selected pre-formatted volume. FAT32 is
+    // the default; FAT16 is retained for compatibility targets.
+    let sd_card = args.sd.then(|| {
+        Arc::new(Mutex::new(SdCard::new_with_format(
+            picocalc_board::sdcard::DEFAULT_BLOCKS,
+            args.sd_format,
+        )))
+    });
 
     let (mut emu, boot_mode, lcd) = boot(
         firmware,
@@ -1554,6 +1646,11 @@ fn run() -> Result<Verdict, String> {
         None
     };
 
+    let sd_report = sd_card.as_ref().map(|card| {
+        let card = card.lock().expect("SD mutex");
+        SdReport::snapshot(&card)
+    });
+
     let keyboard_report = keyboard.as_ref().map(|kbd| {
         let k = kbd.lock().expect("keyboard mutex");
         KeyboardReport {
@@ -1612,6 +1709,7 @@ fn run() -> Result<Verdict, String> {
         lcd_report.as_ref(),
         fb_report.as_ref(),
         psram_report.as_ref(),
+        sd_report.as_ref(),
         keyboard_report.as_ref(),
         pwm_report.as_ref(),
         pio_report.as_ref(),
@@ -1669,7 +1767,8 @@ fn run() -> Result<Verdict, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StopReason, fatal_exception_name, json_escape};
+    use super::{SdReport, StopReason, fatal_exception_name, json_escape, validate_sd_selection};
+    use picocalc_board::SdFormat;
 
     #[test]
     fn stop_reason_strings_are_stable() {
@@ -1695,5 +1794,32 @@ mod tests {
         assert_eq!(json_escape("l1\nl2\ttab\r"), "l1\\nl2\\ttab\\r");
         assert_eq!(json_escape("\u{1}"), "\\u0001");
         assert_eq!(json_escape("plain/path-ok"), "plain/path-ok");
+    }
+
+    #[test]
+    fn an_explicit_sd_format_requires_an_attached_card() {
+        assert_eq!(validate_sd_selection(true, true), Ok(()));
+        assert_eq!(validate_sd_selection(true, false), Ok(()));
+        assert_eq!(validate_sd_selection(false, false), Ok(()));
+        assert_eq!(
+            validate_sd_selection(false, true),
+            Err("--sd-format requires --sd".to_string())
+        );
+    }
+
+    #[test]
+    fn sd_report_names_the_selected_format() {
+        let report = SdReport {
+            format: SdFormat::Fat32,
+            block_count: 131_072,
+            commands_seen: 7,
+            blocks_read: 2,
+            blocks_written: 1,
+            unknown_commands: Vec::new(),
+        }
+        .to_json();
+        assert!(report.contains("\"format\": \"fat32\""));
+        assert!(report.contains("\"block_size\": 512"));
+        assert!(report.contains("\"blocks_written\": 1"));
     }
 }

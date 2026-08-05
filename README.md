@@ -19,7 +19,7 @@ Development priorities are:
 4. Support deterministic scenario execution and artifacts such as framebuffer images, UART logs, traces, filesystem results, and test reports.
 5. Preserve upstream attribution, licenses, and history. General fixes suitable for upstream may be prepared separately for contribution to `0x4D44/picoem`.
 
-This firmware backend complements rather than replaces the faster host-device-model backend planned in `picocalc_emu`. PicoCalc-specific behavior should remain outside the generic RP2040 core wherever a board-level adapter or external-device model is sufficient.
+This firmware backend complements rather than replaces the faster host-device-model backend implemented in `picocalc_emu`. PicoCalc-specific behavior should remain outside the generic RP2040 core wherever a board-level adapter or external-device model is sufficient.
 
 Upstream changes are fetched through the local `upstream` remote and incorporated selectively after review and regression testing. They are not merged automatically.
 
@@ -55,11 +55,44 @@ Feature coverage as of the published versions — Arm-mode only; Hazard3 RISC-V 
 | Memory | 32 KB ROM, 520 KB SRAM, XIP flash | 16 KB ROM, 264 KB SRAM (no onboard flash) |
 | PIO blocks | Working | Working |
 | Pacer (wall-clock real-time pacing) | Working | Working |
-| UART / SPI / I2C / DMA / timers | Stubs | Stubs |
+| UART / SPI / I2C / DMA / timers | Mixed implementation; see `tech_debt.md` | Implemented for the exercised PicoCalc paths; residual timing gaps remain |
 | GDB RSP debug server | Stub | Stub |
 | TrustZone (SAU / ACCESSCTRL) | Design seams only — v1 treats everything as Secure | N/A |
 
 Open cycle-timing gaps and post-Phase-7 residuals are tracked in `tech_debt.md`.
+
+### PicoCalc integration status
+
+The RP2040 PicoCalc path can direct-boot a Pico SDK BIN and attach the board display,
+8 MiB PSRAM, I2C keyboard controller, and a pre-formatted SPI0 SD card. The generated card defaults
+to FAT32, matching PicoCalc's bundled 32 GB card; `--sd-format fat16` selects the compatibility
+profile. Both formats pass the same BSP filesystem smoke, while the SPI block model itself remains
+filesystem-independent. Both LCD transports
+used by the canonical BSP are modelled: SPI1/RGB666 for compatibility and PIO0/RGB565 for
+the recommended configuration. The scenario runner can inject timed keys and assert UART,
+pixel, and framebuffer-region conditions while firmware is executing.
+
+The primary reference for keyboard-controller behavior is ClockworkPi's official
+[`PicoCalc/Code/picocalc_keyboard`](https://github.com/clockworkpi/PicoCalc/tree/master/Code/picocalc_keyboard)
+STM32F103R8T6 firmware. In this workspace it is checked out at
+`/home/fuyuki/pico_dvl/codex/PicoCalc/Code/picocalc_keyboard`. The Rust device currently models the
+consumer-visible subset used by the tested RP2040 firmware; full register, modifier, repeat, and
+configurable-overflow conformance is tracked by `picocalc_emu` Milestone R1.
+
+```bash
+cargo run --release -p picocalc-harness --bin picocalc-run -- \
+  --bin /absolute/path/to/picocalc_app.bin \
+  --bootrom "$PWD/roms/rp2040/bootrom-rp2040-b2.bin" \
+  --board picocalc --lcd-variant pio-rgb565 \
+  --psram --sd --keyboard --scenario /absolute/path/to/scenario.json \
+  --snapshot-dir /tmp/picocalc-snapshots --json /tmp/picocalc-report.json
+```
+
+The command above is authoritative only when its structured report is checked against the
+target's declared expectations. The cross-repository acceptance order, source/toolchain pins,
+and current hardening work are owned by
+[`picocalc_emu/docs/MILESTONES.md`](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/MILESTONES.md),
+not duplicated here.
 
 ## Quick Start
 
@@ -97,17 +130,22 @@ Bundled ROMs under `roms/rp2350/` (`blinky.bin`, `benchmark.bin`, `lcd_demo.bin`
 
 ## Workspace Layout
 
-Seven crates under `crates/`:
+Eleven crates under `crates/`:
 
-- **`picoem-common`** — shared primitives: `Memory`, `ClockTree`, `Pacer`, PIO primitive types (`PioBlock` / `StateMachine`), divider/FIFO, `Peripheral` trait. Both chip crates depend on this.
+- **`picoem-common`** — shared primitives: `Memory`, `ClockTree`, `Pacer`, PIO primitive types (`PioBlock` / `StateMachine`), divider/FIFO, and portable threaded primitives. Both chip crates depend on this.
+- **`picoem-devices`** — reusable off-chip device models shared by emulators and harnesses.
 - **`rp2350-emu`** — the RP2350 / RP2354 emulator core library (CPUs, bus, memory, clocks, SIO, PIO, FPU, coprocessors, pacer).
 - **`rp2350-emu-tui`** — interactive TUI (ratatui + crossterm) for `rp2350-emu`, with panels and a device frontend (LCD, benchmark).
 - **`rp2040-emu`** — the RP2040 emulator core library (dual Cortex-M0+, bus, memory, clocks, SIO, PIO).
 - **`rp2040-emu-tui`** — interactive TUI for `rp2040-emu`.
 - **`picoem-harness`** — all differential and hardware-in-the-loop test binaries. Binaries are chip-suffixed (`qemu_diff_m33` / `qemu_diff_m0plus`, `probe_diff_rp2350` / `probe_diff_rp2040`, etc.).
 - **`picoem-debug`** — GDB RSP server and trace tooling. Stubbed.
+- **`picocalc-board`** — PicoCalc pin map and external LCD, keyboard, PSRAM, SD, audio-observation, framebuffer, and report-input observations.
+- **`picocalc-harness`** — the `picocalc-run` firmware runner and JSON scenario engine.
+- **`epio-sys`** — optional native FFI for the reference PIO simulator; excluded from `default-members`.
 
-The real UIs are `rp2350-emu-tui` and `rp2040-emu-tui`; run them with `cargo run -p rp2350-emu-tui` or `cargo run -p rp2040-emu-tui`. The workspace has no top-level binary.
+The interactive UIs are `rp2350-emu-tui` and `rp2040-emu-tui`. The headless PicoCalc entry point is
+`picocalc-run` from `picocalc-harness`. The workspace has no top-level binary.
 
 ## Testing
 
@@ -119,6 +157,8 @@ The emulators are validated by independent oracles, each catching different bug 
 cargo test                      # all crates
 cargo test -p rp2350-emu        # RP2350 / RP2354 core only
 cargo test -p rp2040-emu        # RP2040 core only
+cargo test -p picocalc-board    # PicoCalc board/device models
+cargo test -p picocalc-harness  # runner/scenario parser and execution contract
 cargo test <name_substring>      # filtered
 ```
 

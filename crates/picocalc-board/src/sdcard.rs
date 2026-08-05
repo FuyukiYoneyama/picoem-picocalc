@@ -10,9 +10,11 @@
 //!
 //! A high-capacity (SDHC) card whose blocks live in memory. That is
 //! enough for the BSP's smoke test, which mounts a FAT volume, writes a
-//! file, syncs, reads it back, compares and deletes it. Storage starts
-//! zeroed; FatFs formats it on first mount if there is no filesystem, so
-//! nothing needs a prepared image.
+//! file, syncs, reads it back, compares and deletes it. The BSP's FatFs
+//! configuration mounts but does not format (`FF_USE_MKFS=0`), so this
+//! model lays down an empty volume during construction. FAT32 is the
+//! default, matching the 32 GB card supplied with PicoCalc; FAT16 remains
+//! available as an explicit compatibility profile.
 //!
 //! Command framing follows the driver's own shape: six bytes (`0x40 |
 //! index`, four argument bytes, CRC), then the card holds MISO high for
@@ -36,6 +38,42 @@ pub const BLOCK_SIZE: usize = 512;
 /// Default capacity: 64 MiB. Large enough for a FAT volume with room to
 /// work in, small enough to allocate without thought.
 pub const DEFAULT_BLOCKS: usize = (64 << 20) / BLOCK_SIZE;
+
+/// Filesystem layout provisioned into a newly-created card.
+///
+/// This affects only the initial block contents. The SPI/SDHC protocol
+/// remains a filesystem-independent block transport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SdFormat {
+    /// Compatibility profile retained for older targets and diagnostics.
+    Fat16,
+    /// Default profile, matching PicoCalc's bundled 32 GB card.
+    #[default]
+    Fat32,
+}
+
+impl SdFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fat16 => "fat16",
+            Self::Fat32 => "fat32",
+        }
+    }
+}
+
+impl std::str::FromStr for SdFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "fat16" => Ok(Self::Fat16),
+            "fat32" => Ok(Self::Fat32),
+            _ => Err(format!(
+                "unknown SD format '{value}' (expected fat16|fat32)"
+            )),
+        }
+    }
+}
 
 /// Idle byte. The card leaves MISO high when it has nothing to say.
 const IDLE: u8 = 0xFF;
@@ -68,6 +106,7 @@ enum Phase {
 /// SD card in SPI mode.
 pub struct SdCard {
     blocks: Vec<u8>,
+    format: SdFormat,
     phase: Phase,
     /// Argument bytes of the command being assembled.
     arg: [u8; 4],
@@ -103,9 +142,16 @@ impl Default for SdCard {
 }
 
 impl SdCard {
+    /// Create a card using the default FAT32 profile.
     pub fn new(block_count: usize) -> Self {
+        Self::new_with_format(block_count, SdFormat::default())
+    }
+
+    /// Create a card with an explicitly selected initial volume format.
+    pub fn new_with_format(block_count: usize, format: SdFormat) -> Self {
         let mut card = Self {
             blocks: vec![0u8; block_count * BLOCK_SIZE],
+            format,
             phase: Phase::Idle,
             arg: [0; 4],
             reply: std::collections::VecDeque::new(),
@@ -122,8 +168,16 @@ impl SdCard {
             blocks_written: 0,
             unknown_commands: Vec::new(),
         };
-        card.format_fat16();
+        match format {
+            SdFormat::Fat16 => card.format_fat16(),
+            SdFormat::Fat32 => card.format_fat32(),
+        }
         card
+    }
+
+    /// Initial filesystem profile selected for this card.
+    pub const fn format(&self) -> SdFormat {
+        self.format
     }
 
     /// Lay down an empty FAT16 volume.
@@ -152,8 +206,7 @@ impl SdCard {
         // the cluster count across a boundary.
         let usable = total_sectors - RESERVED_SECTORS as usize - root_sectors;
         let approx_clusters = usable / SECTORS_PER_CLUSTER as usize;
-        let fat_sectors =
-            ((approx_clusters + 2) * 2).div_ceil(BYTES_PER_SECTOR);
+        let fat_sectors = ((approx_clusters + 2) * 2).div_ceil(BYTES_PER_SECTOR);
 
         let boot = &mut self.blocks[0..BYTES_PER_SECTOR];
         boot.fill(0);
@@ -196,11 +249,118 @@ impl SdCard {
         }
 
         // Empty root directory.
-        let root_start = (RESERVED_SECTORS as usize
-            + NUM_FATS as usize * fat_sectors)
-            * BYTES_PER_SECTOR;
+        let root_start =
+            (RESERVED_SECTORS as usize + NUM_FATS as usize * fat_sectors) * BYTES_PER_SECTOR;
         let root_end = root_start + root_sectors * BYTES_PER_SECTOR;
         self.blocks[root_start..root_end].fill(0);
+    }
+
+    /// Lay down an empty FAT32 volume.
+    ///
+    /// A one-sector cluster keeps a 64 MiB test card above the FAT32
+    /// minimum cluster count. The volume is a superfloppy, like the
+    /// existing FAT16 profile: sector zero is the VBR, not an MBR.
+    fn format_fat32(&mut self) {
+        const BYTES_PER_SECTOR: usize = BLOCK_SIZE;
+        const SECTORS_PER_CLUSTER: u8 = 1;
+        const RESERVED_SECTORS: u16 = 32;
+        const NUM_FATS: u8 = 2;
+        const ROOT_CLUSTER: u32 = 2;
+        const FSINFO_SECTOR: u16 = 1;
+        const BACKUP_BOOT_SECTOR: u16 = 6;
+        const MIN_FAT32_CLUSTERS: usize = 65_525;
+
+        let total_sectors = self.block_count();
+        assert!(
+            total_sectors <= u32::MAX as usize,
+            "FAT32 profile exceeds the 32-bit BPB sector count"
+        );
+
+        // FAT size depends on the number of data clusters, which in turn
+        // depends on FAT size. Iterate to the small fixed point.
+        let mut fat_sectors = 1usize;
+        let cluster_count = loop {
+            let overhead = RESERVED_SECTORS as usize + NUM_FATS as usize * fat_sectors;
+            assert!(
+                total_sectors > overhead,
+                "FAT32 profile needs more than {overhead} sectors"
+            );
+            let clusters = (total_sectors - overhead) / SECTORS_PER_CLUSTER as usize;
+            let required = ((clusters + 2) * 4).div_ceil(BYTES_PER_SECTOR);
+            // The exact self-consistent values can straddle a rounding
+            // boundary and alternate by one sector. A table that is at
+            // least as large as required is valid, so stop there.
+            if required <= fat_sectors {
+                break clusters;
+            }
+            fat_sectors = required;
+        };
+        assert!(
+            cluster_count >= MIN_FAT32_CLUSTERS,
+            "FAT32 profile needs at least {MIN_FAT32_CLUSTERS} clusters, got {cluster_count}"
+        );
+        assert!(fat_sectors <= u32::MAX as usize);
+
+        self.blocks.fill(0);
+        let boot = &mut self.blocks[..BYTES_PER_SECTOR];
+        boot[0..3].copy_from_slice(&[0xEB, 0x58, 0x90]);
+        boot[3..11].copy_from_slice(b"MSWIN4.1");
+        boot[11..13].copy_from_slice(&(BYTES_PER_SECTOR as u16).to_le_bytes());
+        boot[13] = SECTORS_PER_CLUSTER;
+        boot[14..16].copy_from_slice(&RESERVED_SECTORS.to_le_bytes());
+        boot[16] = NUM_FATS;
+        // FAT32 has no fixed root directory and uses only TotSec32/FATSz32.
+        boot[17..19].copy_from_slice(&0u16.to_le_bytes());
+        boot[19..21].copy_from_slice(&0u16.to_le_bytes());
+        boot[21] = 0xF8;
+        boot[22..24].copy_from_slice(&0u16.to_le_bytes());
+        boot[24..26].copy_from_slice(&63u16.to_le_bytes());
+        boot[26..28].copy_from_slice(&255u16.to_le_bytes());
+        boot[28..32].copy_from_slice(&0u32.to_le_bytes());
+        boot[32..36].copy_from_slice(&(total_sectors as u32).to_le_bytes());
+        boot[36..40].copy_from_slice(&(fat_sectors as u32).to_le_bytes());
+        boot[40..42].copy_from_slice(&0u16.to_le_bytes());
+        boot[42..44].copy_from_slice(&0u16.to_le_bytes());
+        boot[44..48].copy_from_slice(&ROOT_CLUSTER.to_le_bytes());
+        boot[48..50].copy_from_slice(&FSINFO_SECTOR.to_le_bytes());
+        boot[50..52].copy_from_slice(&BACKUP_BOOT_SECTOR.to_le_bytes());
+        boot[64] = 0x80;
+        boot[66] = 0x29;
+        boot[67..71].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        boot[71..82].copy_from_slice(b"PICOCALC   ");
+        boot[82..90].copy_from_slice(b"FAT32   ");
+        boot[510..512].copy_from_slice(&[0x55, 0xAA]);
+
+        let fsinfo_offset = FSINFO_SECTOR as usize * BYTES_PER_SECTOR;
+        let fsinfo = &mut self.blocks[fsinfo_offset..fsinfo_offset + BYTES_PER_SECTOR];
+        fsinfo[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes());
+        fsinfo[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes());
+        fsinfo[488..492].copy_from_slice(&((cluster_count - 1) as u32).to_le_bytes());
+        fsinfo[492..496].copy_from_slice(&3u32.to_le_bytes());
+        fsinfo[508..512].copy_from_slice(&0xAA55_0000u32.to_le_bytes());
+
+        let backup_offset = BACKUP_BOOT_SECTOR as usize * BYTES_PER_SECTOR;
+        self.blocks.copy_within(0..BYTES_PER_SECTOR, backup_offset);
+        let backup_fsinfo_offset =
+            (BACKUP_BOOT_SECTOR as usize + FSINFO_SECTOR as usize) * BYTES_PER_SECTOR;
+        self.blocks.copy_within(
+            fsinfo_offset..fsinfo_offset + BYTES_PER_SECTOR,
+            backup_fsinfo_offset,
+        );
+
+        // Reserved entries plus the allocated root-directory cluster.
+        for copy in 0..NUM_FATS as usize {
+            let start = (RESERVED_SECTORS as usize + copy * fat_sectors) * BYTES_PER_SECTOR;
+            self.blocks[start..start + 4].copy_from_slice(&0x0FFF_FFF8u32.to_le_bytes());
+            self.blocks[start + 4..start + 8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            self.blocks[start + 8..start + 12].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+        }
+
+        // Cluster 2 is the root directory. The backing store is already
+        // zeroed, but spell out the address whose geometry the tests use.
+        let root_sector = RESERVED_SECTORS as usize + NUM_FATS as usize * fat_sectors;
+        let root_offset = root_sector * BYTES_PER_SECTOR;
+        self.blocks[root_offset..root_offset + BYTES_PER_SECTOR].fill(0);
     }
 
     /// Capacity in blocks.
@@ -369,7 +529,8 @@ impl SdCard {
             // APP_CMD: the next command is an ACMD.
             55 => {
                 self.app_cmd_pending = true;
-                self.reply.push_back(if self.initialised { R1_READY } else { R1_IDLE });
+                self.reply
+                    .push_back(if self.initialised { R1_READY } else { R1_IDLE });
             }
             // READ_OCR: R3. Bit 30 of the first byte marks high capacity,
             // which is what makes the driver address in blocks.
@@ -415,5 +576,84 @@ impl SdCard {
         } else {
             self.unknown_commands.push((code, 1));
         }
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::{BLOCK_SIZE, DEFAULT_BLOCKS, SdCard, SdFormat};
+
+    fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn default_card_is_fat32() {
+        let card = SdCard::default();
+        assert_eq!(card.format(), SdFormat::Fat32);
+        assert_eq!(&card.blocks[82..90], b"FAT32   ");
+    }
+
+    #[test]
+    fn fat16_remains_an_explicit_compatibility_profile() {
+        let card = SdCard::new_with_format(DEFAULT_BLOCKS, SdFormat::Fat16);
+        assert_eq!(card.format(), SdFormat::Fat16);
+        assert_eq!(&card.blocks[54..62], b"FAT16   ");
+        assert_eq!(&card.blocks[510..512], &[0x55, 0xAA]);
+    }
+
+    #[test]
+    fn fat32_bpb_has_mountable_geometry() {
+        let card = SdCard::default();
+        let boot = &card.blocks[..BLOCK_SIZE];
+        let reserved = u16_at(boot, 14) as usize;
+        let fats = boot[16] as usize;
+        let fat_sectors = u32_at(boot, 36) as usize;
+        let sectors_per_cluster = boot[13] as usize;
+        let total = u32_at(boot, 32) as usize;
+        let clusters = (total - reserved - fats * fat_sectors) / sectors_per_cluster;
+
+        assert_eq!(u16_at(boot, 11), BLOCK_SIZE as u16);
+        assert_eq!(u16_at(boot, 17), 0);
+        assert_eq!(u16_at(boot, 22), 0);
+        assert_eq!(u32_at(boot, 44), 2);
+        assert_eq!(u16_at(boot, 48), 1);
+        assert_eq!(u16_at(boot, 50), 6);
+        assert!(clusters >= 65_525, "FAT32 cluster count was {clusters}");
+        assert_eq!(&boot[510..512], &[0x55, 0xAA]);
+    }
+
+    #[test]
+    fn fat32_writes_fsinfo_backup_and_both_fats() {
+        let card = SdCard::default();
+        let boot = &card.blocks[..BLOCK_SIZE];
+        let reserved = u16_at(boot, 14) as usize;
+        let fat_sectors = u32_at(boot, 36) as usize;
+        let fsinfo = &card.blocks[BLOCK_SIZE..2 * BLOCK_SIZE];
+        let backup = &card.blocks[6 * BLOCK_SIZE..7 * BLOCK_SIZE];
+
+        assert_eq!(u32_at(fsinfo, 0), 0x4161_5252);
+        assert_eq!(u32_at(fsinfo, 484), 0x6141_7272);
+        assert_eq!(u32_at(fsinfo, 492), 3);
+        assert_eq!(u32_at(fsinfo, 508), 0xAA55_0000);
+        assert_eq!(backup, boot);
+
+        for start_sector in [reserved, reserved + fat_sectors] {
+            let fat = &card.blocks[start_sector * BLOCK_SIZE..];
+            assert_eq!(u32_at(fat, 0), 0x0FFF_FFF8);
+            assert_eq!(u32_at(fat, 4), 0xFFFF_FFFF);
+            assert_eq!(u32_at(fat, 8), 0x0FFF_FFFF);
+        }
+    }
+
+    #[test]
+    fn format_names_parse_and_reject_unknown_values() {
+        assert_eq!("fat16".parse(), Ok(SdFormat::Fat16));
+        assert_eq!("FAT32".parse(), Ok(SdFormat::Fat32));
+        assert!("exfat".parse::<SdFormat>().is_err());
     }
 }

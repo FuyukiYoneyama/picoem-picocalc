@@ -64,7 +64,12 @@ mod tests {
     use super::*;
 
     fn wire() -> (SdCardWire, Arc<Mutex<SdCard>>) {
-        let card = Arc::new(Mutex::new(SdCard::new(64)));
+        // Wire-protocol tests need only a few blocks; use the compact
+        // FAT16 profile because a valid FAT32 volume needs >=65,525 clusters.
+        let card = Arc::new(Mutex::new(SdCard::new_with_format(
+            64,
+            crate::sdcard::SdFormat::Fat16,
+        )));
         (SdCardWire::new(Arc::clone(&card)), card)
     }
 
@@ -117,7 +122,7 @@ mod tests {
         }
         assert_eq!(answers[0], 0x01, "busy at first");
         assert!(
-            answers.iter().any(|&a| a == 0x00),
+            answers.contains(&0x00),
             "must become ready, got {answers:?}"
         );
     }

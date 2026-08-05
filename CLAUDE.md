@@ -14,9 +14,22 @@ Cycle-accurate emulators for the Raspberry Pi RP2354 / RP2350 family (dual Corte
 - `rp2040-emu-tui` — the TUI demo app driving `rp2040-emu`.
 - `picoem-harness` — differential test binaries (QEMU diff + probe-rs diff variants per chip, softfloat diff, paced benchmark, silicon oracles, PicoGUS replay, OneROM oracles, test_silicon orchestrator).
 - `picoem-debug` — GDB RSP scaffolding (stub).
+- `picocalc-board` — PicoCalc pin map and external display, keyboard, PSRAM, SD, audio-observation, framebuffer, and report-input observations. Keep PicoCalc-specific policy here rather than in the generic RP2040 core.
+- `picocalc-harness` — headless `picocalc-run` binary, target execution loop, report writer, and JSON scenario engine.
 - `epio-sys` — native FFI for the reference PIO simulator. **Excluded from workspace `default-members`** because it requires `clang` and vendored submodules; build explicitly with `cargo build -p epio-sys`.
 
 See `wrk_docs/2026.04.14 - HLD - mdpicoem Workspace Restructure.md` for the phase-by-phase restructure plan.
+
+For keyboard-controller behavior, ClockworkPi's official
+[`PicoCalc/Code/picocalc_keyboard`](https://github.com/clockworkpi/PicoCalc/tree/master/Code/picocalc_keyboard)
+STM32F103R8T6 firmware is the primary reference. The local workspace checkout is
+`/home/fuyuki/pico_dvl/codex/PicoCalc/Code/picocalc_keyboard`. RP2040 drivers
+and applications are consumer evidence. Do not infer controller FIFO, modifier, repeat, register,
+or overflow semantics from a consumer when the official producer source answers the question.
+
+The SD device is a filesystem-independent block model. Its default provisioned volume is FAT32,
+matching PicoCalc's bundled 32 GB card; FAT16 is an explicit compatibility profile. Keep both
+filesystem smoke paths and the runner's `sd.format` report field covered when changing the model.
 
 ## Build & Test
 
@@ -32,6 +45,8 @@ cargo test <test_name_substr>
 
 # Run tests in one crate
 cargo test -p rp2350-emu
+cargo test -p picocalc-board
+cargo test -p picocalc-harness
 
 # Code coverage
 cargo llvm-cov
@@ -101,9 +116,17 @@ The overnight drivers under `fuzz-runs/` (`run-m33.sh`, `run-m0plus.sh`, `run-pr
 - **`crates/rp2040-emu-tui`** — interactive TUI for the RP2040 emulator. Same shape as `rp2350-emu-tui` minus the FPU/DCP/RCP/NS panels; its ISA panel carries M0+-specific cycle numbers.
 - **`crates/picoem-debug`** — GDB RSP server + trace scaffolding (currently a stub).
 - **`crates/picoem-harness`** — all test binaries (see "Testing Topology" below). Binaries are chip-suffixed: `qemu_diff_m33` vs `qemu_diff_m0plus`, `probe_diff_rp2350` vs `probe_diff_rp2040`, `silicon_periph_diff_rp2350` vs `silicon_periph_diff_rp2040`, etc.
+- **`crates/picocalc-board`** — board-level PicoCalc adapter and external-device models. It owns PicoCalc pins and device policy; generic RP2040 behavior stays in `rp2040-emu`.
+- **`crates/picocalc-harness`** — the headless `picocalc-run` entry point and scenario/report implementation. Scenario JSON is input; report field order is deliberately controlled for deterministic bytes.
 - **`crates/epio-sys`** — native FFI binding to the reference PIO simulator (`links = "epio"`). Excluded from `default-members` so the root `cargo build` still works on hosts without clang; build explicitly with `cargo build -p epio-sys`.
 
-**The real entry points are `rp2350-emu-tui` and `rp2040-emu-tui`.** The workspace has no top-level binary; build/run via `cargo run -p rp2350-emu-tui` or `cargo run -p rp2040-emu-tui`.
+The interactive entry points are `rp2350-emu-tui` and `rp2040-emu-tui`; the headless PicoCalc
+entry point is `picocalc-run` from `picocalc-harness`. The workspace has no top-level binary.
+
+For cross-repository work, do not duplicate accepted backend commits, firmware hashes, or execution
+order here. Those are owned by `picocalc_emu/reference-projects/firmware-targets.json` and
+`picocalc_emu/docs/MILESTONES.md`. This repository owns emulator behavior, runner/report contracts,
+and their tests.
 
 ## Core Emulator Architecture (`crates/rp2350-emu/src/`)
 
