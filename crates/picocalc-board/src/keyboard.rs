@@ -509,13 +509,15 @@ impl Keyboard {
                         b',' => {
                             output = false;
                             if state == KeyState::Released {
-                                self.lcd_backlight = self.lcd_backlight.saturating_sub(16).max(16);
+                                self.lcd_backlight =
+                                    self.lcd_backlight.saturating_sub(16).max(16);
                             }
                         }
                         b'.' => {
                             output = false;
                             if state == KeyState::Released {
-                                self.lcd_backlight = self.lcd_backlight.saturating_add(16).min(240);
+                                self.lcd_backlight =
+                                    self.lcd_backlight.saturating_add(16).min(240);
                             }
                         }
                         b' ' => {
@@ -701,8 +703,8 @@ impl rp2040_emu::peripherals::i2c::I2cExternalDevice for Keyboard {
                 REG_RESET => {}
                 // These official cases ignore the write flag but still
                 // prepare their ordinary reply (FIFO therefore still pops).
-                REG_VERSION | REG_KEY_COUNT | REG_KEY_FIFO | REG_BATTERY | REG_C64_MATRIX
-                | REG_C64_JOYSTICK => {}
+                REG_VERSION | REG_KEY_COUNT | REG_KEY_FIFO | REG_BATTERY
+                | REG_C64_MATRIX | REG_C64_JOYSTICK => {}
                 _ => {
                     self.unknown_reg_writes += 1;
                     self.last_unknown_reg = Some(reg);

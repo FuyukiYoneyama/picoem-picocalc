@@ -178,6 +178,7 @@ impl Board {
     }
 }
 
+
 /// Which display transport the firmware uses.
 ///
 /// The panel is the same part in both cases; only how bytes reach it
@@ -382,7 +383,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--json" => json = Some(PathBuf::from(value("--json")?)),
             "--uart" => uart = Some(PathBuf::from(value("--uart")?)),
-            "--backend-commit" => expected_backend_commit = Some(value("--backend-commit")?),
+            "--backend-commit" => {
+                expected_backend_commit = Some(value("--backend-commit")?)
+            }
             "--board" => board = Board::parse(&value("--board")?)?,
             "--lcd-variant" => lcd_variant = LcdVariant::parse(&value("--lcd-variant")?)?,
             "--fb-png" => fb_png = Some(PathBuf::from(value("--fb-png")?)),
@@ -462,7 +465,10 @@ fn parse_args() -> Result<Args, String> {
     {
         return Err("--scenario only permits --expect-stop scenario_done".to_string());
     }
-    if stop_pc.is_some() && expected_stop.is_some() && expected_stop != Some(StopReason::PcMatch) {
+    if stop_pc.is_some()
+        && expected_stop.is_some()
+        && expected_stop != Some(StopReason::PcMatch)
+    {
         return Err("--stop-pc only permits --expect-stop pc_match".to_string());
     }
 
@@ -572,26 +578,17 @@ struct VerdictReport {
 impl VerdictReport {
     fn to_json(&self) -> String {
         let strings = |items: &[String]| {
-            items
-                .iter()
-                .map(|item| json_string(item))
-                .collect::<Vec<_>>()
-                .join(", ")
+            items.iter().map(|item| json_string(item)).collect::<Vec<_>>().join(", ")
         };
-        let reasons = self
-            .reasons
-            .iter()
-            .map(|reason| json_string(reason))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let reasons = self.reasons.iter()
+            .map(|reason| json_string(reason)).collect::<Vec<_>>().join(", ");
         format!(
             "  \"verdict\": {{\"status\": {}, \"reasons\": [{}], \
              \"expected_stop_reason\": {}, \"required_uart_markers\": [{}], \
              \"missing_uart_markers\": [{}]}},\n",
             json_string(self.status.as_str()),
             reasons,
-            self.expected_stop
-                .map(|reason| json_string(reason.as_str()))
+            self.expected_stop.map(|reason| json_string(reason.as_str()))
                 .unwrap_or_else(|| "null".to_string()),
             strings(&self.required_uart_markers),
             strings(&self.missing_uart_markers),
@@ -612,53 +609,27 @@ fn judge_run(
     expected_uart: &[String],
 ) -> VerdictReport {
     let mut reasons = Vec::new();
-    if outcome.exception.is_some() {
-        reasons.push("exception");
-    }
-    if outcome.error.is_some() {
-        reasons.push("emulator_error");
-    }
-    if unsupported_count > 0 {
-        reasons.push("unsupported_mmio");
-    }
-    if unsupported_truncated {
-        reasons.push("unsupported_mmio_log_truncated");
-    }
-    if key_events_dropped > 0 {
-        reasons.push("keyboard_events_dropped");
-    }
-    if keyboard_protocol_errors > 0 {
-        reasons.push("keyboard_protocol_error");
-    }
-    if scenario_passed == Some(false) && !scenario_fault {
-        reasons.push("scenario_failed");
-    }
-    if scenario_fault {
-        reasons.push("scenario_unrunnable");
-    }
+    if outcome.exception.is_some() { reasons.push("exception"); }
+    if outcome.error.is_some() { reasons.push("emulator_error"); }
+    if unsupported_count > 0 { reasons.push("unsupported_mmio"); }
+    if unsupported_truncated { reasons.push("unsupported_mmio_log_truncated"); }
+    if key_events_dropped > 0 { reasons.push("keyboard_events_dropped"); }
+    if keyboard_protocol_errors > 0 { reasons.push("keyboard_protocol_error"); }
+    if scenario_passed == Some(false) && !scenario_fault { reasons.push("scenario_failed"); }
+    if scenario_fault { reasons.push("scenario_unrunnable"); }
     if !scenario_fault && expected_stop.is_some_and(|expected| outcome.stop_reason != expected) {
         reasons.push("stop_reason_mismatch");
     }
 
-    let missing_uart_markers = expected_uart
-        .iter()
-        .filter(|marker| {
-            let bytes = marker.as_bytes();
-            bytes.is_empty()
-                || !outcome
-                    .uart_bytes
-                    .windows(bytes.len())
-                    .any(|window| window == bytes)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let missing_uart_markers = expected_uart.iter().filter(|marker| {
+        let bytes = marker.as_bytes();
+        bytes.is_empty() || !outcome.uart_bytes.windows(bytes.len()).any(|window| window == bytes)
+    }).cloned().collect::<Vec<_>>();
     if !scenario_fault && !missing_uart_markers.is_empty() {
         reasons.push("missing_uart_markers");
     }
 
-    let has_judged_failure = reasons
-        .iter()
-        .any(|reason| *reason != "scenario_unrunnable");
+    let has_judged_failure = reasons.iter().any(|reason| *reason != "scenario_unrunnable");
     let status = if has_judged_failure {
         Verdict::Fail
     } else if scenario_fault {
@@ -802,10 +773,7 @@ fn boot(
     // display model, same as the real mainboard.
     if let Some(kbd) = keyboard {
         emu.bus
-            .attach_i2c_device(
-                pins::KEYBOARD_I2C_INSTANCE,
-                Box::new(KeyboardWire::new(kbd)),
-            )
+            .attach_i2c_device(pins::KEYBOARD_I2C_INSTANCE, Box::new(KeyboardWire::new(kbd)))
             .map_err(|i| format!("no I2C instance {i} on RP2040"))?;
     }
 
@@ -969,14 +937,7 @@ fn run_loop(
                 uart: &uart_bytes,
             });
             if e.is_done() {
-                return finish(
-                    emu,
-                    &vclock,
-                    &mut uart_bytes,
-                    StopReason::ScenarioDone,
-                    None,
-                    None,
-                );
+                return finish(emu, &vclock, &mut uart_bytes, StopReason::ScenarioDone, None, None);
             }
             next_poll_cycles = vclock.cycles_at(e.next_poll_ns());
             // A poll that changed nothing would otherwise re-fire every
@@ -987,14 +948,7 @@ fn run_loop(
         if let Some(target) = stop_pc
             && emu.cores[0].regs.pc() == target
         {
-            return finish(
-                emu,
-                &vclock,
-                &mut uart_bytes,
-                StopReason::PcMatch,
-                None,
-                None,
-            );
+            return finish(emu, &vclock, &mut uart_bytes, StopReason::PcMatch, None, None);
         }
         if let Some(name) = fatal_exception_name(emu.cores[0].regs.xpsr & 0x1FF) {
             return finish(
@@ -1007,28 +961,14 @@ fn run_loop(
             );
         }
         if emu.clock.cycles >= cycle_limit {
-            return finish(
-                emu,
-                &vclock,
-                &mut uart_bytes,
-                StopReason::CycleLimit,
-                None,
-                None,
-            );
+            return finish(emu, &vclock, &mut uart_bytes, StopReason::CycleLimit, None, None);
         }
 
         let consumed = match emu.step() {
             Ok(c) => c,
             Err(e) => {
                 let msg = e.to_string();
-                return finish(
-                    emu,
-                    &vclock,
-                    &mut uart_bytes,
-                    StopReason::Error,
-                    None,
-                    Some(msg),
-                );
+                return finish(emu, &vclock, &mut uart_bytes, StopReason::Error, None, Some(msg));
             }
         };
         steps += 1;
@@ -1046,14 +986,7 @@ fn run_loop(
                 park_state(emu, 0),
                 park_state(emu, 1)
             );
-            return finish(
-                emu,
-                &vclock,
-                &mut uart_bytes,
-                StopReason::Error,
-                None,
-                Some(detail),
-            );
+            return finish(emu, &vclock, &mut uart_bytes, StopReason::Error, None, Some(detail));
         }
 
         if steps.is_multiple_of(UART_DRAIN_INTERVAL) {
@@ -1602,8 +1535,7 @@ fn build_report(
     ));
     s.push_str(&format!(
         "  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n",
-        json_string(backend_commit),
-        backend_dirty
+        json_string(backend_commit), backend_dirty
     ));
     s.push_str(&format!(
         "  \"firmware\": {{\"basename\": {}, \"sha256\": {}}},\n",
@@ -1964,8 +1896,7 @@ fn run() -> Result<Verdict, String> {
     });
     let scenario_fault = engine.as_ref().is_some_and(|value| value.fault().is_some());
     let scenario_passed = engine.as_ref().map(|value| value.passed());
-    let key_events_dropped = keyboard_report
-        .as_ref()
+    let key_events_dropped = keyboard_report.as_ref()
         .map_or(0, |value| value.key_events_dropped);
     let keyboard_protocol_errors = keyboard_report.as_ref().map_or(0, |value| {
         value.unknown_reg_selects + value.unknown_reg_writes
@@ -2009,7 +1940,10 @@ fn run() -> Result<Verdict, String> {
         engine.as_ref().map(|e| {
             (
                 e,
-                args.scenario.as_deref().map(basename).unwrap_or_default(),
+                args.scenario
+                    .as_deref()
+                    .map(basename)
+                    .unwrap_or_default(),
             )
         }),
         &verdict,
@@ -2082,15 +2016,8 @@ mod tests {
     #[test]
     fn a_raw_cycle_limit_is_not_a_pass() {
         let result = judge_run(
-            &outcome(StopReason::CycleLimit, b"ready"),
-            0,
-            false,
-            0,
-            0,
-            None,
-            false,
-            None,
-            &[],
+            &outcome(StopReason::CycleLimit, b"ready"), 0, false, 0, 0,
+            None, false, None, &[],
         );
         assert!(result.status == Verdict::CannotJudge);
         assert_eq!(result.reasons, ["no_acceptance_criteria"]);
@@ -2099,14 +2026,8 @@ mod tests {
     #[test]
     fn an_explicit_cycle_limit_and_present_markers_pass() {
         let result = judge_run(
-            &outcome(StopReason::CycleLimit, b"boot lcd=pass ready"),
-            0,
-            false,
-            0,
-            0,
-            None,
-            false,
-            Some(StopReason::CycleLimit),
+            &outcome(StopReason::CycleLimit, b"boot lcd=pass ready"), 0, false, 0, 0,
+            None, false, Some(StopReason::CycleLimit),
             &["lcd=pass".to_string(), "ready".to_string()],
         );
         assert!(result.status == Verdict::Pass);
@@ -2117,15 +2038,8 @@ mod tests {
     #[test]
     fn a_marker_without_an_accepted_stop_cannot_pass() {
         let result = judge_run(
-            &outcome(StopReason::CycleLimit, b"ready"),
-            0,
-            false,
-            0,
-            0,
-            None,
-            false,
-            None,
-            &["ready".to_string()],
+            &outcome(StopReason::CycleLimit, b"ready"), 0, false, 0, 0,
+            None, false, None, &["ready".to_string()],
         );
         assert!(result.status == Verdict::CannotJudge);
         assert_eq!(result.reasons, ["no_accepted_stop_reason"]);
@@ -2134,21 +2048,11 @@ mod tests {
     #[test]
     fn missing_uart_marker_and_stop_mismatch_fail() {
         let result = judge_run(
-            &outcome(StopReason::PcMatch, b"boot only"),
-            0,
-            false,
-            0,
-            0,
-            None,
-            false,
-            Some(StopReason::CycleLimit),
-            &["lcd=pass".to_string()],
+            &outcome(StopReason::PcMatch, b"boot only"), 0, false, 0, 0,
+            None, false, Some(StopReason::CycleLimit), &["lcd=pass".to_string()],
         );
         assert!(result.status == Verdict::Fail);
-        assert_eq!(
-            result.reasons,
-            ["stop_reason_mismatch", "missing_uart_markers"]
-        );
+        assert_eq!(result.reasons, ["stop_reason_mismatch", "missing_uart_markers"]);
     }
 
     #[test]
@@ -2156,41 +2060,20 @@ mod tests {
         let mut run = outcome(StopReason::Exception, b"ready");
         run.exception = Some("HardFault");
         let result = judge_run(
-            &run,
-            1,
-            true,
-            2,
-            1,
-            Some(true),
-            false,
-            Some(StopReason::Exception),
-            &[],
+            &run, 1, true, 2, 1, Some(true), false, Some(StopReason::Exception), &[],
         );
         assert!(result.status == Verdict::Fail);
-        assert_eq!(
-            result.reasons,
-            [
-                "exception",
-                "unsupported_mmio",
-                "unsupported_mmio_log_truncated",
-                "keyboard_events_dropped",
-                "keyboard_protocol_error"
-            ]
-        );
+        assert_eq!(result.reasons, [
+            "exception", "unsupported_mmio", "unsupported_mmio_log_truncated",
+            "keyboard_events_dropped", "keyboard_protocol_error"
+        ]);
     }
 
     #[test]
     fn an_unrunnable_scenario_is_cannot_judge() {
         let result = judge_run(
-            &outcome(StopReason::ScenarioDone, b""),
-            0,
-            false,
-            0,
-            0,
-            Some(false),
-            true,
-            Some(StopReason::ScenarioDone),
-            &["ready".to_string()],
+            &outcome(StopReason::ScenarioDone, b""), 0, false, 0, 0,
+            Some(false), true, Some(StopReason::ScenarioDone), &["ready".to_string()],
         );
         assert!(result.status == Verdict::CannotJudge);
         assert_eq!(result.reasons, ["scenario_unrunnable"]);
@@ -2199,15 +2082,8 @@ mod tests {
     #[test]
     fn a_failed_scenario_is_a_judged_failure() {
         let result = judge_run(
-            &outcome(StopReason::CycleLimit, b""),
-            0,
-            false,
-            0,
-            0,
-            Some(false),
-            false,
-            Some(StopReason::ScenarioDone),
-            &[],
+            &outcome(StopReason::CycleLimit, b""), 0, false, 0, 0,
+            Some(false), false, Some(StopReason::ScenarioDone), &[],
         );
         assert!(result.status == Verdict::Fail);
         assert_eq!(result.reasons, ["scenario_failed", "stop_reason_mismatch"]);
@@ -2262,15 +2138,9 @@ mod tests {
     fn backend_identity_must_match_the_clean_compiled_source() {
         let expected = "0123456789012345678901234567890123456789";
         assert_eq!(validate_backend_identity(expected, expected, false), Ok(()));
-        assert!(
-            validate_backend_identity(expected, "wrong", false)
-                .unwrap_err()
-                .contains("was required")
-        );
-        assert!(
-            validate_backend_identity(expected, expected, true)
-                .unwrap_err()
-                .contains("dirty")
-        );
+        assert!(validate_backend_identity(expected, "wrong", false)
+            .unwrap_err().contains("was required"));
+        assert!(validate_backend_identity(expected, expected, true)
+            .unwrap_err().contains("dirty"));
     }
 }

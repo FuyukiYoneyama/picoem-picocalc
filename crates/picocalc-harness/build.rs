@@ -8,10 +8,9 @@ fn git(repo: &PathBuf, args: &[&str]) -> Option<String> {
         .args(args)
         .output()
         .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    })
 }
 
 fn main() {
@@ -26,17 +25,10 @@ fn main() {
 
     if let Some(git_dir) = git(&repo, &["rev-parse", "--git-dir"]) {
         let git_dir = PathBuf::from(git_dir);
-        let git_dir = if git_dir.is_absolute() {
-            git_dir
-        } else {
-            repo.join(git_dir)
-        };
+        let git_dir = if git_dir.is_absolute() { git_dir } else { repo.join(git_dir) };
         println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
         println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
-        println!(
-            "cargo:rerun-if-changed={}",
-            git_dir.join("packed-refs").display()
-        );
+        println!("cargo:rerun-if-changed={}", git_dir.join("packed-refs").display());
         if let Some(head) = git(&repo, &["symbolic-ref", "-q", "HEAD"]) {
             println!("cargo:rerun-if-changed={}", git_dir.join(head).display());
         }

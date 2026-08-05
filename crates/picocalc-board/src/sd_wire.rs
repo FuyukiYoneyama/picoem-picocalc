@@ -43,7 +43,10 @@ impl SpiExternalDevice for SdCardWire {
         // The driver sets 8-bit frames and never changes them. Same
         // reasoning as the panel wire: a wider frame would be a firmware
         // change, not an emulator fault.
-        self.card.lock().expect("SD mutex").transfer(word as u8) as u16
+        self.card
+            .lock()
+            .expect("SD mutex")
+            .transfer(word as u8) as u16
     }
 
     fn observe_pins(&mut self, gpio_out_levels: u32) {
