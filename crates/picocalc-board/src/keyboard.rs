@@ -41,6 +41,26 @@ pub const KEYBOARD_I2C_ADDR: u16 = 0x1F;
 
 /// Register: number of queued key events.
 pub const REG_KEY_COUNT: u8 = 0x04;
+
+/// Deepest the key FIFO may get.
+///
+/// The count register carries the depth in its low five bits — the
+/// Canonical BSP reads it as `key_info[0] & 0x1f`, and that masking is
+/// hardware-verified. A controller holding 32 events would therefore
+/// report zero and its own firmware could never drain it, so a real
+/// controller cannot be in that state: the queue is bounded at or below
+/// what the field can express.
+///
+/// Leaving the model's queue unbounded made it reachable. A scenario
+/// that queued key bursts faster than the firmware consumed them drove
+/// the backlog to exactly 224, `224 & 0x1f == 0`, and the driver went
+/// permanently blind on an emulator-only state. Found by the PicoTetris
+/// line-clear scenario; see `picocalc_emu/docs/SCENARIO_RUNNER.md`.
+///
+/// What is *not* established is which end a full controller discards.
+/// This model drops the arriving event, which at least loses input the
+/// user just gave rather than input the program was about to read.
+pub const MAX_QUEUED_EVENTS: usize = 31;
 /// Register: pop one key event.
 pub const REG_KEY_FIFO: u8 = 0x09;
 /// Register: backlight level (written with bit 7 set).
@@ -110,6 +130,10 @@ pub struct Keyboard {
     // --- observation counters (diagnostics only) ---
     pub reg_selects: u64,
     pub key_events_delivered: u64,
+    /// Events discarded because the controller was already full. Non-zero
+    /// means input was queued faster than the firmware drained it, and
+    /// whatever the run then observed is not what the queued keys meant.
+    pub key_events_dropped: u64,
     pub battery_reads: u64,
     pub backlight_writes: u64,
     pub unknown_reg_selects: u64,
@@ -136,6 +160,7 @@ impl Keyboard {
             battery_flags: 0,
             reg_selects: 0,
             key_events_delivered: 0,
+            key_events_dropped: 0,
             battery_reads: 0,
             backlight_writes: 0,
             unknown_reg_selects: 0,
@@ -144,13 +169,25 @@ impl Keyboard {
     }
 
     /// Queue a press/release pair for `code`, as a real keypress would.
+    ///
+    /// The two events are queued independently, so a controller with one
+    /// slot left keeps the press and loses the release — the same way a
+    /// real FIFO would fill mid-keystroke.
     pub fn press_and_release(&mut self, code: u8) {
-        self.fifo.push_back(KeyEvent::pressed(code));
-        self.fifo.push_back(KeyEvent::released(code));
+        self.push_event(KeyEvent::pressed(code));
+        self.push_event(KeyEvent::released(code));
     }
 
-    /// Queue one raw event.
+    /// Queue one raw event, discarding it if the controller is full.
+    ///
+    /// See [`MAX_QUEUED_EVENTS`]: silently growing past the depth the
+    /// count register can express would let firmware reach a state real
+    /// hardware cannot produce.
     pub fn push_event(&mut self, event: KeyEvent) {
+        if self.fifo.len() >= MAX_QUEUED_EVENTS {
+            self.key_events_dropped += 1;
+            return;
+        }
         self.fifo.push_back(event);
     }
 
@@ -290,6 +327,75 @@ impl rp2040_emu::peripherals::i2c::I2cExternalDevice for KeyboardWire {
             .lock()
             .expect("keyboard mutex")
             .transaction_end();
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use rp2040_emu::peripherals::i2c::I2cExternalDevice;
+
+    /// Read the count register the way the Canonical BSP does: select
+    /// `0x04`, take two bytes, mask the first with `0x1f`.
+    fn bsp_key_count(kbd: &mut Keyboard) -> u8 {
+        kbd.write_byte(REG_KEY_COUNT);
+        let low = kbd.read_byte();
+        let _high = kbd.read_byte();
+        low & 0x1f
+    }
+
+    #[test]
+    fn the_queue_never_exceeds_what_the_count_register_can_express() {
+        let mut kbd = Keyboard::picocalc();
+        for i in 0..200u32 {
+            kbd.press_and_release((b'a' + (i % 26) as u8) as u8);
+        }
+        assert_eq!(kbd.queued(), MAX_QUEUED_EVENTS);
+        assert_eq!(kbd.key_events_dropped, 400 - MAX_QUEUED_EVENTS as u64);
+    }
+
+    /// The regression this bound exists for. An unbounded queue could
+    /// reach a multiple of 32, whereupon the BSP's `& 0x1f` reads zero
+    /// and the driver stops draining for good — on a controller that is
+    /// in fact full.
+    #[test]
+    fn a_full_controller_never_reports_itself_empty() {
+        let mut kbd = Keyboard::picocalc();
+        for i in 0..500u32 {
+            kbd.push_event(KeyEvent::pressed((b'a' + (i % 26) as u8) as u8));
+            assert_ne!(
+                bsp_key_count(&mut kbd),
+                0,
+                "after {} events the BSP would see an empty controller",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn a_drained_controller_still_reports_empty() {
+        let mut kbd = Keyboard::picocalc();
+        assert_eq!(bsp_key_count(&mut kbd), 0);
+        kbd.press_and_release(b'x');
+        assert_eq!(bsp_key_count(&mut kbd), 2);
+        for _ in 0..2 {
+            kbd.write_byte(REG_KEY_FIFO);
+            kbd.read_byte();
+            kbd.read_byte();
+        }
+        assert_eq!(bsp_key_count(&mut kbd), 0);
+        assert_eq!(kbd.key_events_dropped, 0);
+    }
+
+    #[test]
+    fn a_controller_with_one_slot_left_keeps_the_press_and_loses_the_release() {
+        let mut kbd = Keyboard::picocalc();
+        for _ in 0..MAX_QUEUED_EVENTS - 1 {
+            kbd.push_event(KeyEvent::pressed(b'z'));
+        }
+        kbd.press_and_release(b'q');
+        assert_eq!(kbd.queued(), MAX_QUEUED_EVENTS);
+        assert_eq!(kbd.key_events_dropped, 1);
     }
 }
 

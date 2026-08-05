@@ -39,12 +39,16 @@ use picocalc_board::{
 };
 use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 
+mod scenario;
+
 /// Report schema version. Bump on any breaking field change.
 ///
 /// * 1 — Gate 1: boot / UART / unsupported-MMIO report.
 /// * 2 — Gate 2: optional `lcd` + `framebuffer` sections, `board` field.
 /// * 3 — Gate 3: optional `psram` section (`--psram` / `--psram-verify-range`).
-const SCHEMA_VERSION: u32 = 4;
+/// * 5 — Milestone 3: optional `scenario` section (`--scenario`), and the
+///   `scenario_done` stop reason.
+const SCHEMA_VERSION: u32 = 5;
 
 /// Default 16 KB RP2040 bootrom image, relative to the repo root.
 const DEFAULT_BOOTROM_PATH: &str = "roms/rp2040/bootrom-rp2040-b2.bin";
@@ -203,6 +207,8 @@ struct Args {
     keyboard: bool,
     sd: bool,
     keys: Option<String>,
+    scenario: Option<PathBuf>,
+    snapshot_dir: PathBuf,
 }
 
 /// Parse a `start:len` range, e.g. `0:10000` or `0x100:0x2000` (either
@@ -260,6 +266,18 @@ fn print_usage() {
                                   psram_test() writes, and report matched/mismatched counts.\n\
                                   START/LEN accept hex (0x-prefixed) or decimal. Requires\n\
                                   --psram.\n\
+         --keyboard               Attach the PicoCalc keyboard controller on I2C1.\n\
+         --keys <string>          Queue these characters as key events before the run\n\
+                                  starts. Implies --keyboard. For input that has to be\n\
+                                  timed against what the program is doing, use --scenario.\n\
+         --sd                     Attach an SD card on SPI0, pre-formatted FAT16.\n\
+         --scenario <path>        Run a JSON scenario: timed key input, and pixel / region\n\
+                                  / UART assertions checked inside the run loop. Adds the\n\
+                                  'scenario' report section. Exit 1 if any step fails.\n\
+                                  Milliseconds are virtual, derived from the system clock\n\
+                                  the firmware has programmed.\n\
+         --snapshot-dir <path>    Where scenario 'snapshot' steps write their PNGs.\n\
+                                  Default: the current directory.\n\
          -h, --help               This message."
     );
 }
@@ -292,6 +310,8 @@ fn parse_args() -> Result<Args, String> {
     let mut keyboard = false;
     let mut sd = false;
     let mut keys: Option<String> = None;
+    let mut scenario: Option<PathBuf> = None;
+    let mut snapshot_dir: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -342,6 +362,8 @@ fn parse_args() -> Result<Args, String> {
             "--keyboard" => keyboard = true,
             "--sd" => sd = true,
             "--keys" => keys = Some(value("--keys")?),
+            "--scenario" => scenario = Some(PathBuf::from(value("--scenario")?)),
+            "--snapshot-dir" => snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
                 psram_verify_range = Some(parse_range(&raw)?);
@@ -365,6 +387,9 @@ fn parse_args() -> Result<Args, String> {
     if keys.is_some() {
         keyboard = true;
     }
+    if snapshot_dir.is_some() && scenario.is_none() {
+        return Err("--snapshot-dir only means anything with --scenario".to_string());
+    }
 
     Ok(Args {
         bin: bin.ok_or_else(|| "missing required --bin <path>".to_string())?,
@@ -383,6 +408,8 @@ fn parse_args() -> Result<Args, String> {
         keyboard,
         sd,
         keys,
+        scenario,
+        snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
     })
 }
 
@@ -393,11 +420,16 @@ enum StopReason {
     PcMatch,
     Exception,
     Error,
+    /// Every scenario step finished. A normal stop, and the usual one
+    /// under `--scenario`: there is nothing left to observe, so burning
+    /// the rest of the cycle budget would only cost wall time.
+    ScenarioDone,
 }
 
 impl StopReason {
     fn as_str(self) -> &'static str {
         match self {
+            StopReason::ScenarioDone => "scenario_done",
             StopReason::CycleLimit => "cycle_limit",
             StopReason::PcMatch => "pc_match",
             StopReason::Exception => "exception",
@@ -411,6 +443,9 @@ impl StopReason {
 struct RunOutcome {
     stop_reason: StopReason,
     cycles: u64,
+    /// Virtual time at the stop, from [`VirtualClock`]. Firmware time,
+    /// not host time — nothing here reads a wall clock.
+    elapsed_ns: u64,
     pc: u32,
     exception: Option<&'static str>,
     error: Option<String>,
@@ -589,11 +624,83 @@ fn park_state(emu: &Emulator, core: usize) -> &'static str {
     }
 }
 
-fn run_loop(emu: &mut Emulator, cycle_limit: u64, stop_pc: Option<u32>) -> RunOutcome {
+/// Emulated cycles converted to virtual nanoseconds.
+///
+/// The system clock is not a constant: firmware boots on ROSC and moves
+/// to a PLL, so a fixed divisor would put every timestamp taken before
+/// the switch off by a factor of twenty. Instead the conversion is
+/// re-based whenever `clk_sys` changes — time already elapsed keeps the
+/// rate it was measured at, and only the new stretch uses the new rate.
+struct VirtualClock {
+    epoch_cycles: u64,
+    epoch_ns: u64,
+    hz: u64,
+}
+
+impl VirtualClock {
+    fn new(hz: u32) -> Self {
+        Self {
+            epoch_cycles: 0,
+            epoch_ns: 0,
+            hz: u64::from(hz).max(1),
+        }
+    }
+
+    fn ns_at(&self, cycles: u64) -> u64 {
+        let elapsed = u128::from(cycles.saturating_sub(self.epoch_cycles));
+        self.epoch_ns + (elapsed * 1_000_000_000 / u128::from(self.hz)) as u64
+    }
+
+    /// The cycle count at which the clock will read `ns`, saturating at
+    /// `u64::MAX` so a far-future deadline simply never arrives.
+    fn cycles_at(&self, ns: u64) -> u64 {
+        let ahead = u128::from(ns.saturating_sub(self.epoch_ns));
+        let cycles = ahead * u128::from(self.hz) / 1_000_000_000;
+        self.epoch_cycles
+            .saturating_add(u64::try_from(cycles).unwrap_or(u64::MAX))
+    }
+
+    /// Adopt a new rate from `cycles` onwards. No-op if unchanged.
+    fn rebase(&mut self, cycles: u64, hz: u32) -> bool {
+        let hz = u64::from(hz).max(1);
+        if hz == self.hz {
+            return false;
+        }
+        self.epoch_ns = self.ns_at(cycles);
+        self.epoch_cycles = cycles;
+        self.hz = hz;
+        true
+    }
+}
+
+/// Board models the scenario engine can reach into mid-run.
+#[derive(Default)]
+struct BoardHandles {
+    lcd: Option<Arc<Mutex<St7365p>>>,
+    keyboard: Option<Arc<Mutex<Keyboard>>>,
+}
+
+fn run_loop(
+    emu: &mut Emulator,
+    cycle_limit: u64,
+    stop_pc: Option<u32>,
+    mut engine: Option<&mut scenario::Engine>,
+    board: &BoardHandles,
+) -> RunOutcome {
     let mut uart_bytes: Vec<u8> = Vec::new();
     let mut steps: u64 = 0;
 
+    let mut vclock = VirtualClock::new(emu.bus.clock_tree.sys_clk_hz);
+    // Comparing cycles rather than converting to nanoseconds keeps the
+    // per-step check to one integer compare; the division only happens
+    // at a poll or a clock change.
+    let mut next_poll_cycles = match engine.as_deref() {
+        Some(e) => vclock.cycles_at(e.next_poll_ns()),
+        None => u64::MAX,
+    };
+
     let finish = |emu: &mut Emulator,
+                  vclock: &VirtualClock,
                   uart_bytes: &mut Vec<u8>,
                   stop_reason: StopReason,
                   exception: Option<&'static str>,
@@ -602,6 +709,7 @@ fn run_loop(emu: &mut Emulator, cycle_limit: u64, stop_pc: Option<u32>) -> RunOu
         RunOutcome {
             stop_reason,
             cycles: emu.clock.cycles,
+            elapsed_ns: vclock.ns_at(emu.clock.cycles),
             pc: emu.cores[0].regs.pc(),
             exception,
             error,
@@ -611,15 +719,40 @@ fn run_loop(emu: &mut Emulator, cycle_limit: u64, stop_pc: Option<u32>) -> RunOu
 
     loop {
         // Pre-step observations. Checking before the first step means a
-        // `--stop-pc` equal to the reset vector matches immediately.
+        // `--stop-pc` equal to the reset vector matches immediately, and
+        // that a scenario's first step sees the machine at reset.
+        if let Some(e) = engine.as_deref_mut()
+            && emu.clock.cycles >= next_poll_cycles
+        {
+            // The engine may test the UART stream, so it must see every
+            // byte sent so far — not just those the periodic drain has
+            // collected.
+            uart_bytes.extend_from_slice(&emu.drain_uart0_tx_log());
+            e.poll(&scenario::Observation {
+                now_ns: vclock.ns_at(emu.clock.cycles),
+                cycles: emu.clock.cycles,
+                lcd: board.lcd.as_deref(),
+                keyboard: board.keyboard.as_deref(),
+                uart: &uart_bytes,
+            });
+            if e.is_done() {
+                return finish(emu, &vclock, &mut uart_bytes, StopReason::ScenarioDone, None, None);
+            }
+            next_poll_cycles = vclock.cycles_at(e.next_poll_ns());
+            // A poll that changed nothing would otherwise re-fire every
+            // step until virtual time moved on.
+            next_poll_cycles = next_poll_cycles.max(emu.clock.cycles + 1);
+        }
+
         if let Some(target) = stop_pc
             && emu.cores[0].regs.pc() == target
         {
-            return finish(emu, &mut uart_bytes, StopReason::PcMatch, None, None);
+            return finish(emu, &vclock, &mut uart_bytes, StopReason::PcMatch, None, None);
         }
         if let Some(name) = fatal_exception_name(emu.cores[0].regs.xpsr & 0x1FF) {
             return finish(
                 emu,
+                &vclock,
                 &mut uart_bytes,
                 StopReason::Exception,
                 Some(name),
@@ -627,14 +760,14 @@ fn run_loop(emu: &mut Emulator, cycle_limit: u64, stop_pc: Option<u32>) -> RunOu
             );
         }
         if emu.clock.cycles >= cycle_limit {
-            return finish(emu, &mut uart_bytes, StopReason::CycleLimit, None, None);
+            return finish(emu, &vclock, &mut uart_bytes, StopReason::CycleLimit, None, None);
         }
 
         let consumed = match emu.step() {
             Ok(c) => c,
             Err(e) => {
                 let msg = e.to_string();
-                return finish(emu, &mut uart_bytes, StopReason::Error, None, Some(msg));
+                return finish(emu, &vclock, &mut uart_bytes, StopReason::Error, None, Some(msg));
             }
         };
         steps += 1;
@@ -652,11 +785,22 @@ fn run_loop(emu: &mut Emulator, cycle_limit: u64, stop_pc: Option<u32>) -> RunOu
                 park_state(emu, 0),
                 park_state(emu, 1)
             );
-            return finish(emu, &mut uart_bytes, StopReason::Error, None, Some(detail));
+            return finish(emu, &vclock, &mut uart_bytes, StopReason::Error, None, Some(detail));
         }
 
         if steps.is_multiple_of(UART_DRAIN_INTERVAL) {
             uart_bytes.extend_from_slice(&emu.drain_uart0_tx_log());
+        }
+
+        // Firmware reprograms the clock tree during init; from here on,
+        // virtual milliseconds have to mean what the firmware thinks they
+        // mean. The pending poll deadline is expressed in nanoseconds, so
+        // it moves with the rebase rather than being stranded at the old
+        // rate.
+        if vclock.rebase(emu.clock.cycles, emu.bus.clock_tree.sys_clk_hz)
+            && let Some(e) = engine.as_deref()
+        {
+            next_poll_cycles = vclock.cycles_at(e.next_poll_ns()).max(emu.clock.cycles + 1);
         }
     }
 }
@@ -976,6 +1120,7 @@ struct KeyboardReport {
     reg_selects: u64,
     key_events_delivered: u64,
     key_events_remaining: usize,
+    key_events_dropped: u64,
     battery_reads: u64,
     backlight_writes: u64,
     backlight: u8,
@@ -994,6 +1139,10 @@ impl KeyboardReport {
         s.push_str(&format!(
             "    \"reg_selects\": {}, \"key_events_delivered\": {}, \"key_events_remaining\": {},\n",
             self.reg_selects, self.key_events_delivered, self.key_events_remaining
+        ));
+        s.push_str(&format!(
+            "    \"key_events_dropped\": {},\n",
+            self.key_events_dropped
         ));
         s.push_str(&format!(
             "    \"battery_reads\": {}, \"backlight_writes\": {}, \"backlight\": {},\n",
@@ -1092,12 +1241,14 @@ fn build_report(
     unsupported_truncated: bool,
     uart_sha: &str,
     board: Board,
+    lcd_variant: LcdVariant,
     lcd: Option<&LcdReport>,
     fb: Option<&FramebufferReport>,
     psram: Option<&PsramReport>,
     keyboard: Option<&KeyboardReport>,
     pwm: Option<&PwmReport>,
     pio: Option<&PioReport>,
+    scenario: Option<(&scenario::Engine, String)>,
 ) -> String {
     let mut s = String::new();
     s.push_str("{\n");
@@ -1118,6 +1269,14 @@ fn build_report(
     ));
     s.push_str("  \"execution_model\": \"Serial\",\n");
     s.push_str(&format!("  \"board\": {},\n", json_string(board.as_str())));
+    // Which display transport produced this run. Recorded because the
+    // two variants reach very different cycle counts for the same
+    // firmware — a report without it invites the reader to compare runs
+    // that are not comparable.
+    s.push_str(&format!(
+        "  \"lcd_variant\": {},\n",
+        json_string(lcd_variant.as_str())
+    ));
     s.push_str(&format!(
         "  \"boot\": {{\"mode\": {}, \"vtor_flash_offset\": \"{:#06x}\"}},\n",
         json_string(boot_mode.as_str()),
@@ -1137,6 +1296,13 @@ fn build_report(
         json_string(outcome.stop_reason.as_str())
     ));
     s.push_str(&format!("  \"cycles\": {},\n", outcome.cycles));
+    // Firmware time, from the clock the firmware programmed. Integer
+    // microseconds: nanoseconds would imply a precision the quantised
+    // step loop does not have.
+    s.push_str(&format!(
+        "  \"elapsed_us\": {},\n",
+        outcome.elapsed_ns / 1_000
+    ));
     s.push_str(&format!(
         "  \"pc\": {},\n",
         json_string(&format!("{:#010x}", outcome.pc))
@@ -1194,6 +1360,9 @@ fn build_report(
     if let Some(pio) = pio {
         s.push_str(&pio.to_json());
     }
+    if let Some((engine, file)) = scenario {
+        s.push_str(&engine.to_json(&file, |t| json_string(t)));
+    }
 
     s.push_str(&format!(
         "  \"uart\": {{\"bytes\": {}, \"sha256\": {}}}\n",
@@ -1204,9 +1373,12 @@ fn build_report(
     s
 }
 
+/// Exit codes, matching `picocalc_emu`'s `tools/picocalc.py`: 0 pass,
+/// 1 the run was judged and failed, 2 it could not be judged at all.
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Verdict::Pass) => ExitCode::SUCCESS,
+        Ok(Verdict::Fail) => ExitCode::from(1),
         Err(e) => {
             eprintln!("picocalc-run: fatal: {e}");
             ExitCode::from(2)
@@ -1238,8 +1410,37 @@ fn build_framebuffer_report(
     }))
 }
 
-fn run() -> Result<(), String> {
-    let args = parse_args().inspect_err(|_| print_usage())?;
+/// What the process should say about the run.
+///
+/// Kept apart from `Err`, which means the harness could not judge at all
+/// (a missing file, an unparsable scenario) and exits 2. `Fail` means it
+/// judged and the answer was no.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Pass,
+    Fail,
+}
+
+fn run() -> Result<Verdict, String> {
+    let mut args = parse_args().inspect_err(|_| print_usage())?;
+
+    let scenario = match &args.scenario {
+        Some(path) => Some(scenario::load(path)?),
+        None => None,
+    };
+    if let Some(s) = &scenario {
+        if s.needs_lcd() && args.board != Board::PicoCalc {
+            return Err(format!(
+                "scenario '{}' looks at the panel, which needs --board picocalc",
+                s.name
+            ));
+        }
+        // Same rule as --keys: asking for key events implies the
+        // controller they arrive through.
+        if s.needs_keyboard() {
+            args.keyboard = true;
+        }
+    }
 
     let firmware = load_image(&args.bin, "firmware")?;
     let bootrom = load_image(&args.bootrom, "bootrom")?;
@@ -1290,7 +1491,32 @@ fn run() -> Result<(), String> {
     )?;
     emu.bus.unsupported_mmio_log_enabled = true;
 
-    let outcome = run_loop(&mut emu, args.cycles, args.stop_pc);
+    let handles = BoardHandles {
+        lcd: lcd.clone(),
+        keyboard: keyboard.clone(),
+    };
+    let mut engine = scenario.map(|s| scenario::Engine::new(s, args.snapshot_dir.clone()));
+
+    let outcome = run_loop(
+        &mut emu,
+        args.cycles,
+        args.stop_pc,
+        engine.as_mut(),
+        &handles,
+    );
+
+    // A run that ended for its own reasons — cycle limit, HardFault —
+    // leaves the scenario mid-step. Say so per step rather than letting
+    // the report imply those steps passed.
+    if let Some(e) = engine.as_mut() {
+        e.finish_incomplete(&scenario::Observation {
+            now_ns: outcome.elapsed_ns,
+            cycles: outcome.cycles,
+            lcd: None,
+            keyboard: None,
+            uart: &outcome.uart_bytes,
+        });
+    }
 
     // Snapshot the panel before anything else touches it.
     let (lcd_report, fb) = match &lcd {
@@ -1336,6 +1562,7 @@ fn run() -> Result<(), String> {
             reg_selects: k.reg_selects,
             key_events_delivered: k.key_events_delivered,
             key_events_remaining: k.queued(),
+            key_events_dropped: k.key_events_dropped,
             battery_reads: k.battery_reads,
             backlight_writes: k.backlight_writes,
             backlight: k.backlight,
@@ -1381,12 +1608,22 @@ fn run() -> Result<(), String> {
         unsupported_truncated,
         &uart_sha,
         args.board,
+        args.lcd_variant,
         lcd_report.as_ref(),
         fb_report.as_ref(),
         psram_report.as_ref(),
         keyboard_report.as_ref(),
         pwm_report.as_ref(),
         pio_report.as_ref(),
+        engine.as_ref().map(|e| {
+            (
+                e,
+                args.scenario
+                    .as_deref()
+                    .map(basename)
+                    .unwrap_or_default(),
+            )
+        }),
     );
 
     match &args.json {
@@ -1394,7 +1631,40 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("writing report {}: {e}", path.display()))?,
         None => print!("{report}"),
     }
-    Ok(())
+
+    let Some(engine) = engine else {
+        return Ok(Verdict::Pass);
+    };
+    // The per-step lines go to stderr so a report on stdout stays
+    // machine-readable when the two are piped apart.
+    eprintln!("scenario '{}': {}", engine.name(), engine.status());
+    for line in engine.summary_lines() {
+        eprintln!("{line}");
+    }
+    if let Some(fault) = engine.fault() {
+        eprintln!("scenario could not run: {fault}");
+    }
+    // Dropped keys change what the firmware saw without changing what
+    // the scenario said, so every step after the first drop is measuring
+    // something other than the scripted input. Worth saying out loud
+    // even when the run passed.
+    if let Some(dropped) = keyboard_report
+        .as_ref()
+        .map(|k| k.key_events_dropped)
+        .filter(|&n| n > 0)
+    {
+        eprintln!(
+            "warning: the keyboard controller discarded {dropped} event(s) — input was \
+             queued faster than the firmware drained it. Space the keys out with gap_ms; \
+             the controller holds at most {} events.",
+            picocalc_board::keyboard::MAX_QUEUED_EVENTS
+        );
+    }
+    Ok(if engine.passed() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail
+    })
 }
 
 #[cfg(test)]
