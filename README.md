@@ -94,6 +94,14 @@ and current hardening work are owned by
 [`picocalc_emu/docs/MILESTONES.md`](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/MILESTONES.md),
 not duplicated here.
 
+Report schema 7 makes that judgement normative. A conformance invocation supplies an accepted
+stop with `--expect-stop` and may repeat `--expect-uart` for required firmware markers. A raw
+cycle-limit run without any acceptance criterion is `cannot_judge`, not pass. Exception, emulator
+error, unsupported or truncated MMIO, keyboard event loss, scenario failure, stop mismatch, and
+missing UART markers cannot silently pass. The report's `verdict.status` and process status use the
+same mapping: 0=`pass`, 1=`fail`, 2=`cannot_judge`. A scenario infrastructure fault also exits 2;
+an assertion, timeout, or incomplete scenario exits 1.
+
 ## Quick Start
 
 Clone with submodules — the workspace member `epio-sys` references vendored upstream sources via git submodules. A normal clone works for everything else, but `cargo build -p epio-sys` requires submodules to be initialised:

@@ -19,7 +19,8 @@
 //!    VTOR straight from the SDK vector table at flash offset `0x100`,
 //!    exactly what boot2 does on silicon.
 //!
-//! Stop reasons: `cycle_limit` (budget exhausted — a normal stop),
+//! Stop reasons: `cycle_limit` (budget exhausted — only acceptable when
+//! explicitly named by the conformance contract),
 //! `pc_match` (`--stop-pc` reached, used for "did we get to `main`?"),
 //! `exception` (core 0 entered NMI or HardFault), `error` (both cores
 //! halted, or the emulator returned an error).
@@ -49,7 +50,8 @@ mod scenario;
 /// * 5 — Milestone 3: optional `scenario` section (`--scenario`), and the
 ///   `scenario_done` stop reason.
 /// * 6 — R1: optional `sd` section with the provisioned filesystem format.
-const SCHEMA_VERSION: u32 = 6;
+/// * 7 — R1: top-level verdict, reasons, and explicit stop/UART expectations.
+const SCHEMA_VERSION: u32 = 7;
 
 /// Default 16 KB RP2040 bootrom image, relative to the repo root.
 const DEFAULT_BOOTROM_PATH: &str = "roms/rp2040/bootrom-rp2040-b2.bin";
@@ -211,6 +213,8 @@ struct Args {
     keys: Option<String>,
     scenario: Option<PathBuf>,
     snapshot_dir: PathBuf,
+    expected_stop: Option<StopReason>,
+    expected_uart: Vec<String>,
 }
 
 /// Parse a `start:len` range, e.g. `0:10000` or `0x100:0x2000` (either
@@ -247,8 +251,8 @@ fn print_usage() {
                                   0x1000_0000 and direct-booted from offset 0x100.\n\
          --bootrom <path>         16 KB RP2040 bootrom image, loaded but never executed.\n\
                                   Default: {DEFAULT_BOOTROM_PATH}\n\
-         --cycles <N>             Cycle budget. Exceeding it is a normal stop\n\
-                                  (stop_reason=cycle_limit). Default: {DEFAULT_CYCLE_LIMIT}\n\
+         --cycles <N>             Cycle budget. Exceeding it gives cycle_limit, which is\n\
+                                  not a pass unless explicitly expected. Default: {DEFAULT_CYCLE_LIMIT}\n\
          --stop-pc <hex>          Stop with stop_reason=pc_match when core 0's PC equals\n\
                                   this address (e.g. 0x10000ca8). Forces a 1-cycle step\n\
                                   quantum so every instruction boundary is observed.\n\
@@ -290,6 +294,8 @@ fn print_usage() {
                                   the firmware has programmed.\n\
          --snapshot-dir <path>    Where scenario 'snapshot' steps write their PNGs.\n\
                                   Default: the current directory.\n\
+         --expect-stop <reason>   Required stop: cycle_limit, pc_match, or scenario_done.\n\
+         --expect-uart <text>     Required UART substring. Repeat for each marker.\n\
          -h, --help               This message."
     );
 }
@@ -326,6 +332,8 @@ fn parse_args() -> Result<Args, String> {
     let mut keys: Option<String> = None;
     let mut scenario: Option<PathBuf> = None;
     let mut snapshot_dir: Option<PathBuf> = None;
+    let mut expected_stop: Option<StopReason> = None;
+    let mut expected_uart: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < argv.len() {
@@ -383,6 +391,19 @@ fn parse_args() -> Result<Args, String> {
             "--keys" => keys = Some(value("--keys")?),
             "--scenario" => scenario = Some(PathBuf::from(value("--scenario")?)),
             "--snapshot-dir" => snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
+            "--expect-stop" => {
+                if expected_stop.is_some() {
+                    return Err("--expect-stop may be specified only once".to_string());
+                }
+                expected_stop = Some(StopReason::parse_acceptable(&value("--expect-stop")?)?);
+            }
+            "--expect-uart" => {
+                let marker = value("--expect-uart")?;
+                if marker.is_empty() {
+                    return Err("--expect-uart marker must not be empty".to_string());
+                }
+                expected_uart.push(marker);
+            }
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
                 psram_verify_range = Some(parse_range(&raw)?);
@@ -410,6 +431,27 @@ fn parse_args() -> Result<Args, String> {
     if snapshot_dir.is_some() && scenario.is_none() {
         return Err("--snapshot-dir only means anything with --scenario".to_string());
     }
+    if expected_stop == Some(StopReason::PcMatch) && stop_pc.is_none() {
+        return Err("--expect-stop pc_match requires --stop-pc".to_string());
+    }
+    if expected_stop == Some(StopReason::ScenarioDone) && scenario.is_none() {
+        return Err("--expect-stop scenario_done requires --scenario".to_string());
+    }
+    if scenario.is_some() && stop_pc.is_some() {
+        return Err("--scenario and --stop-pc define competing successful stops".to_string());
+    }
+    if scenario.is_some()
+        && expected_stop.is_some()
+        && expected_stop != Some(StopReason::ScenarioDone)
+    {
+        return Err("--scenario only permits --expect-stop scenario_done".to_string());
+    }
+    if stop_pc.is_some()
+        && expected_stop.is_some()
+        && expected_stop != Some(StopReason::PcMatch)
+    {
+        return Err("--stop-pc only permits --expect-stop pc_match".to_string());
+    }
 
     Ok(Args {
         bin: bin.ok_or_else(|| "missing required --bin <path>".to_string())?,
@@ -431,6 +473,8 @@ fn parse_args() -> Result<Args, String> {
         keys,
         scenario,
         snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
+        expected_stop,
+        expected_uart,
     })
 }
 
@@ -457,6 +501,17 @@ impl StopReason {
             StopReason::Error => "error",
         }
     }
+
+    fn parse_acceptable(raw: &str) -> Result<Self, String> {
+        match raw {
+            "cycle_limit" => Ok(StopReason::CycleLimit),
+            "pc_match" => Ok(StopReason::PcMatch),
+            "scenario_done" => Ok(StopReason::ScenarioDone),
+            other => Err(format!(
+                "invalid --expect-stop '{other}' (expected cycle_limit|pc_match|scenario_done)"
+            )),
+        }
+    }
 }
 
 /// Result of the run loop — everything the report needs that isn't
@@ -471,6 +526,110 @@ struct RunOutcome {
     exception: Option<&'static str>,
     error: Option<String>,
     uart_bytes: Vec<u8>,
+}
+
+/// Process result. `CannotJudge` is distinct from a negative firmware
+/// verdict: it means no acceptance contract was supplied, or the harness
+/// itself could not produce a trustworthy judgement.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Pass,
+    Fail,
+    CannotJudge,
+}
+
+impl Verdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Pass => "pass",
+            Verdict::Fail => "fail",
+            Verdict::CannotJudge => "cannot_judge",
+        }
+    }
+}
+
+struct VerdictReport {
+    status: Verdict,
+    reasons: Vec<&'static str>,
+    expected_stop: Option<StopReason>,
+    required_uart_markers: Vec<String>,
+    missing_uart_markers: Vec<String>,
+}
+
+impl VerdictReport {
+    fn to_json(&self) -> String {
+        let strings = |items: &[String]| {
+            items.iter().map(|item| json_string(item)).collect::<Vec<_>>().join(", ")
+        };
+        let reasons = self.reasons.iter()
+            .map(|reason| json_string(reason)).collect::<Vec<_>>().join(", ");
+        format!(
+            "  \"verdict\": {{\"status\": {}, \"reasons\": [{}], \
+             \"expected_stop_reason\": {}, \"required_uart_markers\": [{}], \
+             \"missing_uart_markers\": [{}]}},\n",
+            json_string(self.status.as_str()),
+            reasons,
+            self.expected_stop.map(|reason| json_string(reason.as_str()))
+                .unwrap_or_else(|| "null".to_string()),
+            strings(&self.required_uart_markers),
+            strings(&self.missing_uart_markers),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn judge_run(
+    outcome: &RunOutcome,
+    unsupported_count: usize,
+    unsupported_truncated: bool,
+    key_events_dropped: u64,
+    scenario_passed: Option<bool>,
+    scenario_fault: bool,
+    expected_stop: Option<StopReason>,
+    expected_uart: &[String],
+) -> VerdictReport {
+    let mut reasons = Vec::new();
+    if outcome.exception.is_some() { reasons.push("exception"); }
+    if outcome.error.is_some() { reasons.push("emulator_error"); }
+    if unsupported_count > 0 { reasons.push("unsupported_mmio"); }
+    if unsupported_truncated { reasons.push("unsupported_mmio_log_truncated"); }
+    if key_events_dropped > 0 { reasons.push("keyboard_events_dropped"); }
+    if scenario_passed == Some(false) && !scenario_fault { reasons.push("scenario_failed"); }
+    if scenario_fault { reasons.push("scenario_unrunnable"); }
+    if !scenario_fault && expected_stop.is_some_and(|expected| outcome.stop_reason != expected) {
+        reasons.push("stop_reason_mismatch");
+    }
+
+    let missing_uart_markers = expected_uart.iter().filter(|marker| {
+        let bytes = marker.as_bytes();
+        bytes.is_empty() || !outcome.uart_bytes.windows(bytes.len()).any(|window| window == bytes)
+    }).cloned().collect::<Vec<_>>();
+    if !scenario_fault && !missing_uart_markers.is_empty() {
+        reasons.push("missing_uart_markers");
+    }
+
+    let has_judged_failure = reasons.iter().any(|reason| *reason != "scenario_unrunnable");
+    let status = if has_judged_failure {
+        Verdict::Fail
+    } else if scenario_fault {
+        Verdict::CannotJudge
+    } else if expected_stop.is_none() && scenario_passed.is_none() {
+        reasons.push(if expected_uart.is_empty() {
+            "no_acceptance_criteria"
+        } else {
+            "no_accepted_stop_reason"
+        });
+        Verdict::CannotJudge
+    } else {
+        Verdict::Pass
+    };
+    VerdictReport {
+        status,
+        reasons,
+        expected_stop,
+        required_uart_markers: expected_uart.to_vec(),
+        missing_uart_markers,
+    }
 }
 
 /// ARMv6-M IPSR exception numbers that mean "the firmware has fallen
@@ -1332,6 +1491,7 @@ fn build_report(
     pwm: Option<&PwmReport>,
     pio: Option<&PioReport>,
     scenario: Option<(&scenario::Engine, String)>,
+    verdict: &VerdictReport,
 ) -> String {
     let mut s = String::new();
     s.push_str("{\n");
@@ -1404,6 +1564,7 @@ fn build_report(
             None => "null".to_string(),
         }
     ));
+    s.push_str(&verdict.to_json());
 
     s.push_str("  \"unsupported_mmio\": [");
     if unsupported.is_empty() {
@@ -1465,6 +1626,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(Verdict::Pass) => ExitCode::SUCCESS,
         Ok(Verdict::Fail) => ExitCode::from(1),
+        Ok(Verdict::CannotJudge) => ExitCode::from(2),
         Err(e) => {
             eprintln!("picocalc-run: fatal: {e}");
             ExitCode::from(2)
@@ -1494,17 +1656,6 @@ fn build_framebuffer_report(
         non_black_pixels: fb.non_black_pixels(),
         png_basename,
     }))
-}
-
-/// What the process should say about the run.
-///
-/// Kept apart from `Err`, which means the harness could not judge at all
-/// (a missing file, an unparsable scenario) and exits 2. `Fail` means it
-/// judged and the answer was no.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Verdict {
-    Pass,
-    Fail,
 }
 
 fn run() -> Result<Verdict, String> {
@@ -1690,6 +1841,30 @@ fn run() -> Result<Verdict, String> {
         .or(BUILT_IN_BACKEND_COMMIT)
         .unwrap_or("unknown");
 
+    let effective_expected_stop = args.expected_stop.or_else(|| {
+        if args.stop_pc.is_some() {
+            Some(StopReason::PcMatch)
+        } else if engine.is_some() {
+            Some(StopReason::ScenarioDone)
+        } else {
+            None
+        }
+    });
+    let scenario_fault = engine.as_ref().is_some_and(|value| value.fault().is_some());
+    let scenario_passed = engine.as_ref().map(|value| value.passed());
+    let key_events_dropped = keyboard_report.as_ref()
+        .map_or(0, |value| value.key_events_dropped);
+    let verdict = judge_run(
+        &outcome,
+        unsupported.len(),
+        unsupported_truncated,
+        key_events_dropped,
+        scenario_passed,
+        scenario_fault,
+        effective_expected_stop,
+        &args.expected_uart,
+    );
+
     let report = build_report(
         backend_commit,
         &basename(&args.bin),
@@ -1722,6 +1897,7 @@ fn run() -> Result<Verdict, String> {
                     .unwrap_or_default(),
             )
         }),
+        &verdict,
     );
 
     match &args.json {
@@ -1730,17 +1906,16 @@ fn run() -> Result<Verdict, String> {
         None => print!("{report}"),
     }
 
-    let Some(engine) = engine else {
-        return Ok(Verdict::Pass);
-    };
-    // The per-step lines go to stderr so a report on stdout stays
-    // machine-readable when the two are piped apart.
-    eprintln!("scenario '{}': {}", engine.name(), engine.status());
-    for line in engine.summary_lines() {
-        eprintln!("{line}");
-    }
-    if let Some(fault) = engine.fault() {
-        eprintln!("scenario could not run: {fault}");
+    if let Some(engine) = engine {
+        // The per-step lines go to stderr so a report on stdout stays
+        // machine-readable when the two are piped apart.
+        eprintln!("scenario '{}': {}", engine.name(), engine.status());
+        for line in engine.summary_lines() {
+            eprintln!("{line}");
+        }
+        if let Some(fault) = engine.fault() {
+            eprintln!("scenario could not run: {fault}");
+        }
     }
     // Dropped keys change what the firmware saw without changing what
     // the scenario said, so every step after the first drop is measuring
@@ -1752,22 +1927,21 @@ fn run() -> Result<Verdict, String> {
         .filter(|&n| n > 0)
     {
         eprintln!(
-            "warning: the keyboard controller discarded {dropped} event(s) — input was \
+            "failure: the keyboard controller discarded {dropped} event(s) — input was \
              queued faster than the firmware drained it. Space the keys out with gap_ms; \
              the controller holds at most {} events.",
             picocalc_board::keyboard::MAX_QUEUED_EVENTS
         );
     }
-    Ok(if engine.passed() {
-        Verdict::Pass
-    } else {
-        Verdict::Fail
-    })
+    Ok(verdict.status)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SdReport, StopReason, fatal_exception_name, json_escape, validate_sd_selection};
+    use super::{
+        RunOutcome, SdReport, StopReason, Verdict, fatal_exception_name, json_escape, judge_run,
+        validate_sd_selection,
+    };
     use picocalc_board::SdFormat;
 
     #[test]
@@ -1776,6 +1950,94 @@ mod tests {
         assert_eq!(StopReason::PcMatch.as_str(), "pc_match");
         assert_eq!(StopReason::Exception.as_str(), "exception");
         assert_eq!(StopReason::Error.as_str(), "error");
+    }
+
+    fn outcome(stop_reason: StopReason, uart: &[u8]) -> RunOutcome {
+        RunOutcome {
+            stop_reason,
+            cycles: 100,
+            elapsed_ns: 1_000,
+            pc: 0x1000_0100,
+            exception: None,
+            error: None,
+            uart_bytes: uart.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_raw_cycle_limit_is_not_a_pass() {
+        let result = judge_run(
+            &outcome(StopReason::CycleLimit, b"ready"), 0, false, 0,
+            None, false, None, &[],
+        );
+        assert!(result.status == Verdict::CannotJudge);
+        assert_eq!(result.reasons, ["no_acceptance_criteria"]);
+    }
+
+    #[test]
+    fn an_explicit_cycle_limit_and_present_markers_pass() {
+        let result = judge_run(
+            &outcome(StopReason::CycleLimit, b"boot lcd=pass ready"), 0, false, 0,
+            None, false, Some(StopReason::CycleLimit),
+            &["lcd=pass".to_string(), "ready".to_string()],
+        );
+        assert!(result.status == Verdict::Pass);
+        assert!(result.reasons.is_empty());
+        assert!(result.missing_uart_markers.is_empty());
+    }
+
+    #[test]
+    fn a_marker_without_an_accepted_stop_cannot_pass() {
+        let result = judge_run(
+            &outcome(StopReason::CycleLimit, b"ready"), 0, false, 0,
+            None, false, None, &["ready".to_string()],
+        );
+        assert!(result.status == Verdict::CannotJudge);
+        assert_eq!(result.reasons, ["no_accepted_stop_reason"]);
+    }
+
+    #[test]
+    fn missing_uart_marker_and_stop_mismatch_fail() {
+        let result = judge_run(
+            &outcome(StopReason::PcMatch, b"boot only"), 0, false, 0,
+            None, false, Some(StopReason::CycleLimit), &["lcd=pass".to_string()],
+        );
+        assert!(result.status == Verdict::Fail);
+        assert_eq!(result.reasons, ["stop_reason_mismatch", "missing_uart_markers"]);
+    }
+
+    #[test]
+    fn unsafe_observations_always_fail() {
+        let mut run = outcome(StopReason::Exception, b"ready");
+        run.exception = Some("HardFault");
+        let result = judge_run(
+            &run, 1, true, 2, Some(true), false, Some(StopReason::Exception), &[],
+        );
+        assert!(result.status == Verdict::Fail);
+        assert_eq!(result.reasons, [
+            "exception", "unsupported_mmio", "unsupported_mmio_log_truncated",
+            "keyboard_events_dropped"
+        ]);
+    }
+
+    #[test]
+    fn an_unrunnable_scenario_is_cannot_judge() {
+        let result = judge_run(
+            &outcome(StopReason::ScenarioDone, b""), 0, false, 0,
+            Some(false), true, Some(StopReason::ScenarioDone), &["ready".to_string()],
+        );
+        assert!(result.status == Verdict::CannotJudge);
+        assert_eq!(result.reasons, ["scenario_unrunnable"]);
+    }
+
+    #[test]
+    fn a_failed_scenario_is_a_judged_failure() {
+        let result = judge_run(
+            &outcome(StopReason::CycleLimit, b""), 0, false, 0,
+            Some(false), false, Some(StopReason::ScenarioDone), &[],
+        );
+        assert!(result.status == Verdict::Fail);
+        assert_eq!(result.reasons, ["scenario_failed", "stop_reason_mismatch"]);
     }
 
     #[test]
