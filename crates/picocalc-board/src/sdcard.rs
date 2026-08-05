@@ -12,9 +12,10 @@
 //! enough for the BSP's smoke test, which mounts a FAT volume, writes a
 //! file, syncs, reads it back, compares and deletes it. The BSP's FatFs
 //! configuration mounts but does not format (`FF_USE_MKFS=0`), so this
-//! model lays down an empty volume during construction. FAT32 is the
-//! default, matching the 32 GB card supplied with PicoCalc; FAT16 remains
-//! available as an explicit compatibility profile.
+//! model lays down an empty volume during construction. The model capacity
+//! is 64 MiB, while FAT32 is the default to match the filesystem choice of
+//! the 32 GB card supplied with PicoCalc; FAT16 remains available as an
+//! explicit compatibility profile.
 //!
 //! Command framing follows the driver's own shape: six bytes (`0x40 |
 //! index`, four argument bytes, CRC), then the card holds MISO high for
@@ -47,7 +48,8 @@ pub const DEFAULT_BLOCKS: usize = (64 << 20) / BLOCK_SIZE;
 pub enum SdFormat {
     /// Compatibility profile retained for older targets and diagnostics.
     Fat16,
-    /// Default profile, matching PicoCalc's bundled 32 GB card.
+    /// Default filesystem profile, matching PicoCalc's bundled 32 GB card.
+    /// The model capacity remains [`DEFAULT_BLOCKS`] (64 MiB).
     #[default]
     Fat32,
 }
@@ -186,10 +188,10 @@ impl SdCard {
     /// never formats. A real card ships formatted, so the model does the
     /// same rather than making every test carry a prepared image.
     ///
-    /// FAT16 rather than FAT32 because the geometry is simpler to get
-    /// right and FatFs mounts either. The layout is the textbook one:
-    /// one reserved sector holding the boot record, two copies of the
-    /// allocation table, a fixed-size root directory, then data.
+    /// This is the explicit compatibility profile; the default formatter
+    /// is FAT32. The FAT16 layout is the textbook one: one reserved sector
+    /// holding the boot record, two copies of the allocation table, a
+    /// fixed-size root directory, then data.
     fn format_fat16(&mut self) {
         const BYTES_PER_SECTOR: usize = 512;
         const SECTORS_PER_CLUSTER: u8 = 4;

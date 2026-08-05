@@ -27,9 +27,10 @@ STM32F103R8T6 firmware is the primary reference. The local workspace checkout is
 and applications are consumer evidence. Do not infer controller FIFO, modifier, repeat, register,
 or overflow semantics from a consumer when the official producer source answers the question.
 
-The SD device is a filesystem-independent block model. Its default provisioned volume is FAT32,
-matching PicoCalc's bundled 32 GB card; FAT16 is an explicit compatibility profile. Keep both
-filesystem smoke paths and the runner's `sd.format` report field covered when changing the model.
+The SD device is a filesystem-independent block model. Its in-memory test volume is 64 MiB and is
+provisioned as FAT32 by default, matching the filesystem choice rather than the capacity of PicoCalc's
+bundled 32 GB card; FAT16 is an explicit compatibility profile. Keep both filesystem smoke paths and
+the runner's `sd.format` report field covered when changing the model.
 
 ## Build & Test
 

@@ -9,7 +9,7 @@ An independent PicoCalc-oriented derivative of [`0x4D44/picoem`](https://github.
 - **Repository model:** independent derivative rather than a GitHub fork-network repository
 - **Primary consumer:** [`FuyukiYoneyama/picocalc_emu`](https://github.com/FuyukiYoneyama/picocalc_emu)
 
-This derivative is intended to provide the RP2040 firmware-execution backend for `picocalc_emu`. The main objective is to run the same PicoCalc ELF, BIN, or UF2 firmware used on hardware while connecting the emulated RP2040 to deterministic PicoCalc board-device models.
+This derivative is intended to provide the RP2040 firmware-execution backend for `picocalc_emu`. The current `picocalc-run` interface direct-boots the raw Pico SDK BIN generated alongside the ELF and the UF2 deployed to hardware, while connecting the emulated RP2040 to deterministic PicoCalc board-device models. ELF input must first be converted with `objcopy`; direct UF2 loading is not implemented.
 
 Development priorities are:
 
@@ -64,10 +64,10 @@ Open cycle-timing gaps and post-Phase-7 residuals are tracked in `tech_debt.md`.
 ### PicoCalc integration status
 
 The RP2040 PicoCalc path can direct-boot a Pico SDK BIN and attach the board display,
-8 MiB PSRAM, I2C keyboard controller, and a pre-formatted SPI0 SD card. The generated card defaults
-to FAT32, matching PicoCalc's bundled 32 GB card; `--sd-format fat16` selects the compatibility
-profile. Both formats pass the same BSP filesystem smoke, while the SPI block model itself remains
-filesystem-independent. Both LCD transports
+8 MiB PSRAM, I2C keyboard controller, and a pre-formatted SPI0 SD card. The in-memory test card is
+64 MiB; its filesystem defaults to FAT32 to match the format expected for PicoCalc's bundled 32 GB
+card, while `--sd-format fat16` selects the compatibility profile. Both formats pass the same BSP
+filesystem smoke, while the SPI block model itself remains filesystem-independent. Both LCD transports
 used by the canonical BSP are modelled: SPI1/RGB666 for compatibility and PIO0/RGB565 for
 the recommended configuration. The scenario runner can inject timed keys and assert UART,
 pixel, and framebuffer-region conditions while firmware is executing.
