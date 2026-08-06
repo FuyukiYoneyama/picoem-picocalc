@@ -110,6 +110,25 @@ incomplete scenario exits 1. Registered cross-repository runs should normally us
 `picocalc_emu/tools/picocalc.py test --mode firmware --target ...`, which verifies schema 8,
 backend/source identity, artifact hashes, device arguments, and report expectations together.
 
+### OPT0-A idle profiling
+
+The Serial runner has an opt-in, diagnostic-only idle profiler for the emulator optimization
+program. It is excluded from default builds so that the reference and wall-time measurement path
+does not acquire a disabled profiler branch. Build it explicitly and add an output path:
+
+```bash
+cargo run --release -p picocalc-harness --features idle-profiler -- \
+  <the normal picocalc-run arguments> \
+  --idle-profile /tmp/picocalc-idle-profile.json
+```
+
+The separate schema-1 profile records total and per-core cycles, the both-core-blocked upper bound,
+a conservative proven-safe lower bound, power-of-two cumulative `S(K)` distributions, and
+overlapping blocker cycles and episode counts for PIO, DMA, PWM, SysTick, UART, SPI, I2C, ADC,
+timer, and pending IRQ state. `instrumented=true` and `valid_for_wall_time=false` are normative:
+the JSON is for prioritizing optimization work and must not be used as a performance result. The
+ordinary schema-8 report and its acceptance rules are unchanged.
+
 ## Quick Start
 
 Clone with submodules — the workspace member `epio-sys` references vendored upstream sources via git submodules. A normal clone works for everything else, but `cargo build -p epio-sys` requires submodules to be initialised:

@@ -10,6 +10,12 @@ rust-version.workspace = true
 publish = false
 build = "build.rs"
 
+[features]
+default = []
+# Diagnostic-only OPT0-A build. The normal conformance runner remains
+# byte-for-byte schema compatible and carries no profiler hot-path branch.
+idle-profiler = ["rp2040-emu/idle-profiler"]
+
 [lints]
 workspace = true
 

@@ -24,6 +24,15 @@ pub mod irq;
 pub mod memory;
 pub mod peripherals;
 
+#[cfg(feature = "idle-profiler")]
+mod idle_profile;
+
+#[cfg(feature = "idle-profiler")]
+pub use idle_profile::{
+    CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_PROFILE_SCHEMA_VERSION,
+    IdleBlockerCycles, IdleBlockerEpisodes, IdleProfileSnapshot,
+};
+
 // Dual-execution HLD V1 (Stage 3b.2) — threaded runtime scaffolding.
 // The module file internally `#![cfg]`-gates to x86_64 Windows + the
 // `threading` cargo feature, so non-Windows and `--no-default-features`
@@ -243,6 +252,10 @@ pub struct Emulator {
     /// PC moved this tick. Initialised to a sentinel `0xFF` so the
     /// very first observation always counts as an advance.
     pub(crate) pio0_sm0_last_pc: u8,
+    /// OPT0-A Serial idle profiler. Entirely absent from normal builds;
+    /// diagnostic harnesses opt in through the `idle-profiler` feature.
+    #[cfg(feature = "idle-profiler")]
+    idle_profiler: Option<idle_profile::IdleProfiler>,
     /// Execution model chosen at build time; cannot change
     /// post-construction. Dispatch for [`Self::step`] / [`Self::run`] /
     /// [`Self::run_quantum`] branches on this. Defaults to
@@ -419,6 +432,10 @@ impl Emulator {
         self.pio0_sm0_max_pc = 0;
         self.pio0_sm0_pc_advances = 0;
         self.pio0_sm0_last_pc = 0xFF;
+        #[cfg(feature = "idle-profiler")]
+        if let Some(profiler) = self.idle_profiler.as_mut() {
+            *profiler = idle_profile::IdleProfiler::default();
+        }
         if let Some(ref mut psram) = self.bus.psram {
             psram.reset_state();
         }
@@ -763,12 +780,34 @@ impl Emulator {
             // and the next `step()` re-enters this branch, closing the
             // gap across multiple quanta — never silently stalls.
             let max_advance = self.step_quantum as u64;
-            let advance = (deadline - self.bus.master_cycle).min(max_advance);
+            let horizon_distance = deadline - self.bus.master_cycle;
+            let advance = horizon_distance.min(max_advance);
+            #[cfg(feature = "idle-profiler")]
+            let blocked_observation = (
+                self.idle_blocker_mask(),
+                self.cores[0].is_halted(),
+                self.bus.wfe_waiting[0],
+                self.cores[1].is_halted(),
+                self.bus.wfe_waiting[1],
+            );
             self.clock.cycles = self.clock.cycles.wrapping_add(advance);
             self.bus.master_cycle = self.clock.cycles;
             self.bus.tick_peripherals(advance as u32);
             self.drain_pending_irqs_to_cores();
             self.wake_checks();
+            #[cfg(feature = "idle-profiler")]
+            if let Some(profiler) = self.idle_profiler.as_mut() {
+                let (blockers, c0_halted, c0_wfe, c1_halted, c1_wfe) = blocked_observation;
+                profiler.record_blocked(
+                    advance,
+                    horizon_distance,
+                    blockers,
+                    c0_halted,
+                    c0_wfe,
+                    c1_halted,
+                    c1_wfe,
+                );
+            }
             return advance;
         }
         // See the fn docstring for the rationale on the fast-path and
@@ -850,7 +889,63 @@ impl Emulator {
             self.drain_pending_irqs_to_cores();
         }
         self.wake_checks();
+        #[cfg(feature = "idle-profiler")]
+        if let Some(profiler) = self.idle_profiler.as_mut() {
+            let both_blocked = (self.cores[0].is_halted() || self.bus.wfe_waiting[0])
+                && (self.cores[1].is_halted() || self.bus.wfe_waiting[1]);
+            if consumed == 0 && both_blocked {
+                profiler.record_zero_progress_blocked();
+            } else {
+                profiler.record_running(consumed, c0_total, c1_total);
+            }
+        }
         consumed
+    }
+
+    /// Return conservative autonomous-source blockers for an idle jump.
+    ///
+    /// A zero mask means only that the current model can prove the
+    /// interval quiescent apart from its scheduled timer wake. It does
+    /// not claim that every both-blocked interval is safe.
+    #[cfg(feature = "idle-profiler")]
+    fn idle_blocker_mask(&self) -> idle_profile::IdleBlockerMask {
+        use idle_profile::IdleBlockerMask as M;
+
+        let mut bits = 0u16;
+        if !self.bus.pio_all_idle() {
+            bits |= M::PIO;
+        }
+        if !self.bus.dma.is_idle() {
+            bits |= M::DMA;
+        }
+        if !self.bus.pwm.is_idle() {
+            bits |= M::PWM;
+        }
+        if self.bus.systicks[0].is_enabled() || self.bus.systicks[1].is_enabled() {
+            bits |= M::SYSTICK;
+        }
+        if !self.bus.uart0.is_idle() || !self.bus.uart1.is_idle() {
+            bits |= M::UART;
+        }
+        if !self.bus.spi0.is_idle() || !self.bus.spi1.is_idle() {
+            bits |= M::SPI;
+        }
+        if !self.bus.i2c0.is_idle() || !self.bus.i2c1.is_idle() {
+            bits |= M::I2C;
+        }
+        if !self.bus.adc.is_idle() {
+            bits |= M::ADC;
+        }
+        if !self.bus.timer.is_idle() {
+            bits |= M::TIMER;
+        }
+        if self.bus.irq_pending != 0
+            || self.bus.nvics[0].pending_and_enabled() != 0
+            || self.bus.nvics[1].pending_and_enabled() != 0
+        {
+            bits |= M::PENDING_IRQ;
+        }
+        M::from_bits(bits)
     }
 
     /// Drain [`Bus::irq_pending`] into both cores' NVIC pending
@@ -1128,6 +1223,8 @@ impl Emulator {
             pio0_sm0_max_pc: self.pio0_sm0_max_pc,
             pio0_sm0_pc_advances: self.pio0_sm0_pc_advances,
             pio0_sm0_last_pc: self.pio0_sm0_last_pc,
+            #[cfg(feature = "idle-profiler")]
+            idle_profiler: None,
             execution_model: ExecutionModel::Serial,
             threaded: None,
             panic_info: None,
@@ -1476,6 +1573,29 @@ impl Emulator {
         self.assert_not_placeholder();
         self.bus.drain_uart0_tx_log()
     }
+
+    /// Enable and reset the diagnostic Serial idle profiler.
+    ///
+    /// Available only in builds with the `idle-profiler` feature. The
+    /// method is rejected on Threaded emulators because OPT0-A defines
+    /// the Serial path as its reference.
+    #[cfg(feature = "idle-profiler")]
+    pub fn enable_idle_profiler(&mut self) -> Result<(), EmulatorError> {
+        if self.execution_model != ExecutionModel::Serial {
+            return Err(EmulatorError::NotSupportedInThreadedMode);
+        }
+        self.idle_profiler = Some(idle_profile::IdleProfiler::default());
+        Ok(())
+    }
+
+    /// Snapshot the diagnostic idle profiler without closing or changing
+    /// the currently open episode. Returns `None` until enabled.
+    #[cfg(feature = "idle-profiler")]
+    pub fn idle_profile_snapshot(&self) -> Option<IdleProfileSnapshot> {
+        self.idle_profiler
+            .as_ref()
+            .map(idle_profile::IdleProfiler::snapshot)
+    }
 }
 
 /// Builder for assembling the emulator. Seeds the Bus clock tree from
@@ -1573,6 +1693,8 @@ impl EmulatorBuilder {
             pio0_sm0_max_pc: 0,
             pio0_sm0_pc_advances: 0,
             pio0_sm0_last_pc: 0xFF,
+            #[cfg(feature = "idle-profiler")]
+            idle_profiler: None,
             execution_model: self.execution,
             #[cfg(all(
                 feature = "threading",
@@ -2207,6 +2329,68 @@ mod stage5_lib_residue {
             emu.bus.master_cycle,
             emu.bus.next_scheduled_lazy_deadline(),
         );
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_profiler_records_conservative_safe_blocked_cycles() {
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(64)
+            .build()
+            .unwrap();
+        emu.enable_idle_profiler().unwrap();
+        emu.cores[0].halt();
+        emu.halt_core1();
+        let sys_hz = emu.bus.clock_tree.sys_clk_hz;
+        emu.bus
+            .timer
+            .write32(INTE_OFFSET, 1, 0, emu.bus.master_cycle, sys_hz);
+        emu.bus
+            .timer
+            .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
+
+        assert_eq!(emu.step().unwrap(), 64);
+        let profile = emu.idle_profile_snapshot().unwrap();
+        assert_eq!(profile.step_calls, 1);
+        assert_eq!(profile.total_master_cycles, 64);
+        assert_eq!(profile.both_blocked_cycles, 64);
+        assert_eq!(profile.proven_safe_cycles, 64);
+        assert_eq!(profile.blocked_lengths.episodes_ge[6], 1);
+        assert_eq!(profile.blocked_lengths.cycle_mass_ge[6], 64);
+        assert_eq!(profile.proven_safe_lengths.episodes_ge[6], 1);
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_profiler_attributes_pio_as_overlapping_blocker() {
+        use crate::bus::PIO0_BASE;
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(8)
+            .build()
+            .unwrap();
+        emu.enable_idle_profiler().unwrap();
+        emu.cores[0].halt();
+        emu.halt_core1();
+        emu.bus.write32(PIO0_BASE + 0x2000, 1);
+        assert!(!emu.bus.pio_all_idle());
+        let sys_hz = emu.bus.clock_tree.sys_clk_hz;
+        emu.bus
+            .timer
+            .write32(INTE_OFFSET, 1, 0, emu.bus.master_cycle, sys_hz);
+        emu.bus
+            .timer
+            .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
+
+        assert_eq!(emu.step().unwrap(), 8);
+        let profile = emu.idle_profile_snapshot().unwrap();
+        assert_eq!(profile.both_blocked_cycles, 8);
+        assert_eq!(profile.proven_safe_cycles, 0);
+        assert_eq!(profile.blockers.pio, 8);
+        assert_eq!(profile.blocker_episodes.pio, 1);
     }
 
     // ------------------- step_serial: slow-path / fast-path gating (line 750) -------------------

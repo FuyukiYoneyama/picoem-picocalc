@@ -39,6 +39,11 @@ use picocalc_board::{
     St7365pWire, pins,
 };
 use rp2040_emu::{Config, Emulator, EmulatorBuilder};
+#[cfg(feature = "idle-profiler")]
+use rp2040_emu::{
+    CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_PROFILE_SCHEMA_VERSION,
+    IdleProfileSnapshot,
+};
 
 mod scenario;
 
@@ -231,6 +236,8 @@ struct Args {
     snapshot_dir: PathBuf,
     expected_stop: Option<StopReason>,
     expected_uart: Vec<String>,
+    #[cfg(feature = "idle-profiler")]
+    idle_profile: Option<PathBuf>,
 }
 
 /// Parse a `start:len` range, e.g. `0:10000` or `0x100:0x2000` (either
@@ -314,6 +321,10 @@ fn print_usage() {
          --expect-uart <text>     Required UART substring. Repeat for each marker.\n\
          -h, --help               This message."
     );
+    #[cfg(feature = "idle-profiler")]
+    eprintln!(
+        "         --idle-profile <path>   OPT0-A diagnostic JSON (not valid for wall-time measurement)."
+    );
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -350,6 +361,8 @@ fn parse_args() -> Result<Args, String> {
     let mut snapshot_dir: Option<PathBuf> = None;
     let mut expected_stop: Option<StopReason> = None;
     let mut expected_uart: Vec<String> = Vec::new();
+    #[cfg(feature = "idle-profiler")]
+    let mut idle_profile: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -420,6 +433,8 @@ fn parse_args() -> Result<Args, String> {
                 }
                 expected_uart.push(marker);
             }
+            #[cfg(feature = "idle-profiler")]
+            "--idle-profile" => idle_profile = Some(PathBuf::from(value("--idle-profile")?)),
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
                 psram_verify_range = Some(parse_range(&raw)?);
@@ -488,6 +503,8 @@ fn parse_args() -> Result<Args, String> {
         snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
         expected_stop,
         expected_uart,
+        #[cfg(feature = "idle-profiler")]
+        idle_profile,
     })
 }
 
@@ -1094,6 +1111,126 @@ fn json_escape(s: &str) -> String {
 
 fn json_string(s: &str) -> String {
     format!("\"{}\"", json_escape(s))
+}
+
+#[cfg(feature = "idle-profiler")]
+fn u64_json_array(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(feature = "idle-profiler")]
+fn histogram_json(value: &CumulativeHistogramSnapshot) -> String {
+    format!(
+        "{{\"episodes_ge\": [{}], \"cycle_mass_ge\": [{}]}}",
+        u64_json_array(&value.episodes_ge),
+        u64_json_array(&value.cycle_mass_ge),
+    )
+}
+
+#[cfg(feature = "idle-profiler")]
+#[allow(clippy::too_many_arguments)]
+fn build_idle_profile_report(
+    backend_commit: &str,
+    backend_dirty: bool,
+    firmware_name: &str,
+    firmware_sha: &str,
+    step_quantum: u32,
+    outcome: &RunOutcome,
+    profile: &IdleProfileSnapshot,
+) -> String {
+    let thresholds: [u64; IDLE_HISTOGRAM_BUCKETS] = std::array::from_fn(|i| 1u64 << i);
+    let b = &profile.blockers;
+    let e = &profile.blocker_episodes;
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": {},\n",
+            "  \"kind\": \"rp2040_serial_idle_profile\",\n",
+            "  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n",
+            "  \"firmware\": {{\"basename\": {}, \"sha256\": {}}},\n",
+            "  \"execution_model\": \"Serial\",\n",
+            "  \"instrumented\": true,\n",
+            "  \"valid_for_wall_time\": false,\n",
+            "  \"step_quantum\": {},\n",
+            "  \"stop_reason\": {},\n",
+            "  \"run_cycles\": {},\n",
+            "  \"histogram_thresholds_cycles\": [{}],\n",
+            "  \"counters\": {{\n",
+            "    \"step_calls\": {},\n",
+            "    \"total_master_cycles\": {},\n",
+            "    \"core0_executed_cycles\": {},\n",
+            "    \"core1_executed_cycles\": {},\n",
+            "    \"both_blocked_cycles\": {},\n",
+            "    \"proven_safe_cycles\": {},\n",
+            "    \"zero_progress_blocked_steps\": {},\n",
+            "    \"core0_halted_blocked_cycles\": {},\n",
+            "    \"core0_wfe_blocked_cycles\": {},\n",
+            "    \"core1_halted_blocked_cycles\": {},\n",
+            "    \"core1_wfe_blocked_cycles\": {}\n",
+            "  }},\n",
+            "  \"blocked_lengths\": {},\n",
+            "  \"proven_safe_lengths\": {},\n",
+            "  \"initial_horizon_distances\": {},\n",
+            "  \"blocker_cycles\": {{",
+            "\"pio\": {}, \"dma\": {}, \"pwm\": {}, \"systick\": {}, ",
+            "\"uart\": {}, \"spi\": {}, \"i2c\": {}, \"adc\": {}, ",
+            "\"timer\": {}, \"pending_irq\": {}",
+            "}},\n",
+            "  \"blocker_episodes\": {{",
+            "\"pio\": {}, \"dma\": {}, \"pwm\": {}, \"systick\": {}, ",
+            "\"uart\": {}, \"spi\": {}, \"i2c\": {}, \"adc\": {}, ",
+            "\"timer\": {}, \"pending_irq\": {}",
+            "}}\n",
+            "}}\n"
+        ),
+        IDLE_PROFILE_SCHEMA_VERSION,
+        json_string(backend_commit),
+        backend_dirty,
+        json_string(firmware_name),
+        json_string(firmware_sha),
+        step_quantum,
+        json_string(outcome.stop_reason.as_str()),
+        outcome.cycles,
+        u64_json_array(&thresholds),
+        profile.step_calls,
+        profile.total_master_cycles,
+        profile.core0_executed_cycles,
+        profile.core1_executed_cycles,
+        profile.both_blocked_cycles,
+        profile.proven_safe_cycles,
+        profile.zero_progress_blocked_steps,
+        profile.core0_halted_blocked_cycles,
+        profile.core0_wfe_blocked_cycles,
+        profile.core1_halted_blocked_cycles,
+        profile.core1_wfe_blocked_cycles,
+        histogram_json(&profile.blocked_lengths),
+        histogram_json(&profile.proven_safe_lengths),
+        histogram_json(&profile.initial_horizon_distances),
+        b.pio,
+        b.dma,
+        b.pwm,
+        b.systick,
+        b.uart,
+        b.spi,
+        b.i2c,
+        b.adc,
+        b.timer,
+        b.pending_irq,
+        e.pio,
+        e.dma,
+        e.pwm,
+        e.systick,
+        e.uart,
+        e.spi,
+        e.i2c,
+        e.adc,
+        e.timer,
+        e.pending_irq,
+    )
 }
 
 /// Everything the report says about the attached panel. Snapshotted out
@@ -1842,6 +1979,11 @@ fn run() -> Result<Verdict, String> {
         sd_card.clone(),
     )?;
     emu.bus.unsupported_mmio_log_enabled = true;
+    #[cfg(feature = "idle-profiler")]
+    if args.idle_profile.is_some() {
+        emu.enable_idle_profiler()
+            .map_err(|e| format!("enabling idle profiler: {e}"))?;
+    }
 
     let handles = BoardHandles {
         lcd: lcd.clone(),
@@ -1856,6 +1998,24 @@ fn run() -> Result<Verdict, String> {
         engine.as_mut(),
         &handles,
     );
+
+    #[cfg(feature = "idle-profiler")]
+    if let Some(path) = &args.idle_profile {
+        let snapshot = emu
+            .idle_profile_snapshot()
+            .expect("--idle-profile enabled the profiler before the run");
+        let profile_report = build_idle_profile_report(
+            BUILT_BACKEND_COMMIT,
+            built_backend_dirty(),
+            &basename(&args.bin),
+            &firmware_sha,
+            step_quantum,
+            &outcome,
+            &snapshot,
+        );
+        std::fs::write(path, profile_report.as_bytes())
+            .map_err(|e| format!("writing idle profile {}: {e}", path.display()))?;
+    }
 
     // A run that ended for its own reasons — cycle limit, HardFault —
     // leaves the scenario mid-step. Say so per step rather than letting
@@ -2058,6 +2218,11 @@ mod tests {
         validate_backend_identity, validate_sd_selection,
     };
     use picocalc_board::SdFormat;
+    #[cfg(feature = "idle-profiler")]
+    use rp2040_emu::IdleProfileSnapshot;
+
+    #[cfg(feature = "idle-profiler")]
+    use super::build_idle_profile_report;
 
     #[test]
     fn stop_reason_strings_are_stable() {
@@ -2271,6 +2436,58 @@ mod tests {
             validate_backend_identity(expected, expected, true)
                 .unwrap_err()
                 .contains("dirty")
+        );
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_profile_report_is_deterministic_valid_json() {
+        let mut profile = IdleProfileSnapshot {
+            step_calls: 11,
+            total_master_cycles: 100,
+            both_blocked_cycles: 80,
+            proven_safe_cycles: 64,
+            ..IdleProfileSnapshot::default()
+        };
+        profile.blockers.pwm = 16;
+        profile.blocker_episodes.pwm = 1;
+        profile.blocked_lengths.episodes_ge[0] = 2;
+        profile.blocked_lengths.cycle_mass_ge[0] = 80;
+        let run = outcome(StopReason::ScenarioDone, b"");
+        let report = build_idle_profile_report(
+            "0123456789012345678901234567890123456789",
+            false,
+            "firmware.bin",
+            "abcdef",
+            1,
+            &run,
+            &profile,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(parsed["kind"], "rp2040_serial_idle_profile");
+        assert_eq!(parsed["instrumented"], true);
+        assert_eq!(parsed["valid_for_wall_time"], false);
+        assert_eq!(parsed["counters"]["both_blocked_cycles"], 80);
+        assert_eq!(parsed["blocker_cycles"]["pwm"], 16);
+        assert_eq!(parsed["blocker_episodes"]["pwm"], 1);
+        assert_eq!(
+            parsed["histogram_thresholds_cycles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(
+            report,
+            build_idle_profile_report(
+                "0123456789012345678901234567890123456789",
+                false,
+                "firmware.bin",
+                "abcdef",
+                1,
+                &run,
+                &profile,
+            )
         );
     }
 }

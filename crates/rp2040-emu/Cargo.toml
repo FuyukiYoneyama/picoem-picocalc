@@ -38,6 +38,9 @@ threading = []
 # panic-injection APIs arriving with Stage 3b.4. Mirrors the RP2350
 # `testing` feature; NOT in `default` on purpose.
 testing = []
+# OPT0-A execution profiler. Kept out of default builds so the
+# performance/reference path does not pay even a disabled runtime branch.
+idle-profiler = []
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }
