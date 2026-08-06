@@ -16,6 +16,9 @@ public release simply ships those current versions.
 
 ### Added
 
+- Add the R4 GitHub Actions backend quality gate with separate test/release-build, rustfmt, and
+  Clippy jobs on pinned Ubuntu 24.04 and Rust 1.97.1. Formatting and linting are scoped to the
+  PicoCalc-owned crates, while the RP2040 core remains covered by tests.
 - Add the headless `picocalc-run` RP2040 firmware runner, deterministic JSON scenarios, framebuffer
   and UART artifacts, and schema 8 structured reports with normative verdicts and compiled-backend
   provenance.

@@ -193,9 +193,7 @@ impl Scenario {
     /// True if any step sends keys, so the caller can attach the
     /// controller rather than letting the run fail at the first `key`.
     pub fn needs_keyboard(&self) -> bool {
-        self.steps
-            .iter()
-            .any(|s| matches!(s.op, Op::Key { .. }))
+        self.steps.iter().any(|s| matches!(s.op, Op::Key { .. }))
     }
 
     /// True if any step looks at the panel. Unlike the keyboard, the
@@ -405,10 +403,7 @@ fn parse_step(raw: &Value) -> Result<Step, String> {
     Ok(Step { label, op })
 }
 
-fn duration_field(
-    obj: &serde_json::Map<String, Value>,
-    field: &str,
-) -> Result<u64, String> {
+fn duration_field(obj: &serde_json::Map<String, Value>, field: &str) -> Result<u64, String> {
     let ms = obj
         .get(field)
         .and_then(Value::as_u64)
@@ -540,11 +535,7 @@ fn parse_rect(obj: &serde_json::Map<String, Value>) -> Result<Rect, String> {
     Ok(Rect { x, y, w, h })
 }
 
-fn coord(
-    obj: &serde_json::Map<String, Value>,
-    field: &str,
-    limit: usize,
-) -> Result<usize, String> {
+fn coord(obj: &serde_json::Map<String, Value>, field: &str, limit: usize) -> Result<usize, String> {
     let n = obj
         .get(field)
         .and_then(Value::as_u64)
@@ -578,19 +569,16 @@ fn optional_usize(
             let n = v
                 .as_u64()
                 .ok_or_else(|| format!("{field}: must be a non-negative integer"))?;
-            Ok(Some(usize::try_from(n).map_err(|_| {
-                format!("{field}: too large")
-            })?))
+            Ok(Some(
+                usize::try_from(n).map_err(|_| format!("{field}: too large"))?,
+            ))
         }
     }
 }
 
 /// RGB565 colours may be given as a number or as a `"0x…"` string —
 /// hand-written scenarios reach for hex, and JSON has no hex literal.
-fn colour(
-    obj: &serde_json::Map<String, Value>,
-    field: &str,
-) -> Result<Option<u16>, String> {
+fn colour(obj: &serde_json::Map<String, Value>, field: &str) -> Result<Option<u16>, String> {
     let Some(v) = obj.get(field) else {
         return Ok(None);
     };
@@ -721,8 +709,7 @@ fn evaluate(
                     .map_err(|_| "LCD model mutex poisoned".to_string())?;
                 region_non_black(&guard, *rect)
             };
-            let holds =
-                min.is_none_or(|lo| count >= lo) && max.is_none_or(|hi| count <= hi);
+            let holds = min.is_none_or(|lo| count >= lo) && max.is_none_or(|hi| count <= hi);
             Ok(Verdict {
                 holds,
                 detail: format!(
@@ -785,7 +772,11 @@ fn evaluate(
                 detail: format!(
                     "{} is {} the baseline",
                     rect.describe(),
-                    if got == *baseline { "still at" } else { "away from" }
+                    if got == *baseline {
+                        "still at"
+                    } else {
+                        "away from"
+                    }
                 ),
             })
         }
@@ -1159,9 +1150,7 @@ impl Engine {
                     match kbd.lock() {
                         Ok(mut guard) => guard.press_and_release(code),
                         Err(_) => {
-                            return Progress::Faulted(
-                                "keyboard model mutex poisoned".to_string(),
-                            );
+                            return Progress::Faulted("keyboard model mutex poisoned".to_string());
                         }
                     }
                     *next_at_ns = obs.now_ns + gap_ms * 1_000_000;
@@ -1208,9 +1197,7 @@ impl Engine {
                             path.display()
                         ));
                     }
-                    png_basename = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned());
+                    png_basename = path.file_name().map(|n| n.to_string_lossy().into_owned());
                 }
                 Progress::Finished {
                     status: StepStatus::Pass,
@@ -1286,7 +1273,10 @@ impl Engine {
     pub fn to_json(&self, scenario_basename: &str, json_string: impl Fn(&str) -> String) -> String {
         let mut s = String::new();
         s.push_str("  \"scenario\": {\n");
-        s.push_str(&format!("    \"file\": {},\n", json_string(scenario_basename)));
+        s.push_str(&format!(
+            "    \"file\": {},\n",
+            json_string(scenario_basename)
+        ));
         s.push_str(&format!("    \"name\": {},\n", json_string(self.name())));
         s.push_str(&format!(
             "    \"description\": {},\n",
@@ -1295,7 +1285,10 @@ impl Engine {
                 None => "null".to_string(),
             }
         ));
-        s.push_str(&format!("    \"status\": {},\n", json_string(self.status())));
+        s.push_str(&format!(
+            "    \"status\": {},\n",
+            json_string(self.status())
+        ));
         s.push_str(&format!("    \"poll_ms\": {},\n", self.poll_ms()));
         s.push_str(&format!("    \"steps_total\": {},\n", self.steps_total()));
         s.push_str(&format!(
@@ -1633,7 +1626,13 @@ mod tests {
         assert!(e.is_done());
         assert_eq!(e.results()[0].status, StepStatus::Fail);
         assert_eq!(e.results()[0].at_ms, 20);
-        assert!(e.results()[0].detail.as_ref().unwrap().contains("timed out"));
+        assert!(
+            e.results()[0]
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("timed out")
+        );
     }
 
     #[test]

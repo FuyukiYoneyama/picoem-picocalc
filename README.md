@@ -167,6 +167,15 @@ The interactive UIs are `rp2350-emu-tui` and `rp2040-emu-tui`. The headless Pico
 
 The emulators are validated by independent oracles, each catching different bug classes.
 
+GitHub Actions provides the R4 backend quality gate as three independent jobs on pinned
+Ubuntu 24.04 and Rust 1.97.1: tests plus a release runner build, scoped rustfmt, and scoped Clippy
+with warnings denied. The formatting and lint boundary is `picocalc-board` plus
+`picocalc-harness`; inherited upstream crates are not reformatted as part of PicoCalc work.
+`rp2040-emu` remains in the test job because it is the core used by the runner. Passing this CI
+does not automatically promote the current backend commit into a firmware target: accepted commits
+remain explicit in `picocalc_emu/reference-projects/firmware-targets.json`, and historical targets
+continue to run from their pinned checkout.
+
 ### 1. Unit tests
 
 ```bash
