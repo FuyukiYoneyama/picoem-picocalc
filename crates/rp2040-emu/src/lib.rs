@@ -30,7 +30,7 @@ mod idle_profile;
 #[cfg(feature = "idle-profiler")]
 pub use idle_profile::{
     CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_PROFILE_SCHEMA_VERSION,
-    IdleBlockerCycles, IdleBlockerEpisodes, IdleProfileSnapshot,
+    IdleBlockerCycles, IdleBlockerEpisodes, IdleCurrentProbe, IdleProfileSnapshot,
 };
 
 // Dual-execution HLD V1 (Stage 3b.2) — threaded runtime scaffolding.
@@ -1596,6 +1596,23 @@ impl Emulator {
             .as_ref()
             .map(idle_profile::IdleProfiler::snapshot)
     }
+
+    /// Sample the current conservative idle gate for OPT0-A cost studies.
+    ///
+    /// This does not mutate emulated state and does not claim to compute a
+    /// complete future event horizon. It exists only in diagnostic builds.
+    #[cfg(feature = "idle-profiler")]
+    #[inline(never)]
+    pub fn idle_current_probe(&self) -> IdleCurrentProbe {
+        self.assert_not_placeholder();
+        let blockers = self.idle_blocker_mask();
+        IdleCurrentProbe {
+            master_cycle: self.bus.master_cycle,
+            next_lazy_deadline: self.bus.next_scheduled_lazy_deadline(),
+            blocker_count: blockers.count(),
+            proven_quiescent: blockers.is_empty(),
+        }
+    }
 }
 
 /// Builder for assembling the emulator. Seeds the Bus clock tree from
@@ -2351,6 +2368,10 @@ mod stage5_lib_residue {
             .timer
             .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
 
+        let probe = emu.idle_current_probe();
+        assert!(probe.proven_quiescent);
+        assert_eq!(probe.blocker_count, 0);
+        assert!(probe.next_lazy_deadline.is_some());
         assert_eq!(emu.step().unwrap(), 64);
         let profile = emu.idle_profile_snapshot().unwrap();
         assert_eq!(profile.step_calls, 1);
@@ -2385,6 +2406,9 @@ mod stage5_lib_residue {
             .timer
             .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
 
+        let probe = emu.idle_current_probe();
+        assert!(!probe.proven_quiescent);
+        assert_eq!(probe.blocker_count, 1);
         assert_eq!(emu.step().unwrap(), 8);
         let profile = emu.idle_profile_snapshot().unwrap();
         assert_eq!(profile.both_blocked_cycles, 8);

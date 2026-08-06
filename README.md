@@ -129,6 +129,21 @@ timer, and pending IRQ state. `instrumented=true` and `valid_for_wall_time=false
 the JSON is for prioritizing optimization work and must not be used as a performance result. The
 ordinary schema-8 report and its acceptance rules are unchanged.
 
+The companion cost microbenchmark uses the same diagnostic feature:
+
+```bash
+cargo build --locked --release -p picocalc-harness \
+  --features idle-profiler --bin opt0-idle-cost
+taskset -c 0 target/release/opt0-idle-cost \
+  --iterations 1000000 --samples 10 --json /tmp/opt0-idle-cost.json
+```
+
+It compares loop overhead, a current conservative idle probe, the existing quantum-1 blocked step,
+and quiescent `tick_peripherals(L)` for several values of `L`. Its schema explicitly reports that
+active-source next-event calculation, boundary event firing, clock update, IRQ routing, and wake
+checks are not yet fully costed. Consequently its break-even value is an optimistic lower bound and
+is not sufficient by itself to choose an optimization.
+
 ## Quick Start
 
 Clone with submodules — the workspace member `epio-sys` references vendored upstream sources via git submodules. A normal clone works for everything else, but `cargo build -p epio-sys` requires submodules to be initialised:

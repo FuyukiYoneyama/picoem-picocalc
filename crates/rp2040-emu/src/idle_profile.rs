@@ -94,6 +94,24 @@ pub struct IdleBlockerEpisodes {
     pub pending_irq: u64,
 }
 
+/// One observation of the conservative idle gate used by OPT0-A.
+///
+/// This is deliberately named a "current probe", not a complete event
+/// horizon. At schema 1 the only scheduled lazy deadline is TIMER; active
+/// PIO/DMA/PWM/serial sources are represented as blocker bits and are not
+/// yet converted to exact next-event cycles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdleCurrentProbe {
+    /// Current emulated master cycle.
+    pub master_cycle: u64,
+    /// Soonest deadline among lazy scheduled sources modelled today.
+    pub next_lazy_deadline: Option<u64>,
+    /// Number of overlapping conservative blockers observed.
+    pub blocker_count: u32,
+    /// True only when the current source checks find no blocker.
+    pub proven_quiescent: bool,
+}
+
 /// Stable snapshot of the opt-in Serial idle profiler.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdleProfileSnapshot {
@@ -158,8 +176,12 @@ impl IdleBlockerMask {
         self.0 & bit != 0
     }
 
-    fn is_empty(self) -> bool {
+    pub(crate) fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    pub(crate) fn count(self) -> u32 {
+        self.0.count_ones()
     }
 }
 
