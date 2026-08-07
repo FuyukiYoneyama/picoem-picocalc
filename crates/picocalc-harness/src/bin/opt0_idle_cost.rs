@@ -208,7 +208,7 @@ fn run(args: &Args) -> Result<Value, String> {
                 "blocker_count": initial_probe.blocker_count,
                 "stationary_source_count": initial_probe.stationary_source_count,
                 "exact_bulk_source_count": initial_probe.exact_bulk_source_count,
-                "proven_quiescent": initial_probe.proven_quiescent,
+                "proven_jump_safe": initial_probe.proven_jump_safe,
             },
         },
         "measurements": {

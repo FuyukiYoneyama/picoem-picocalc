@@ -134,8 +134,8 @@ pub struct IdleCurrentProbe {
     pub stationary_source_count: u32,
     /// Number of active sources whose existing tick is already exact in bulk.
     pub exact_bulk_source_count: u32,
-    /// True only when the current source checks find no blocker.
-    pub proven_quiescent: bool,
+    /// True when no source requires per-cycle work or an unresolved horizon.
+    pub proven_jump_safe: bool,
 }
 
 /// Stable snapshot of the opt-in Serial idle profiler.

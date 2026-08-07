@@ -1698,7 +1698,7 @@ impl Emulator {
             blocker_count: observation.blockers.count(),
             stationary_source_count: observation.stationary.count(),
             exact_bulk_source_count: observation.exact_bulk.count(),
-            proven_quiescent: observation.proven_safe(),
+            proven_jump_safe: observation.proven_safe(),
         }
     }
 }
@@ -2457,7 +2457,7 @@ mod stage5_lib_residue {
             .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
 
         let probe = emu.idle_current_probe();
-        assert!(probe.proven_quiescent);
+        assert!(probe.proven_jump_safe);
         assert_eq!(probe.blocker_count, 0);
         assert!(probe.next_lazy_deadline.is_some());
         assert_eq!(emu.step().unwrap(), 64);
@@ -2495,7 +2495,7 @@ mod stage5_lib_residue {
             .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
 
         let probe = emu.idle_current_probe();
-        assert!(!probe.proven_quiescent);
+        assert!(!probe.proven_jump_safe);
         assert_eq!(probe.blocker_count, 1);
         assert_eq!(emu.step().unwrap(), 8);
         let profile = emu.idle_profile_snapshot().unwrap();
@@ -2520,7 +2520,7 @@ mod stage5_lib_residue {
         assert!(emu.bus.pio[0].sm[0].stalled_on_empty_tx());
 
         let probe = emu.idle_current_probe();
-        assert!(probe.proven_quiescent);
+        assert!(probe.proven_jump_safe);
         assert_eq!(probe.blocker_count, 0);
         assert_eq!(probe.stationary_source_count, 1);
         assert_eq!(probe.exact_bulk_source_count, 0);
