@@ -923,9 +923,13 @@ impl Emulator {
         // an asserted enabled PIO IRQ, still require an event horizon.
         let mut pio_enabled = false;
         let mut pio_all_enabled_stalled = true;
+        let irq_can_wake = |irq: u32| {
+            self.bus.nvics[0].is_enabled(irq as u8)
+                || self.bus.nvics[1].is_enabled(irq as u8)
+        };
         let mut pio_static_irq = false;
-        let mut pio_routable_irq = false;
-        for pio in &self.bus.pio {
+        let mut pio_wake_irq = false;
+        for (block, pio) in self.bus.pio.iter().enumerate() {
             for sm in &pio.sm {
                 if sm.enabled() {
                     pio_enabled = true;
@@ -933,9 +937,15 @@ impl Emulator {
                 }
             }
             pio_static_irq |= pio.pending_irqs() != 0;
-            pio_routable_irq |= pio.int0_ints_rp2040() != 0 || pio.int1_ints_rp2040() != 0;
+            let line0 = 7 + (block as u32 * 2);
+            let int0_asserted = pio.int0_ints_rp2040() != 0;
+            let int1_asserted = pio.int1_ints_rp2040() != 0;
+            pio_wake_irq |= (int0_asserted && irq_can_wake(line0))
+                || (int1_asserted && irq_can_wake(line0 + 1));
+            pio_static_irq |= (int0_asserted && !irq_can_wake(line0))
+                || (int1_asserted && !irq_can_wake(line0 + 1));
         }
-        if pio_routable_irq || (pio_enabled && !pio_all_enabled_stalled) {
+        if pio_wake_irq || (pio_enabled && !pio_all_enabled_stalled) {
             blockers |= M::PIO;
         }
         if pio_static_irq || (pio_enabled && pio_all_enabled_stalled) {
@@ -943,36 +953,74 @@ impl Emulator {
         }
 
         let pwm = self.bus.pwm.idle_profile_state();
-        if pwm.temporal_boundary || pwm.routable_irq {
+        let pwm_irq_can_wake = irq_can_wake(4);
+        if (pwm.temporal_boundary || pwm.routable_irq) && pwm_irq_can_wake {
             blockers |= M::PWM;
         }
-        if pwm.static_state {
+        if pwm.static_state || (pwm.routable_irq && !pwm_irq_can_wake) {
             stationary |= M::PWM;
         }
-        if pwm.exact_bulk_work {
+        if pwm.exact_bulk_work || (pwm.temporal_boundary && !pwm_irq_can_wake) {
             exact_bulk |= M::PWM;
         }
         if self.bus.systicks[0].is_enabled() || self.bus.systicks[1].is_enabled() {
             blockers |= M::SYSTICK;
         }
 
-        let mut classify = |state: idle_profile::IdlePeripheralState, bit: u16| {
-            if state.temporal_work || state.routable_irq {
-                blockers |= bit;
-            }
-            if state.static_state {
-                stationary |= bit;
-            }
-        };
-        classify(self.bus.dma.idle_profile_state(), M::DMA);
-        classify(self.bus.uart0.idle_profile_state(), M::UART);
-        classify(self.bus.uart1.idle_profile_state(), M::UART);
-        classify(self.bus.spi0.idle_profile_state(), M::SPI);
-        classify(self.bus.spi1.idle_profile_state(), M::SPI);
-        classify(self.bus.i2c0.idle_profile_state(), M::I2C);
-        classify(self.bus.i2c1.idle_profile_state(), M::I2C);
-        classify(self.bus.adc.idle_profile_state(), M::ADC);
-        classify(self.bus.timer.idle_profile_state(), M::TIMER);
+        let mut classify =
+            |state: idle_profile::IdlePeripheralState, bit: u16, irq_can_wake: bool| {
+                if state.temporal_work || (state.routable_irq && irq_can_wake) {
+                    blockers |= bit;
+                }
+                if state.static_state || (state.routable_irq && !irq_can_wake) {
+                    stationary |= bit;
+                }
+            };
+        classify(
+            self.bus.dma.idle_profile_state(),
+            M::DMA,
+            irq_can_wake(11) || irq_can_wake(12),
+        );
+        classify(
+            self.bus.uart0.idle_profile_state(),
+            M::UART,
+            irq_can_wake(20),
+        );
+        classify(
+            self.bus.uart1.idle_profile_state(),
+            M::UART,
+            irq_can_wake(21),
+        );
+        classify(
+            self.bus.spi0.idle_profile_state(),
+            M::SPI,
+            irq_can_wake(18),
+        );
+        classify(
+            self.bus.spi1.idle_profile_state(),
+            M::SPI,
+            irq_can_wake(19),
+        );
+        classify(
+            self.bus.i2c0.idle_profile_state(),
+            M::I2C,
+            irq_can_wake(23),
+        );
+        classify(
+            self.bus.i2c1.idle_profile_state(),
+            M::I2C,
+            irq_can_wake(24),
+        );
+        classify(
+            self.bus.adc.idle_profile_state(),
+            M::ADC,
+            irq_can_wake(22),
+        );
+        classify(
+            self.bus.timer.idle_profile_state(),
+            M::TIMER,
+            (0..4).any(irq_can_wake),
+        );
         if self.bus.irq_pending != 0
             || self.bus.nvics[0].pending_and_enabled() != 0
             || self.bus.nvics[1].pending_and_enabled() != 0
