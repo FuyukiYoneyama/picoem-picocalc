@@ -316,6 +316,18 @@ impl Dma {
         !self.channels.iter().any(|c| c.busy) && self.intr == 0
     }
 
+    /// OPT0 diagnostic classification. A latched but masked completion is
+    /// static; only a BUSY channel advances transfer state with time.
+    #[cfg(feature = "idle-profiler")]
+    pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
+        crate::idle_profile::IdlePeripheralState {
+            temporal_work: self.channels.iter().any(|c| c.busy),
+            routable_irq: ((self.intr | self.intf0) & self.inte0) != 0
+                || ((self.intr | self.intf1) & self.inte1) != 0,
+            static_state: self.intr != 0 || self.intf0 != 0 || self.intf1 != 0,
+        }
+    }
+
     /// Borrow a channel read-only (exposed for tests / observability).
     pub fn channel(&self, i: usize) -> &DmaChannel {
         &self.channels[i]

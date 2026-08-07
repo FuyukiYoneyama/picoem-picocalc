@@ -186,7 +186,7 @@ fn run(args: &Args) -> Result<Value, String> {
     };
 
     Ok(json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "rp2040_serial_idle_cost_microbenchmark",
         "backend_build": {
             "commit": BUILT_BACKEND_COMMIT,
@@ -201,11 +201,13 @@ fn run(args: &Args) -> Result<Value, String> {
         "current_probe_scope": {
             "complete_event_horizon": false,
             "lazy_deadline_sources": ["timer"],
-            "active_sources_are_blockers_not_deadlines": true,
+            "active_sources_are_classified_not_deadlines": true,
             "initial_probe": {
                 "master_cycle": initial_probe.master_cycle,
                 "next_lazy_deadline": initial_probe.next_lazy_deadline,
                 "blocker_count": initial_probe.blocker_count,
+                "stationary_source_count": initial_probe.stationary_source_count,
+                "exact_bulk_source_count": initial_probe.exact_bulk_source_count,
                 "proven_quiescent": initial_probe.proven_quiescent,
             },
         },

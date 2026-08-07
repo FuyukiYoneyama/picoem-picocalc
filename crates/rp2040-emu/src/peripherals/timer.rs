@@ -229,6 +229,17 @@ impl TimerRegs {
         self.intr == 0 && (self.intf & self.inte) == 0
     }
 
+    /// OPT0 diagnostic view of already-latched timer state. Future armed
+    /// alarms are represented separately by `next_scheduled_lazy_deadline`.
+    #[cfg(feature = "idle-profiler")]
+    pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
+        crate::idle_profile::IdlePeripheralState {
+            temporal_work: false,
+            routable_irq: ((self.intr | self.intf) & self.inte) != 0,
+            static_state: self.intr != 0 || self.intf != 0,
+        }
+    }
+
     /// Return the soonest scheduled alarm fire cycle across alarms
     /// that are both armed AND have INTE set, or `None` if no such
     /// alarm is currently scheduled to raise an NVIC IRQ. Used by

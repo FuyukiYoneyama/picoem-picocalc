@@ -193,6 +193,18 @@ impl AdcRegs {
             && self.intr == 0
     }
 
+    /// OPT0 diagnostic classification: conversions advance with time,
+    /// whereas a filled FIFO or masked interrupt latch remains static.
+    #[cfg(feature = "idle-profiler")]
+    pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
+        crate::idle_profile::IdlePeripheralState {
+            temporal_work: self.conversion_remaining.is_some()
+                || (self.cs & (CS_START_ONCE | CS_START_MANY)) != 0,
+            routable_irq: ((self.intr | self.intf) & self.inte) != 0,
+            static_state: !self.fifo.is_empty() || self.intr != 0 || self.intf != 0,
+        }
+    }
+
     /// DREQ: FIFO level crosses `FCS.THRESH` with `FCS.DREQ_EN` set.
     /// Phase 4 DMA TREQ `DREQ_ADC` consults this — firmware that wants
     /// DMA'd samples writes `FCS.EN=1, DREQ_EN=1, THRESH=n` and the DMA

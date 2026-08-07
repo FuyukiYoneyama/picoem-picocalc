@@ -784,7 +784,7 @@ impl Emulator {
             let advance = horizon_distance.min(max_advance);
             #[cfg(feature = "idle-profiler")]
             let blocked_observation = (
-                self.idle_blocker_mask(),
+                self.idle_source_observation(),
                 self.cores[0].is_halted(),
                 self.bus.wfe_waiting[0],
                 self.cores[1].is_halted(),
@@ -797,11 +797,11 @@ impl Emulator {
             self.wake_checks();
             #[cfg(feature = "idle-profiler")]
             if let Some(profiler) = self.idle_profiler.as_mut() {
-                let (blockers, c0_halted, c0_wfe, c1_halted, c1_wfe) = blocked_observation;
+                let (observation, c0_halted, c0_wfe, c1_halted, c1_wfe) = blocked_observation;
                 profiler.record_blocked(
                     advance,
                     horizon_distance,
-                    blockers,
+                    observation,
                     c0_halted,
                     c0_wfe,
                     c1_halted,
@@ -902,50 +902,88 @@ impl Emulator {
         consumed
     }
 
-    /// Return conservative autonomous-source blockers for an idle jump.
+    /// Classify autonomous sources for a prospective idle jump.
     ///
-    /// A zero mask means only that the current model can prove the
-    /// interval quiescent apart from its scheduled timer wake. It does
-    /// not claim that every both-blocked interval is safe.
+    /// This diagnostic-only predicate deliberately does not reuse the
+    /// production fast-path `is_idle()` methods: those methods conservatively
+    /// include FIFO contents and sticky IRQ bits, while an idle jump needs to
+    /// know whether state changes *with time*. Static state and work already
+    /// handled by an exact bulk tick are retained as separate evidence.
     #[cfg(feature = "idle-profiler")]
-    fn idle_blocker_mask(&self) -> idle_profile::IdleBlockerMask {
+    fn idle_source_observation(&self) -> idle_profile::IdleSourceObservation {
         use idle_profile::IdleBlockerMask as M;
 
-        let mut bits = 0u16;
-        if !self.bus.pio_all_idle() {
-            bits |= M::PIO;
+        let mut blockers = 0u16;
+        let mut stationary = 0u16;
+        let mut exact_bulk = 0u16;
+
+        // An enabled PIO SM that is already stalled on an empty TX FIFO
+        // cannot change PC or pins until a CPU/DMA write supplies data. Raw
+        // masked IRQ flags are likewise static. Other enabled SM states, or
+        // an asserted enabled PIO IRQ, still require an event horizon.
+        let mut pio_enabled = false;
+        let mut pio_all_enabled_stalled = true;
+        let mut pio_static_irq = false;
+        let mut pio_routable_irq = false;
+        for pio in &self.bus.pio {
+            for sm in &pio.sm {
+                if sm.enabled() {
+                    pio_enabled = true;
+                    pio_all_enabled_stalled &= sm.stalled_on_empty_tx();
+                }
+            }
+            pio_static_irq |= pio.pending_irqs() != 0;
+            pio_routable_irq |= pio.int0_ints_rp2040() != 0 || pio.int1_ints_rp2040() != 0;
         }
-        if !self.bus.dma.is_idle() {
-            bits |= M::DMA;
+        if pio_routable_irq || (pio_enabled && !pio_all_enabled_stalled) {
+            blockers |= M::PIO;
         }
-        if !self.bus.pwm.is_idle() {
-            bits |= M::PWM;
+        if pio_static_irq || (pio_enabled && pio_all_enabled_stalled) {
+            stationary |= M::PIO;
+        }
+
+        let pwm = self.bus.pwm.idle_profile_state();
+        if pwm.temporal_boundary || pwm.routable_irq {
+            blockers |= M::PWM;
+        }
+        if pwm.static_state {
+            stationary |= M::PWM;
+        }
+        if pwm.exact_bulk_work {
+            exact_bulk |= M::PWM;
         }
         if self.bus.systicks[0].is_enabled() || self.bus.systicks[1].is_enabled() {
-            bits |= M::SYSTICK;
+            blockers |= M::SYSTICK;
         }
-        if !self.bus.uart0.is_idle() || !self.bus.uart1.is_idle() {
-            bits |= M::UART;
-        }
-        if !self.bus.spi0.is_idle() || !self.bus.spi1.is_idle() {
-            bits |= M::SPI;
-        }
-        if !self.bus.i2c0.is_idle() || !self.bus.i2c1.is_idle() {
-            bits |= M::I2C;
-        }
-        if !self.bus.adc.is_idle() {
-            bits |= M::ADC;
-        }
-        if !self.bus.timer.is_idle() {
-            bits |= M::TIMER;
-        }
+
+        let mut classify = |state: idle_profile::IdlePeripheralState, bit: u16| {
+            if state.temporal_work || state.routable_irq {
+                blockers |= bit;
+            }
+            if state.static_state {
+                stationary |= bit;
+            }
+        };
+        classify(self.bus.dma.idle_profile_state(), M::DMA);
+        classify(self.bus.uart0.idle_profile_state(), M::UART);
+        classify(self.bus.uart1.idle_profile_state(), M::UART);
+        classify(self.bus.spi0.idle_profile_state(), M::SPI);
+        classify(self.bus.spi1.idle_profile_state(), M::SPI);
+        classify(self.bus.i2c0.idle_profile_state(), M::I2C);
+        classify(self.bus.i2c1.idle_profile_state(), M::I2C);
+        classify(self.bus.adc.idle_profile_state(), M::ADC);
+        classify(self.bus.timer.idle_profile_state(), M::TIMER);
         if self.bus.irq_pending != 0
             || self.bus.nvics[0].pending_and_enabled() != 0
             || self.bus.nvics[1].pending_and_enabled() != 0
         {
-            bits |= M::PENDING_IRQ;
+            blockers |= M::PENDING_IRQ;
         }
-        M::from_bits(bits)
+        idle_profile::IdleSourceObservation {
+            blockers: M::from_bits(blockers),
+            stationary: M::from_bits(stationary),
+            exact_bulk: M::from_bits(exact_bulk),
+        }
     }
 
     /// Drain [`Bus::irq_pending`] into both cores' NVIC pending
@@ -1605,12 +1643,14 @@ impl Emulator {
     #[inline(never)]
     pub fn idle_current_probe(&self) -> IdleCurrentProbe {
         self.assert_not_placeholder();
-        let blockers = self.idle_blocker_mask();
+        let observation = self.idle_source_observation();
         IdleCurrentProbe {
             master_cycle: self.bus.master_cycle,
             next_lazy_deadline: self.bus.next_scheduled_lazy_deadline(),
-            blocker_count: blockers.count(),
-            proven_quiescent: blockers.is_empty(),
+            blocker_count: observation.blockers.count(),
+            stationary_source_count: observation.stationary.count(),
+            exact_bulk_source_count: observation.exact_bulk.count(),
+            proven_quiescent: observation.proven_safe(),
         }
     }
 }
@@ -2415,6 +2455,27 @@ mod stage5_lib_residue {
         assert_eq!(profile.proven_safe_cycles, 0);
         assert_eq!(profile.blockers.pio, 8);
         assert_eq!(profile.blocker_episodes.pio, 1);
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_profiler_classifies_empty_tx_stalled_pio_as_stationary() {
+        use crate::bus::PIO0_BASE;
+
+        let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
+        emu.enable_idle_profiler().unwrap();
+        // SM0 executes a blocking PULL from an empty TX FIFO, then remains
+        // unable to change PC or pins until CPU/DMA supplies a word.
+        emu.bus.write32(PIO0_BASE + 0x048, 0x80A0);
+        emu.bus.write32(PIO0_BASE + 0x000, 1);
+        emu.bus.pio[0].step(0);
+        assert!(emu.bus.pio[0].sm[0].stalled_on_empty_tx());
+
+        let probe = emu.idle_current_probe();
+        assert!(probe.proven_quiescent);
+        assert_eq!(probe.blocker_count, 0);
+        assert_eq!(probe.stationary_source_count, 1);
+        assert_eq!(probe.exact_bulk_source_count, 0);
     }
 
     // ------------------- step_serial: slow-path / fast-path gating (line 750) -------------------

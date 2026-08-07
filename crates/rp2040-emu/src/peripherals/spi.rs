@@ -225,6 +225,20 @@ impl SpiRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.ris == 0
     }
 
+    /// OPT0 diagnostic classification: distinguish an actively shifting
+    /// transmitter from static FIFO/interrupt state.
+    #[cfg(feature = "idle-profiler")]
+    pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
+        crate::idle_profile::IdlePeripheralState {
+            temporal_work: self.is_enabled() && !self.tx_fifo.is_empty(),
+            routable_irq: (self.ris & self.imsc) != 0,
+            static_state: !self.tx_fifo.is_empty()
+                || !self.rx_fifo.is_empty()
+                || self.ris != 0
+                || self.tx_cycle_accum != 0,
+        }
+    }
+
     /// DREQ: TX FIFO has room and the peripheral is enabled. Phase 4
     /// DMA TREQ matrix consults this for `SPI0_TX` / `SPI1_TX`.
     #[inline]

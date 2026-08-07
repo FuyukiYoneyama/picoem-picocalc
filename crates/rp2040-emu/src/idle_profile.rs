@@ -5,7 +5,7 @@
 //! counter, or histogram cost.
 
 /// Machine-readable profile schema emitted by diagnostic harnesses.
-pub const IDLE_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const IDLE_PROFILE_SCHEMA_VERSION: u32 = 2;
 
 /// Number of power-of-two thresholds: 1 through 2^63 cycles.
 pub const IDLE_HISTOGRAM_BUCKETS: usize = 64;
@@ -48,29 +48,31 @@ impl CumulativeHistogramSnapshot {
     }
 }
 
-/// Overlapping cycle totals for autonomous sources that prevented a
-/// both-blocked interval from being conservatively classified as safe.
+/// Overlapping cycle totals for peripheral-source classifications.
+///
+/// The containing [`IdleProfileSnapshot`] field determines whether the
+/// source is a blocker, stationary state, or exact-bulk work.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdleBlockerCycles {
-    /// At least one PIO state machine was enabled or a PIO IRQ was pending.
+    /// PIO source classification.
     pub pio: u64,
-    /// At least one DMA channel was busy or a DMA interrupt was latched.
+    /// DMA source classification.
     pub dma: u64,
-    /// At least one PWM slice was enabled or a PWM interrupt was latched.
+    /// PWM source classification.
     pub pwm: u64,
-    /// At least one core-local SysTick was enabled.
+    /// Core-local SysTick source classification.
     pub systick: u64,
-    /// UART0 or UART1 had FIFO/shift/interrupt work outstanding.
+    /// UART source classification.
     pub uart: u64,
-    /// SPI0 or SPI1 had FIFO/shift/interrupt work outstanding.
+    /// SPI source classification.
     pub spi: u64,
-    /// I2C0 or I2C1 had FIFO/bus/interrupt work outstanding.
+    /// I2C source classification.
     pub i2c: u64,
-    /// ADC conversion/FIFO/interrupt work was outstanding.
+    /// ADC source classification.
     pub adc: u64,
-    /// TIMER had a latched or forced interrupt condition.
+    /// TIMER source classification.
     pub timer: u64,
-    /// A bus or enabled NVIC interrupt was already pending.
+    /// Bus or enabled-NVIC pending source classification.
     pub pending_irq: u64,
 }
 
@@ -94,12 +96,32 @@ pub struct IdleBlockerEpisodes {
     pub pending_irq: u64,
 }
 
-/// One observation of the conservative idle gate used by OPT0-A.
+/// Shared profiler-only view returned by stateful peripheral models.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdlePeripheralState {
+    /// Internal state changes as emulated time advances.
+    pub(crate) temporal_work: bool,
+    /// A currently asserted and enabled source must be routed before a jump.
+    pub(crate) routable_irq: bool,
+    /// Observable state exists but does not change while CPUs are stopped.
+    pub(crate) static_state: bool,
+}
+
+/// PWM adds one category: work already supported by its exact O(1) bulk tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdlePwmState {
+    pub(crate) exact_bulk_work: bool,
+    pub(crate) temporal_boundary: bool,
+    pub(crate) routable_irq: bool,
+    pub(crate) static_state: bool,
+}
+
+/// One observation of the semantic idle classification used by OPT0-A.
 ///
 /// This is deliberately named a "current probe", not a complete event
-/// horizon. At schema 1 the only scheduled lazy deadline is TIMER; active
-/// PIO/DMA/PWM/serial sources are represented as blocker bits and are not
-/// yet converted to exact next-event cycles.
+/// horizon. At schema 2 TIMER remains the only scheduled lazy deadline;
+/// active sources that need a horizon are blockers, while static latches and
+/// already-exact bulk work are reported separately.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IdleCurrentProbe {
     /// Current emulated master cycle.
@@ -108,6 +130,10 @@ pub struct IdleCurrentProbe {
     pub next_lazy_deadline: Option<u64>,
     /// Number of overlapping conservative blockers observed.
     pub blocker_count: u32,
+    /// Number of sources with observable but time-invariant state.
+    pub stationary_source_count: u32,
+    /// Number of active sources whose existing tick is already exact in bulk.
+    pub exact_bulk_source_count: u32,
     /// True only when the current source checks find no blocker.
     pub proven_quiescent: bool,
 }
@@ -147,6 +173,14 @@ pub struct IdleProfileSnapshot {
     pub blockers: IdleBlockerCycles,
     /// Overlapping episode counts for the same blocker sources.
     pub blocker_episodes: IdleBlockerEpisodes,
+    /// Overlapping source state that remains unchanged throughout the interval.
+    pub stationary_sources: IdleBlockerCycles,
+    /// Episode counts for stationary source state.
+    pub stationary_source_episodes: IdleBlockerEpisodes,
+    /// Active work handled exactly by an existing O(1) bulk tick.
+    pub exact_bulk_sources: IdleBlockerCycles,
+    /// Episode counts for exact-bulk source work.
+    pub exact_bulk_source_episodes: IdleBlockerEpisodes,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -185,6 +219,20 @@ impl IdleBlockerMask {
     }
 }
 
+/// Mutually meaningful (but source-overlapping) classification at one cycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdleSourceObservation {
+    pub(crate) blockers: IdleBlockerMask,
+    pub(crate) stationary: IdleBlockerMask,
+    pub(crate) exact_bulk: IdleBlockerMask,
+}
+
+impl IdleSourceObservation {
+    pub(crate) fn proven_safe(self) -> bool {
+        self.blockers.is_empty()
+    }
+}
+
 /// Mutable profiler state owned by an `Emulator` in diagnostic builds.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IdleProfiler {
@@ -192,6 +240,8 @@ pub(crate) struct IdleProfiler {
     open_blocked_length: u64,
     open_safe_length: u64,
     open_blockers: IdleBlockerMask,
+    open_stationary: IdleBlockerMask,
+    open_exact_bulk: IdleBlockerMask,
 }
 
 impl IdleProfiler {
@@ -211,7 +261,7 @@ impl IdleProfiler {
         &mut self,
         cycles: u64,
         horizon_distance: u64,
-        blockers: IdleBlockerMask,
+        observation: IdleSourceObservation,
         core0_halted: bool,
         core0_wfe: bool,
         core1_halted: bool,
@@ -228,7 +278,9 @@ impl IdleProfiler {
                 .record(horizon_distance);
         }
         self.open_blocked_length = self.open_blocked_length.saturating_add(cycles);
-        self.open_blockers = self.open_blockers.union(blockers);
+        self.open_blockers = self.open_blockers.union(observation.blockers);
+        self.open_stationary = self.open_stationary.union(observation.stationary);
+        self.open_exact_bulk = self.open_exact_bulk.union(observation.exact_bulk);
 
         if core0_halted {
             self.snapshot.core0_halted_blocked_cycles = self
@@ -255,14 +307,24 @@ impl IdleProfiler {
                 .saturating_add(cycles);
         }
 
-        if blockers.is_empty() {
+        if observation.proven_safe() {
             self.snapshot.proven_safe_cycles =
                 self.snapshot.proven_safe_cycles.saturating_add(cycles);
             self.open_safe_length = self.open_safe_length.saturating_add(cycles);
         } else {
             self.close_safe_episode();
-            Self::add_blocker_cycles(&mut self.snapshot.blockers, blockers, cycles);
+            Self::add_source_cycles(&mut self.snapshot.blockers, observation.blockers, cycles);
         }
+        Self::add_source_cycles(
+            &mut self.snapshot.stationary_sources,
+            observation.stationary,
+            cycles,
+        );
+        Self::add_source_cycles(
+            &mut self.snapshot.exact_bulk_sources,
+            observation.exact_bulk,
+            cycles,
+        );
     }
 
     pub(crate) fn record_zero_progress_blocked(&mut self) {
@@ -290,12 +352,22 @@ impl IdleProfiler {
         self.snapshot
             .blocked_lengths
             .record(self.open_blocked_length);
-        Self::add_blocker_episodes(&mut self.snapshot.blocker_episodes, self.open_blockers);
+        Self::add_source_episodes(&mut self.snapshot.blocker_episodes, self.open_blockers);
+        Self::add_source_episodes(
+            &mut self.snapshot.stationary_source_episodes,
+            self.open_stationary,
+        );
+        Self::add_source_episodes(
+            &mut self.snapshot.exact_bulk_source_episodes,
+            self.open_exact_bulk,
+        );
         self.open_blocked_length = 0;
         self.open_blockers = IdleBlockerMask::default();
+        self.open_stationary = IdleBlockerMask::default();
+        self.open_exact_bulk = IdleBlockerMask::default();
     }
 
-    fn add_blocker_cycles(dst: &mut IdleBlockerCycles, mask: IdleBlockerMask, cycles: u64) {
+    fn add_source_cycles(dst: &mut IdleBlockerCycles, mask: IdleBlockerMask, cycles: u64) {
         let add = |bit, value: &mut u64| {
             if mask.contains(bit) {
                 *value = value.saturating_add(cycles);
@@ -313,7 +385,7 @@ impl IdleProfiler {
         add(IdleBlockerMask::PENDING_IRQ, &mut dst.pending_irq);
     }
 
-    fn add_blocker_episodes(dst: &mut IdleBlockerEpisodes, mask: IdleBlockerMask) {
+    fn add_source_episodes(dst: &mut IdleBlockerEpisodes, mask: IdleBlockerMask) {
         let add = |bit, value: &mut u64| {
             if mask.contains(bit) {
                 *value = value.saturating_add(1);
@@ -353,17 +425,36 @@ mod tests {
     #[test]
     fn unsafe_cycles_close_only_the_safe_sub_episode() {
         let mut p = IdleProfiler::default();
-        p.record_blocked(4, 20, IdleBlockerMask::default(), false, true, true, false);
         p.record_blocked(
-            2,
-            16,
-            IdleBlockerMask::from_bits(IdleBlockerMask::PWM),
+            4,
+            20,
+            IdleSourceObservation::default(),
             false,
             true,
             true,
             false,
         );
-        p.record_blocked(3, 14, IdleBlockerMask::default(), false, true, true, false);
+        p.record_blocked(
+            2,
+            16,
+            IdleSourceObservation {
+                blockers: IdleBlockerMask::from_bits(IdleBlockerMask::PWM),
+                ..IdleSourceObservation::default()
+            },
+            false,
+            true,
+            true,
+            false,
+        );
+        p.record_blocked(
+            3,
+            14,
+            IdleSourceObservation::default(),
+            false,
+            true,
+            true,
+            false,
+        );
         let s = p.snapshot();
         assert_eq!(s.both_blocked_cycles, 9);
         assert_eq!(s.proven_safe_cycles, 7);

@@ -270,6 +270,21 @@ impl I2cRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.raw_intr_stat == 0
     }
 
+    /// OPT0 diagnostic classification. The current I2C model completes
+    /// transactions synchronously on DATA_CMD writes, so `tick()` has no
+    /// temporal transaction work; it only re-routes latched IRQ levels.
+    #[cfg(feature = "idle-profiler")]
+    pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
+        crate::idle_profile::IdlePeripheralState {
+            temporal_work: false,
+            routable_irq: (self.raw_intr_stat & self.intr_mask) != 0,
+            static_state: !self.tx_fifo.is_empty()
+                || !self.rx_fifo.is_empty()
+                || self.raw_intr_stat != 0
+                || self.activity,
+        }
+    }
+
     /// DREQ: TX FIFO has room and the peripheral is enabled. Phase 4
     /// DMA TREQ matrix consults this for `I2C0_TX` / `I2C1_TX`.
     #[inline]

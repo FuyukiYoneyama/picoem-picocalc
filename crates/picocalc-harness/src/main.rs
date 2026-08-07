@@ -42,7 +42,7 @@ use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 #[cfg(feature = "idle-profiler")]
 use rp2040_emu::{
     CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_PROFILE_SCHEMA_VERSION,
-    IdleProfileSnapshot,
+    IdleBlockerCycles, IdleBlockerEpisodes, IdleProfileSnapshot,
 };
 
 mod scenario;
@@ -1132,6 +1132,48 @@ fn histogram_json(value: &CumulativeHistogramSnapshot) -> String {
 }
 
 #[cfg(feature = "idle-profiler")]
+fn source_cycles_json(value: &IdleBlockerCycles) -> String {
+    format!(
+        concat!(
+            "{{\"pio\": {}, \"dma\": {}, \"pwm\": {}, \"systick\": {}, ",
+            "\"uart\": {}, \"spi\": {}, \"i2c\": {}, \"adc\": {}, ",
+            "\"timer\": {}, \"pending_irq\": {}}}"
+        ),
+        value.pio,
+        value.dma,
+        value.pwm,
+        value.systick,
+        value.uart,
+        value.spi,
+        value.i2c,
+        value.adc,
+        value.timer,
+        value.pending_irq,
+    )
+}
+
+#[cfg(feature = "idle-profiler")]
+fn source_episodes_json(value: &IdleBlockerEpisodes) -> String {
+    format!(
+        concat!(
+            "{{\"pio\": {}, \"dma\": {}, \"pwm\": {}, \"systick\": {}, ",
+            "\"uart\": {}, \"spi\": {}, \"i2c\": {}, \"adc\": {}, ",
+            "\"timer\": {}, \"pending_irq\": {}}}"
+        ),
+        value.pio,
+        value.dma,
+        value.pwm,
+        value.systick,
+        value.uart,
+        value.spi,
+        value.i2c,
+        value.adc,
+        value.timer,
+        value.pending_irq,
+    )
+}
+
+#[cfg(feature = "idle-profiler")]
 #[allow(clippy::too_many_arguments)]
 fn build_idle_profile_report(
     backend_commit: &str,
@@ -1143,8 +1185,6 @@ fn build_idle_profile_report(
     profile: &IdleProfileSnapshot,
 ) -> String {
     let thresholds: [u64; IDLE_HISTOGRAM_BUCKETS] = std::array::from_fn(|i| 1u64 << i);
-    let b = &profile.blockers;
-    let e = &profile.blocker_episodes;
     format!(
         concat!(
             "{{\n",
@@ -1175,16 +1215,12 @@ fn build_idle_profile_report(
             "  \"blocked_lengths\": {},\n",
             "  \"proven_safe_lengths\": {},\n",
             "  \"initial_horizon_distances\": {},\n",
-            "  \"blocker_cycles\": {{",
-            "\"pio\": {}, \"dma\": {}, \"pwm\": {}, \"systick\": {}, ",
-            "\"uart\": {}, \"spi\": {}, \"i2c\": {}, \"adc\": {}, ",
-            "\"timer\": {}, \"pending_irq\": {}",
-            "}},\n",
-            "  \"blocker_episodes\": {{",
-            "\"pio\": {}, \"dma\": {}, \"pwm\": {}, \"systick\": {}, ",
-            "\"uart\": {}, \"spi\": {}, \"i2c\": {}, \"adc\": {}, ",
-            "\"timer\": {}, \"pending_irq\": {}",
-            "}}\n",
+            "  \"blocker_cycles\": {},\n",
+            "  \"blocker_episodes\": {},\n",
+            "  \"stationary_source_cycles\": {},\n",
+            "  \"stationary_source_episodes\": {},\n",
+            "  \"exact_bulk_source_cycles\": {},\n",
+            "  \"exact_bulk_source_episodes\": {}\n",
             "}}\n"
         ),
         IDLE_PROFILE_SCHEMA_VERSION,
@@ -1210,26 +1246,12 @@ fn build_idle_profile_report(
         histogram_json(&profile.blocked_lengths),
         histogram_json(&profile.proven_safe_lengths),
         histogram_json(&profile.initial_horizon_distances),
-        b.pio,
-        b.dma,
-        b.pwm,
-        b.systick,
-        b.uart,
-        b.spi,
-        b.i2c,
-        b.adc,
-        b.timer,
-        b.pending_irq,
-        e.pio,
-        e.dma,
-        e.pwm,
-        e.systick,
-        e.uart,
-        e.spi,
-        e.i2c,
-        e.adc,
-        e.timer,
-        e.pending_irq,
+        source_cycles_json(&profile.blockers),
+        source_episodes_json(&profile.blocker_episodes),
+        source_cycles_json(&profile.stationary_sources),
+        source_episodes_json(&profile.stationary_source_episodes),
+        source_cycles_json(&profile.exact_bulk_sources),
+        source_episodes_json(&profile.exact_bulk_source_episodes),
     )
 }
 
@@ -2451,6 +2473,10 @@ mod tests {
         };
         profile.blockers.pwm = 16;
         profile.blocker_episodes.pwm = 1;
+        profile.stationary_sources.uart = 80;
+        profile.stationary_source_episodes.uart = 2;
+        profile.exact_bulk_sources.pwm = 64;
+        profile.exact_bulk_source_episodes.pwm = 1;
         profile.blocked_lengths.episodes_ge[0] = 2;
         profile.blocked_lengths.cycle_mass_ge[0] = 80;
         let run = outcome(StopReason::ScenarioDone, b"");
@@ -2470,6 +2496,10 @@ mod tests {
         assert_eq!(parsed["counters"]["both_blocked_cycles"], 80);
         assert_eq!(parsed["blocker_cycles"]["pwm"], 16);
         assert_eq!(parsed["blocker_episodes"]["pwm"], 1);
+        assert_eq!(parsed["stationary_source_cycles"]["uart"], 80);
+        assert_eq!(parsed["stationary_source_episodes"]["uart"], 2);
+        assert_eq!(parsed["exact_bulk_source_cycles"]["pwm"], 64);
+        assert_eq!(parsed["exact_bulk_source_episodes"]["pwm"], 1);
         assert_eq!(
             parsed["histogram_thresholds_cycles"]
                 .as_array()

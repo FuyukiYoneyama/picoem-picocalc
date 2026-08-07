@@ -193,6 +193,20 @@ impl PwmRegs {
         self.pwm_en_view() == 0 && self.intr == 0 && (self.intf & self.inte) == 0
     }
 
+    /// OPT0 diagnostic classification. An enabled slice with no enabled
+    /// wrap IRQ is exactly bulk-advanceable by [`Self::tick`]; an enabled
+    /// IRQ needs a next-wrap horizon before it may be skipped.
+    #[cfg(feature = "idle-profiler")]
+    pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePwmState {
+        let enabled = self.pwm_en_view() != 0;
+        crate::idle_profile::IdlePwmState {
+            exact_bulk_work: enabled && self.inte == 0,
+            temporal_boundary: enabled && self.inte != 0,
+            routable_irq: ((self.intr | self.intf) & self.inte) != 0,
+            static_state: self.intr != 0 || self.intf != 0,
+        }
+    }
+
     // --- Offset decoding -----------------------------------------------
 
     /// Decode a register offset into `(slice, inner_offset)` if it

@@ -238,6 +238,21 @@ impl UartRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.ris == 0
     }
 
+    /// OPT0 diagnostic classification. Unlike [`Self::is_idle`], this
+    /// separates state that advances with time from FIFO/IRQ state that is
+    /// merely observable while both CPUs are stopped.
+    #[cfg(feature = "idle-profiler")]
+    pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
+        crate::idle_profile::IdlePeripheralState {
+            temporal_work: self.is_tx_enabled() && !self.tx_fifo.is_empty(),
+            routable_irq: (self.ris & self.imsc) != 0,
+            static_state: !self.tx_fifo.is_empty()
+                || !self.rx_fifo.is_empty()
+                || self.ris != 0
+                || self.tx_cycle_accum != 0,
+        }
+    }
+
     /// DREQ: TX FIFO has room and the UART is enabled. Consumed by the
     /// RP2040 DMA matrix (Phase 4) — firmware-selected `UART0_TX` /
     /// `UART1_TX` TREQ values unblock transfers whenever this is true.
@@ -827,6 +842,17 @@ mod tests {
         u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
         u.write32(UARTDR, 0xA5, 0, &mut irqs);
         assert!(!u.is_idle(), "pending TX byte breaks idle");
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_profile_treats_masked_txis_on_empty_fifo_as_static() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        u.ris = UART_INT_TX;
+        let state = u.idle_profile_state();
+        assert!(!state.temporal_work);
+        assert!(!state.routable_irq);
+        assert!(state.static_state);
     }
 
     // --- Fifo disable truncates ---------------------------------------
