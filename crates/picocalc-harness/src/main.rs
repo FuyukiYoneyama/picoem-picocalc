@@ -2675,6 +2675,14 @@ fn run() -> Result<Verdict, String> {
             eprintln!("scenario could not run: {fault}");
         }
     }
+    #[cfg(feature = "pio-exact-bulk-prototype")]
+    {
+        let snapshot = emu.exact_bulk_prototype_snapshot();
+        eprintln!(
+            "pio-exact-bulk-prototype snapshot: calls={} system_cycles={} pio_ticks={}",
+            snapshot.calls, snapshot.system_cycles, snapshot.pio_ticks
+        );
+    }
     // Dropped keys change what the firmware saw without changing what
     // the scenario said, so every step after the first drop is measuring
     // something other than the scripted input. Worth saying out loud
