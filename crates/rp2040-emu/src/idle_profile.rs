@@ -39,7 +39,15 @@ impl Default for CumulativeHistogramSnapshot {
 }
 
 impl CumulativeHistogramSnapshot {
-    fn record(&mut self, length: u64) {
+    pub(crate) fn record(&mut self, length: u64) {
+        self.record_weighted(length, length);
+    }
+
+    /// Record a threshold key while charging a separate amount of cycle
+    /// mass. OPT2-B uses this for horizon-distance samples: `length` is the
+    /// predicted distance, while `mass` is the running work observed under
+    /// that prediction rather than the sum of the predictions themselves.
+    pub(crate) fn record_weighted(&mut self, length: u64, mass: u64) {
         if length == 0 {
             return;
         }
@@ -49,7 +57,7 @@ impl CumulativeHistogramSnapshot {
                 break;
             }
             self.episodes_ge[i] = self.episodes_ge[i].saturating_add(1);
-            self.cycle_mass_ge[i] = self.cycle_mass_ge[i].saturating_add(length);
+            self.cycle_mass_ge[i] = self.cycle_mass_ge[i].saturating_add(mass);
         }
     }
 }

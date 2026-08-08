@@ -46,6 +46,10 @@ use rp2040_emu::{
     CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_PROFILE_SCHEMA_VERSION,
     IdleBlockerCycles, IdleBlockerEpisodes, IdleHorizonEvents, IdleProfileSnapshot,
 };
+#[cfg(feature = "event-horizon-profiler")]
+use rp2040_emu::{
+    RUNNING_EVENT_PROFILE_SCHEMA_VERSION, RunningBoundaryEvents, RunningBoundarySnapshot,
+};
 
 mod scenario;
 
@@ -242,6 +246,8 @@ struct Args {
     idle_profile: Option<PathBuf>,
     #[cfg(feature = "behavior-trace")]
     behavior_trace: Option<PathBuf>,
+    #[cfg(feature = "event-horizon-profiler")]
+    event_horizon_profile: Option<PathBuf>,
 }
 
 /// Parse a `start:len` range, e.g. `0:10000` or `0x100:0x2000` (either
@@ -334,6 +340,12 @@ fn print_usage() {
         "         --behavior-trace <path> OPT0-B correctness artifact with streaming event hashes.\n\
                                           Not valid for wall-time measurement."
     );
+    #[cfg(feature = "event-horizon-profiler")]
+    eprintln!(
+        "         --event-horizon-profile <path>\n\
+                                          OPT2-B running-boundary opportunity profile.\n\
+                                          Not valid for wall-time measurement."
+    );
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -374,6 +386,8 @@ fn parse_args() -> Result<Args, String> {
     let mut idle_profile: Option<PathBuf> = None;
     #[cfg(feature = "behavior-trace")]
     let mut behavior_trace: Option<PathBuf> = None;
+    #[cfg(feature = "event-horizon-profiler")]
+    let mut event_horizon_profile: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -448,6 +462,10 @@ fn parse_args() -> Result<Args, String> {
             "--idle-profile" => idle_profile = Some(PathBuf::from(value("--idle-profile")?)),
             #[cfg(feature = "behavior-trace")]
             "--behavior-trace" => behavior_trace = Some(PathBuf::from(value("--behavior-trace")?)),
+            #[cfg(feature = "event-horizon-profiler")]
+            "--event-horizon-profile" => {
+                event_horizon_profile = Some(PathBuf::from(value("--event-horizon-profile")?))
+            }
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
                 psram_verify_range = Some(parse_range(&raw)?);
@@ -499,6 +517,13 @@ fn parse_args() -> Result<Args, String> {
             "--idle-profile and --behavior-trace are separate diagnostic modes".to_string(),
         );
     }
+    #[cfg(feature = "event-horizon-profiler")]
+    if event_horizon_profile.is_some() && (idle_profile.is_some() || behavior_trace.is_some()) {
+        return Err(
+            "--event-horizon-profile is a separate diagnostic mode from --idle-profile/--behavior-trace"
+                .to_string(),
+        );
+    }
 
     Ok(Args {
         bin: bin.ok_or_else(|| "missing required --bin <path>".to_string())?,
@@ -526,6 +551,8 @@ fn parse_args() -> Result<Args, String> {
         idle_profile,
         #[cfg(feature = "behavior-trace")]
         behavior_trace,
+        #[cfg(feature = "event-horizon-profiler")]
+        event_horizon_profile,
     })
 }
 
@@ -1312,6 +1339,95 @@ fn build_idle_profile_report(
         source_episodes_json(&profile.stationary_source_episodes),
         source_cycles_json(&profile.exact_bulk_sources),
         source_episodes_json(&profile.exact_bulk_source_episodes),
+    )
+}
+
+#[cfg(feature = "event-horizon-profiler")]
+fn running_boundary_events_json(value: &RunningBoundaryEvents) -> String {
+    format!(
+        concat!(
+            "{{\"cpu_mmio\": {}, \"gpio_in\": {}, \"fifo_dreq\": {}, ",
+            "\"irq_exception\": {}, \"pio_device\": {}, \"dma_dreq\": {}, ",
+            "\"timer_systick_pwm\": {}, \"serial\": {}, \"clock\": {}, ",
+            "\"external\": {}}}"
+        ),
+        value.cpu_mmio,
+        value.gpio_in,
+        value.fifo_dreq,
+        value.irq_exception,
+        value.pio_device,
+        value.dma_dreq,
+        value.timer_systick_pwm,
+        value.serial,
+        value.clock,
+        value.external,
+    )
+}
+
+#[cfg(feature = "event-horizon-profiler")]
+#[allow(clippy::too_many_arguments)]
+fn build_running_event_profile_report(
+    backend_commit: &str,
+    backend_dirty: bool,
+    firmware_name: &str,
+    firmware_sha: &str,
+    step_quantum: u32,
+    outcome: &RunOutcome,
+    profile: &RunningBoundarySnapshot,
+) -> String {
+    let thresholds: [u64; IDLE_HISTOGRAM_BUCKETS] = std::array::from_fn(|i| 1u64 << i);
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": {},\n",
+            "  \"kind\": \"rp2040_serial_running_event_horizon_profile\",\n",
+            "  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n",
+            "  \"firmware\": {{\"basename\": {}, \"sha256\": {}}},\n",
+            "  \"execution_model\": \"Serial\",\n",
+            "  \"instrumented\": true,\n",
+            "  \"valid_for_wall_time\": false,\n",
+            "  \"observed_gaps_are_safe_windows\": false,\n",
+            "  \"conservative_horizon_complete_for_current_model\": true,\n",
+            "  \"step_quantum\": {},\n",
+            "  \"stop_reason\": {},\n",
+            "  \"run_cycles\": {},\n",
+            "  \"histogram_thresholds_cycles\": [{}],\n",
+            "  \"counters\": {{\"running_steps\": {}, \"total_running_cycles\": {}, ",
+            "\"boundary_steps\": {}, \"no_known_horizon_steps\": {}, ",
+            "\"no_known_horizon_cycles\": {}, \"candidate_dispatches\": {}, ",
+            "\"candidate_cycles\": {}}},\n",
+            "  \"observed_inter_boundary_dispatches\": {},\n",
+            "  \"observed_inter_boundary_cycles\": {},\n",
+            "  \"observed_candidate_dispatches\": {},\n",
+            "  \"observed_candidate_cycles\": {},\n",
+            "  \"conservative_horizon_distances\": {},\n",
+            "  \"boundary_events\": {},\n",
+            "  \"one_cycle_fallback_cycles\": {}\n",
+            "}}\n"
+        ),
+        RUNNING_EVENT_PROFILE_SCHEMA_VERSION,
+        json_string(backend_commit),
+        backend_dirty,
+        json_string(firmware_name),
+        json_string(firmware_sha),
+        step_quantum,
+        json_string(outcome.stop_reason.as_str()),
+        outcome.cycles,
+        u64_json_array(&thresholds),
+        profile.running_steps,
+        profile.total_running_cycles,
+        profile.boundary_steps,
+        profile.no_known_horizon_steps,
+        profile.no_known_horizon_cycles,
+        profile.candidate_dispatches,
+        profile.candidate_cycles,
+        histogram_json(&profile.observed_inter_boundary_dispatches),
+        histogram_json(&profile.observed_inter_boundary_cycles),
+        histogram_json(&profile.observed_candidate_dispatches),
+        histogram_json(&profile.observed_candidate_cycles),
+        histogram_json(&profile.conservative_horizon_distances),
+        running_boundary_events_json(&profile.boundary_events),
+        horizon_events_json(&profile.one_cycle_fallback_cycles),
     )
 }
 
@@ -2273,6 +2389,11 @@ fn run() -> Result<Verdict, String> {
             emu.map_behavior_gpio_input_domain(BehaviorEventDomain::Psram);
         }
     }
+    #[cfg(feature = "event-horizon-profiler")]
+    if args.event_horizon_profile.is_some() {
+        emu.enable_running_event_profiler()
+            .map_err(|e| format!("enabling running event-horizon profiler: {e}"))?;
+    }
 
     let handles = BoardHandles {
         lcd: lcd.clone(),
@@ -2304,6 +2425,23 @@ fn run() -> Result<Verdict, String> {
         );
         std::fs::write(path, profile_report.as_bytes())
             .map_err(|e| format!("writing idle profile {}: {e}", path.display()))?;
+    }
+    #[cfg(feature = "event-horizon-profiler")]
+    if let Some(path) = &args.event_horizon_profile {
+        let snapshot = emu
+            .running_event_profile_snapshot()
+            .expect("--event-horizon-profile enabled the profiler before the run");
+        let profile_report = build_running_event_profile_report(
+            BUILT_BACKEND_COMMIT,
+            built_backend_dirty(),
+            &basename(&args.bin),
+            &firmware_sha,
+            step_quantum,
+            &outcome,
+            &snapshot,
+        );
+        std::fs::write(path, profile_report.as_bytes())
+            .map_err(|e| format!("writing event-horizon profile {}: {e}", path.display()))?;
     }
 
     // A run that ended for its own reasons — cycle limit, HardFault —
@@ -2541,6 +2679,10 @@ mod tests {
     use super::behavior_projection;
     #[cfg(feature = "idle-profiler")]
     use super::build_idle_profile_report;
+    #[cfg(feature = "event-horizon-profiler")]
+    use super::build_running_event_profile_report;
+    #[cfg(feature = "event-horizon-profiler")]
+    use rp2040_emu::RunningBoundarySnapshot;
     #[cfg(feature = "behavior-trace")]
     use rp2040_emu::{BehaviorEventDomain, BehaviorTraceDomainSnapshot, BehaviorTraceSnapshot};
 
@@ -2866,6 +3008,60 @@ mod tests {
         assert_eq!(
             report,
             build_idle_profile_report(
+                "0123456789012345678901234567890123456789",
+                false,
+                "firmware.bin",
+                "abcdef",
+                1,
+                &run,
+                &profile,
+            )
+        );
+    }
+
+    #[cfg(feature = "event-horizon-profiler")]
+    #[test]
+    fn running_event_profile_report_is_deterministic_valid_json() {
+        let mut profile = RunningBoundarySnapshot {
+            running_steps: 7,
+            total_running_cycles: 12,
+            boundary_steps: 3,
+            candidate_dispatches: 5,
+            candidate_cycles: 9,
+            ..RunningBoundarySnapshot::default()
+        };
+        profile.boundary_events.cpu_mmio = 2;
+        profile.one_cycle_fallback_cycles.pio = 8;
+        profile.observed_candidate_dispatches.episodes_ge[1] = 1;
+        profile.observed_candidate_dispatches.cycle_mass_ge[1] = 5;
+        let run = outcome(StopReason::ScenarioDone, b"");
+        let report = build_running_event_profile_report(
+            "0123456789012345678901234567890123456789",
+            false,
+            "firmware.bin",
+            "abcdef",
+            1,
+            &run,
+            &profile,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(
+            parsed["kind"],
+            "rp2040_serial_running_event_horizon_profile"
+        );
+        assert_eq!(parsed["observed_gaps_are_safe_windows"], false);
+        assert_eq!(parsed["counters"]["running_steps"], 7);
+        assert_eq!(parsed["counters"]["candidate_dispatches"], 5);
+        assert_eq!(parsed["counters"]["candidate_cycles"], 9);
+        assert_eq!(parsed["boundary_events"]["cpu_mmio"], 2);
+        assert_eq!(parsed["one_cycle_fallback_cycles"]["pio"], 8);
+        assert_eq!(
+            parsed["observed_candidate_dispatches"]["cycle_mass_ge"][1],
+            5
+        );
+        assert_eq!(
+            report,
+            build_running_event_profile_report(
                 "0123456789012345678901234567890123456789",
                 false,
                 "firmware.bin",

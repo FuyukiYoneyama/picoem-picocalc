@@ -41,6 +41,10 @@ testing = []
 # OPT0-A execution profiler. Kept out of default builds so the
 # performance/reference path does not pay even a disabled runtime branch.
 idle-profiler = []
+# Diagnostic-only OPT2-B profiler.  It reuses the OPT0-A conservative
+# horizon and OPT0-B observable-state snapshots, but normal execution does
+# not compile any of its counters or MMIO classification hooks.
+event-horizon-profiler = ["idle-profiler", "behavior-trace"]
 # OPT0-B deterministic streaming event contract. Kept out of default
 # builds so the performance path contains neither a disabled branch nor a
 # hash state. The optional dependency exists only in diagnostic binaries.

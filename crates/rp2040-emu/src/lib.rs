@@ -26,11 +26,20 @@ pub mod peripherals;
 
 mod idle_profile;
 
+#[cfg(feature = "event-horizon-profiler")]
+mod running_profile;
+
 #[cfg(feature = "idle-profiler")]
 pub use idle_profile::{
     CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_HORIZON_SCHEMA_VERSION,
     IDLE_PROFILE_SCHEMA_VERSION, IdleBlockerCycles, IdleBlockerEpisodes, IdleCurrentProbe,
     IdleEventHorizonProbe, IdleEventSourceMask, IdleHorizonEvents, IdleProfileSnapshot,
+};
+
+#[cfg(feature = "event-horizon-profiler")]
+pub use running_profile::{
+    RUNNING_EVENT_PROFILE_SCHEMA_VERSION, RunningBoundaryEvents, RunningBoundaryMask,
+    RunningBoundarySnapshot,
 };
 
 #[cfg(feature = "behavior-trace")]
@@ -265,6 +274,11 @@ pub struct Emulator {
     /// diagnostic harnesses opt in through the `idle-profiler` feature.
     #[cfg(feature = "idle-profiler")]
     idle_profiler: Option<idle_profile::IdleProfiler>,
+    /// OPT2-B running event-horizon opportunity profiler. Diagnostic only;
+    /// normal and performance builds contain neither this state nor its bus
+    /// access latches.
+    #[cfg(feature = "event-horizon-profiler")]
+    running_profiler: Option<running_profile::RunningProfile>,
     /// OPT0-B streaming correctness trace. Entirely absent from normal
     /// builds so performance mode has no disabled hot-path branch.
     #[cfg(feature = "behavior-trace")]
@@ -448,6 +462,10 @@ impl Emulator {
         #[cfg(feature = "idle-profiler")]
         if let Some(profiler) = self.idle_profiler.as_mut() {
             *profiler = idle_profile::IdleProfiler::default();
+        }
+        #[cfg(feature = "event-horizon-profiler")]
+        if let Some(profiler) = self.running_profiler.as_mut() {
+            *profiler = running_profile::RunningProfile::default();
         }
         if let Some(ref mut psram) = self.bus.psram {
             psram.reset_state();
@@ -777,6 +795,12 @@ impl Emulator {
         self.bus.master_cycle = self.clock.cycles;
         let start = self.clock.cycles;
         let target = start.wrapping_add(self.step_quantum as u64);
+        #[cfg(feature = "event-horizon-profiler")]
+        self.bus.reset_running_cpu_boundaries();
+        #[cfg(feature = "event-horizon-profiler")]
+        let running_before = self.behavior_observation();
+        #[cfg(feature = "event-horizon-profiler")]
+        let running_horizon = self.idle_event_horizon_internal(external_event_cycle);
 
         // Per HLD 2026.04.26 V5 §5.2.3: accumulate per-core cycle counts
         // across the inner loop so the slow-branch SysTick advance
@@ -937,6 +961,10 @@ impl Emulator {
                     c1_wfe,
                 );
             }
+            #[cfg(feature = "event-horizon-profiler")]
+            if let Some(profiler) = self.running_profiler.as_mut() {
+                profiler.record_non_running();
+            }
             return advance;
         }
         // See the fn docstring for the rationale on the fast-path and
@@ -1022,6 +1050,25 @@ impl Emulator {
             self.drain_pending_irqs_to_cores();
         }
         self.wake_checks();
+        #[cfg(feature = "event-horizon-profiler")]
+        {
+            let mut boundaries = self.bus.take_running_cpu_boundaries();
+            let running_after = self.behavior_observation();
+            boundaries.insert(Self::running_device_boundaries(
+                &running_before,
+                &running_after,
+            ));
+            if external_event_cycle.is_some_and(|cycle| self.clock.cycles >= cycle) {
+                boundaries.insert(running_profile::RunningBoundaryMask::EXTERNAL);
+            }
+            if let Some(profiler) = self.running_profiler.as_mut() {
+                if consumed == 0 {
+                    profiler.record_non_running();
+                } else {
+                    profiler.record_running(consumed, boundaries, running_horizon);
+                }
+            }
+        }
         #[cfg(feature = "idle-profiler")]
         if let Some(profiler) = self.idle_profiler.as_mut() {
             let both_blocked = (self.cores[0].is_halted() || self.bus.wfe_waiting[0])
@@ -1422,6 +1469,8 @@ impl Emulator {
             pio0_sm0_last_pc: self.pio0_sm0_last_pc,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
+            #[cfg(feature = "event-horizon-profiler")]
+            running_profiler: None,
             execution_model: ExecutionModel::Serial,
             threaded: None,
             panic_info: None,
@@ -1924,6 +1973,62 @@ impl Emulator {
         }
     }
 
+    /// Compare the same observable projection used by OPT0-B and classify
+    /// which device-side boundary ended an OPT2-B running interval.  The
+    /// profiler records these post-hoc gaps as an opportunity upper bound;
+    /// it does not promote them to a predictive/safe horizon.
+    #[cfg(feature = "event-horizon-profiler")]
+    fn running_device_boundaries(
+        before: &behavior_trace::BehaviorObservation,
+        after: &behavior_trace::BehaviorObservation,
+    ) -> u16 {
+        use running_profile::RunningBoundaryMask as M;
+
+        let mut bits = 0u16;
+        if before.clock_hz != after.clock_hz {
+            bits |= M::CLOCK;
+        }
+        if before.irq != after.irq {
+            bits |= M::IRQ_EXCEPTION;
+        }
+        if before.gpio_in != after.gpio_in
+            || before.pio_state != after.pio_state
+            || before.psram != after.psram
+        {
+            bits |= M::PIO_DEVICE;
+        }
+        if before.dma_transfers != after.dma_transfers {
+            bits |= M::DMA_DREQ;
+        }
+        if before.timer != after.timer || behavior_trace::pwm_boundary(&before.pwm, &after.pwm) {
+            bits |= M::TIMER_SYSTICK_PWM;
+        }
+        if before.serial != after.serial {
+            bits |= M::SERIAL;
+        }
+        bits
+    }
+
+    /// Enable and reset the OPT2-B running event-horizon opportunity
+    /// profiler. This diagnostic is Serial-only and is intentionally
+    /// separate from the wall-time measurement binary.
+    #[cfg(feature = "event-horizon-profiler")]
+    pub fn enable_running_event_profiler(&mut self) -> Result<(), EmulatorError> {
+        if self.execution_model != ExecutionModel::Serial {
+            return Err(EmulatorError::NotSupportedInThreadedMode);
+        }
+        self.running_profiler = Some(running_profile::RunningProfile::default());
+        Ok(())
+    }
+
+    /// Snapshot OPT2-B aggregate counters without mutating the open interval.
+    #[cfg(feature = "event-horizon-profiler")]
+    pub fn running_event_profile_snapshot(&self) -> Option<RunningBoundarySnapshot> {
+        self.running_profiler
+            .as_ref()
+            .map(running_profile::RunningProfile::snapshot)
+    }
+
     /// Enable and reset the diagnostic Serial idle profiler.
     ///
     /// Available only in builds with the `idle-profiler` feature. The
@@ -2163,6 +2268,8 @@ impl EmulatorBuilder {
             pio0_sm0_last_pc: 0xFF,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
+            #[cfg(feature = "event-horizon-profiler")]
+            running_profiler: None,
             #[cfg(feature = "behavior-trace")]
             behavior_tracer: None,
             execution_model: self.execution,
