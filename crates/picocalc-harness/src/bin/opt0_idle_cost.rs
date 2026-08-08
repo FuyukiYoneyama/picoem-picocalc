@@ -338,7 +338,8 @@ fn run(args: &Args) -> Result<Value, String> {
             "event_fire_route_and_wake_increment_measured": true,
             "clock_update_and_wake_check_included_in_blocked_step_measurements": true,
             "full_all_source_horizon_cost_measured": true,
-            "eligible_for_optimization_priority_decision": true,
+            "requires_matching_workload_horizon_profile": true,
+            "eligible_for_optimization_priority_decision": false,
         },
     }))
 }

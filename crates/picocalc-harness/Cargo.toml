@@ -40,3 +40,7 @@ path = "src/main.rs"
 name = "opt0-idle-cost"
 path = "src/bin/opt0_idle_cost.rs"
 required-features = ["idle-profiler"]
+
+[[bin]]
+name = "opt0-blocked-baseline"
+path = "src/bin/opt0_blocked_baseline.rs"
