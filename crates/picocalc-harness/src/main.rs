@@ -344,7 +344,7 @@ fn print_usage() {
     #[cfg(feature = "event-horizon-profiler")]
     eprintln!(
         "         --event-horizon-profile <path>\n\
-                                          OPT2-B running-boundary opportunity profile.\n\
+                                          OPT2-D running-boundary/decode opportunity profile.\n\
                                           Not valid for wall-time measurement."
     );
 }

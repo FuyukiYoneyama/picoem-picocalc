@@ -1,4 +1,4 @@
-//! OPT2-B running-path profiler profile data layer.
+//! OPT2-B running-path horizon profiler, extended by OPT2-D lever metrics.
 //!
 //! Snapshot fields are aggregated from observed *running* intervals and
 //! recorded boundaries in serial execution. These are observed boundary gaps,

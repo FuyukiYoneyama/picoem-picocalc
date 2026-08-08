@@ -51,7 +51,7 @@ jobs:
         run: |
           cargo test -p rp2040-emu --features behavior-trace
           cargo test -p picocalc-harness --features behavior-trace
-      - name: Test the OPT2-B event-horizon profiler build
+      - name: Test the OPT2-D opportunity profiler build
         run: |
           cargo test -p rp2040-emu --features event-horizon-profiler
           cargo test -p picocalc-harness --features event-horizon-profiler
@@ -84,7 +84,7 @@ jobs:
         run: cargo fmt -p picocalc-board -p picocalc-harness --check
       - name: Check the OPT0-A RP2040 module
         run: rustfmt --edition 2024 --check crates/rp2040-emu/src/idle_profile.rs
-      - name: Check the OPT2-B RP2040 module
+      - name: Check the OPT2-D RP2040 module
         run: rustfmt --edition 2024 --check crates/rp2040-emu/src/running_profile.rs
 
   clippy:
@@ -108,7 +108,7 @@ jobs:
         run: |
           cargo clippy -p rp2040-emu --features behavior-trace --lib -- -D warnings
           cargo clippy -p picocalc-harness --features behavior-trace -- -D warnings
-      - name: Lint the OPT2-B event-horizon profiler build
+      - name: Lint the OPT2-D opportunity profiler build
         run: |
           cargo clippy -p rp2040-emu --features event-horizon-profiler --lib -- -D warnings
           cargo clippy -p picocalc-harness --features event-horizon-profiler -- -D warnings
