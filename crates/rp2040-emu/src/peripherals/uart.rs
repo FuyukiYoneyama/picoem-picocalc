@@ -238,6 +238,17 @@ impl UartRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.ris == 0
     }
 
+    #[cfg(feature = "behavior-trace")]
+    pub(crate) fn behavior_trace_state(&self) -> [u64; 5] {
+        [
+            self.tx_fifo.len() as u64,
+            self.rx_fifo.len() as u64,
+            self.tx_cycle_accum,
+            u64::from(self.ris),
+            u64::from(self.cr),
+        ]
+    }
+
     /// OPT0 diagnostic classification. Unlike [`Self::is_idle`], this
     /// separates state that advances with time from FIFO/IRQ state that is
     /// merely observable while both CPUs are stopped.

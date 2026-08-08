@@ -225,6 +225,19 @@ impl SpiRegs {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.ris == 0
     }
 
+    #[cfg(feature = "behavior-trace")]
+    pub(crate) fn behavior_trace_state(&self) -> [u64; 7] {
+        [
+            self.tx_fifo.len() as u64,
+            self.rx_fifo.len() as u64,
+            self.tx_cycle_accum,
+            u64::from(self.ris),
+            u64::from(self.cr0),
+            u64::from(self.cr1),
+            u64::from(self.dmacr),
+        ]
+    }
+
     /// OPT0 diagnostic classification: distinguish an actively shifting
     /// transmitter from static FIFO/interrupt state.
     #[cfg(feature = "idle-profiler")]

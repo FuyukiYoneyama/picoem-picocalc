@@ -1787,6 +1787,7 @@ impl Emulator {
             timer: self.bus.timer.behavior_trace_state(),
             pwm,
             psram,
+            serial: self.bus.behavior_serial_state(),
         }
     }
 

@@ -80,6 +80,7 @@ pub(crate) struct BehaviorObservation {
     pub timer: [u64; 6],
     pub pwm: [PwmObservation; 8],
     pub psram: Option<PsramObservation>,
+    pub serial: [u64; 38],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,6 +226,13 @@ impl BehaviorTracer {
             }
             self.record(BehaviorEventDomain::TimerPwm, 1, current.cycle, &payload);
         }
+        if current.serial != previous.serial {
+            let mut payload = Vec::with_capacity(current.serial.len() * 8);
+            for value in current.serial {
+                push_u64(&mut payload, value);
+            }
+            self.record(BehaviorEventDomain::SerialBus, 2, current.cycle, &payload);
+        }
         self.previous = current;
     }
 
@@ -292,7 +300,11 @@ impl BehaviorTracer {
         self.record(BehaviorEventDomain::Lcd, 0, value.cycle, &[]);
         self.record(BehaviorEventDomain::DmaDreq, 0, value.cycle, &[]);
         self.record(BehaviorEventDomain::TimerPwm, 0, value.cycle, &[]);
-        self.record(BehaviorEventDomain::SerialBus, 0, value.cycle, &[]);
+        let mut serial = Vec::with_capacity(value.serial.len() * 8);
+        for item in value.serial {
+            push_u64(&mut serial, item);
+        }
+        self.record(BehaviorEventDomain::SerialBus, 0, value.cycle, &serial);
         self.record(BehaviorEventDomain::ScenarioInput, 0, value.cycle, &[]);
     }
 
@@ -351,6 +363,7 @@ mod tests {
             timer: [0; 6],
             pwm: [PwmObservation::default(); 8],
             psram: None,
+            serial: [0; 38],
         }
     }
 

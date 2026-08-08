@@ -200,6 +200,8 @@ pub struct I2cRegs {
     /// Off-chip slave, if any. Survives [`Self::reset`] — resetting the
     /// controller does not unsolder the device from the board.
     device: Option<Box<dyn I2cExternalDevice>>,
+    #[cfg(feature = "behavior-trace")]
+    behavior_transactions: u64,
 }
 
 impl I2cRegs {
@@ -232,6 +234,8 @@ impl I2cRegs {
             activity: false,
             nvic_irq,
             device: None,
+            #[cfg(feature = "behavior-trace")]
+            behavior_transactions: 0,
         }
     }
 
@@ -268,6 +272,19 @@ impl I2cRegs {
     /// True iff FIFOs empty, no sticky interrupts, bus inactive.
     pub fn is_idle(&self) -> bool {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.raw_intr_stat == 0
+    }
+
+    #[cfg(feature = "behavior-trace")]
+    pub(crate) fn behavior_trace_state(&self) -> [u64; 7] {
+        [
+            self.behavior_transactions,
+            self.tx_fifo.len() as u64,
+            self.rx_fifo.len() as u64,
+            u64::from(self.raw_intr_stat),
+            u64::from(self.tar),
+            u64::from(self.enable),
+            u64::from(self.activity),
+        ]
     }
 
     /// OPT0 diagnostic classification. The current I2C model completes
@@ -344,6 +361,10 @@ impl I2cRegs {
         if !self.is_enabled() {
             return;
         }
+        #[cfg(feature = "behavior-trace")]
+        {
+            self.behavior_transactions = self.behavior_transactions.wrapping_add(1);
+        }
         self.activity = true;
         self.raw_intr_stat |= INT_ACTIVITY | INT_START_DET;
         let slave = self.tar & 0x3FF;
@@ -378,9 +399,7 @@ impl I2cRegs {
             // the historical 0xFF stub stands in.
             if is_read {
                 let byte = if device_claims {
-                    self.device
-                        .as_mut()
-                        .map_or(0xFF, |d| d.read_byte() as u32)
+                    self.device.as_mut().map_or(0xFF, |d| d.read_byte() as u32)
                 } else {
                     0xFF
                 };

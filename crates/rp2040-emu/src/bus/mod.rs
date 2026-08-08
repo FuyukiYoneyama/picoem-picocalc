@@ -863,6 +863,18 @@ impl Bus {
         self.uart0.drain_tx_log()
     }
 
+    #[cfg(feature = "behavior-trace")]
+    pub(crate) fn behavior_serial_state(&self) -> [u64; 38] {
+        let mut state = [0u64; 38];
+        state[0..5].copy_from_slice(&self.uart0.behavior_trace_state());
+        state[5..10].copy_from_slice(&self.uart1.behavior_trace_state());
+        state[10..17].copy_from_slice(&self.spi0.behavior_trace_state());
+        state[17..24].copy_from_slice(&self.spi1.behavior_trace_state());
+        state[24..31].copy_from_slice(&self.i2c0.behavior_trace_state());
+        state[31..38].copy_from_slice(&self.i2c1.behavior_trace_state());
+        state
+    }
+
     /// Borrow a single DMA channel's observation state.
     ///
     /// External diagnostic harnesses (e.g. `picogus_diff_rp2040`) read
