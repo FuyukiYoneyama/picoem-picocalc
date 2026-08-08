@@ -1970,10 +1970,9 @@ impl Bus {
     /// Phase 1 peripherals with state (`TIMER`, `WATCHDOG_TICK`) are
     /// lazy and therefore always idle at the fast-path check — their
     /// internal effects fire on alarm-match rather than per-cycle. DMA
-    /// is tracked separately via [`crate::dma::Dma::is_idle`] because
-    /// it's a bus master, not a per-cycle-ticked peripheral, and is
-    /// AND-ed into the fast-path gate alongside this result in
-    /// [`crate::Emulator::step`]. Phase 3 adds ADC (idle iff no
+    /// is a bus master rather than a per-cycle-ticked peripheral, but
+    /// is included here so this method is the complete non-PIO
+    /// fast-path gate. Phase 3 adds ADC (idle iff no
     /// conversion armed) and PWM (idle iff `EN == 0`).
     #[inline]
     pub fn all_peripherals_idle(&self) -> bool {

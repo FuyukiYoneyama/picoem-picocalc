@@ -945,18 +945,15 @@ impl Emulator {
         // it, ~49% throughput regression; with it, neutral.
         //
         // HLD V7 §5.5 broadens the gate from "PIO idle" to "PIO idle
-        // AND peripherals idle AND DMA idle AND no IRQ pending".
+        // AND peripherals (including DMA) idle AND no IRQ pending".
         // Phase 1 peripherals are all lazy (TIMER/WATCHDOG_TICK), and
         // DMA is a Phase 1 always-idle stub, so in practice the gate
         // still reduces to the PIO check — but the extra conditions
         // are in place so later phases don't need to reopen this
         // site.
         let pio_idle = self.bus.pio_all_idle();
-        let peri_idle = self.bus.all_peripherals_idle();
-        let dma_idle = self.bus.dma.is_idle();
-        let any_irq = self.bus.irq_pending != 0;
         // SysTick fires by ORing into `bus.ppb[active].icsr` — NOT by
-        // setting `bus.irq_pending` — so the `any_irq` check above does
+        // setting `bus.irq_pending` — so the IRQ check below does
         // not gate the fast path on SysTick activity. With SysTick
         // enabled and no peripheral activity (e.g. the V5 §5.2
         // tail-chain scenario's `b .` busy-wait after preamble), the
@@ -964,8 +961,16 @@ impl Emulator {
         // tick. Drop to the slow path whenever SysTick is enabled on
         // the active core; SysTick-disabled workloads (almost
         // everything) keep their fast-path eligibility.
-        let systick_idle = !self.bus.systicks[self.bus.active_core()].is_enabled();
-        if pio_idle && peri_idle && dma_idle && systick_idle && !any_irq {
+        // Evaluate the remaining read-only predicates only when PIO is
+        // idle. PicoCalc workloads keep an SM enabled for long periods;
+        // while it is active the slow path is already mandatory, so
+        // repeatedly inspecting every peripheral cannot change the
+        // decision. `all_peripherals_idle()` includes DMA.
+        let fast_path = pio_idle
+            && self.bus.irq_pending == 0
+            && !self.bus.systicks[self.bus.active_core()].is_enabled()
+            && self.bus.all_peripherals_idle();
+        if fast_path {
             self.tick_pio(consumed as u32);
             // Advance lazy-scheduled peripherals (TIMER alarms) by the
             // same window the cores consumed. Any alarm matching inside
