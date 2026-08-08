@@ -244,15 +244,12 @@ pub(crate) struct DecodedOp {
     pub hw1: u16,
     /// Packed flags.
     ///   bit 0 — `is_wide`
-    ///   bit 1 — `is_batch_safe_one_cycle`
-    ///   bits 2..7 — reserved
+    ///   bits 1..7 — reserved
     pub flags: u8,
 }
 
 impl DecodedOp {
     pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
-    #[cfg(feature = "exact-event-batching")]
-    pub(crate) const FLAG_BATCH_SAFE_ONE_CYCLE: u8 = 0b0000_0010;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
@@ -267,12 +264,6 @@ impl DecodedOp {
     #[inline(always)]
     pub(crate) fn is_wide(&self) -> bool {
         self.flags & Self::FLAG_WIDE != 0
-    }
-
-    #[cfg(feature = "exact-event-batching")]
-    #[inline(always)]
-    pub(crate) fn is_batch_safe_one_cycle(&self) -> bool {
-        self.flags & Self::FLAG_BATCH_SAFE_ONE_CYCLE != 0
     }
 }
 

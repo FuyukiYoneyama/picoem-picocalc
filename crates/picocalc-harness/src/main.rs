@@ -1095,11 +1095,7 @@ fn run_loop(
         }
 
         let external_event_cycle = next_poll_cycles.min(cycle_limit);
-        #[cfg(feature = "exact-event-batching")]
-        let step_result = emu.step_until_exact_batched(external_event_cycle, stop_pc);
-        #[cfg(not(feature = "exact-event-batching"))]
-        let step_result = emu.step_until(external_event_cycle);
-        let consumed = match step_result {
+        let consumed = match emu.step_until(external_event_cycle) {
             Ok(c) => c,
             Err(e) => {
                 let msg = e.to_string();
@@ -2412,15 +2408,6 @@ fn run() -> Result<Verdict, String> {
         engine.as_mut(),
         &handles,
     );
-
-    #[cfg(feature = "exact-event-batching")]
-    {
-        let batch = emu.exact_event_batching_snapshot();
-        eprintln!(
-            "OPT2-C exact batches={} cycles={} dispatches_elided={} max_cycles={}",
-            batch.batches, batch.cycles, batch.dispatches_elided, batch.max_cycles
-        );
-    }
 
     #[cfg(feature = "idle-profiler")]
     if let Some(path) = &args.idle_profile {

@@ -227,16 +227,6 @@ impl Default for Config {
 /// Default quantum size in cycles. Matches `rp2350_emu`.
 pub const DEFAULT_STEP_QUANTUM: u32 = 64;
 
-/// Aggregate counters for the feature-gated OPT2-C prototype.
-#[cfg(feature = "exact-event-batching")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ExactEventBatchingSnapshot {
-    pub batches: u64,
-    pub cycles: u64,
-    pub dispatches_elided: u64,
-    pub max_cycles: u64,
-}
-
 /// Top-level RP2040 emulator. Owns dual Cortex-M0+ cores, bus fabric,
 /// memory, and clock.
 ///
@@ -289,9 +279,6 @@ pub struct Emulator {
     /// access latches.
     #[cfg(feature = "event-horizon-profiler")]
     running_profiler: Option<running_profile::RunningProfile>,
-    /// OPT2-C prototype counters. Absent from every normal build.
-    #[cfg(feature = "exact-event-batching")]
-    exact_batching: ExactEventBatchingSnapshot,
     /// OPT0-B streaming correctness trace. Entirely absent from normal
     /// builds so performance mode has no disabled hot-path branch.
     #[cfg(feature = "behavior-trace")]
@@ -479,10 +466,6 @@ impl Emulator {
         #[cfg(feature = "event-horizon-profiler")]
         if let Some(profiler) = self.running_profiler.as_mut() {
             *profiler = running_profile::RunningProfile::default();
-        }
-        #[cfg(feature = "exact-event-batching")]
-        {
-            self.exact_batching = ExactEventBatchingSnapshot::default();
         }
         if let Some(ref mut psram) = self.bus.psram {
             psram.reset_state();
@@ -754,163 +737,6 @@ impl Emulator {
         #[cfg(feature = "behavior-trace")]
         self.observe_behavior_trace();
         Ok(consumed)
-    }
-
-    /// OPT2-C bounded running-core batching candidate.
-    ///
-    /// This entry point is intentionally feature-gated while the candidate is
-    /// under measurement.  It first tries to execute a short, cache-resident
-    /// run of strictly sequential one-cycle register instructions.  The run is
-    /// capped by the complete conservative event horizon, the caller-owned
-    /// external boundary, and `stop_pc`.  If any precondition is not proven,
-    /// it falls back to [`Self::step_until`] without changing state.
-    #[cfg(feature = "exact-event-batching")]
-    pub fn step_until_exact_batched(
-        &mut self,
-        external_event_cycle: u64,
-        stop_pc: Option<u32>,
-    ) -> Result<u64, EmulatorError> {
-        if self.execution_model == ExecutionModel::Threaded {
-            return Err(EmulatorError::NotSupportedInThreadedMode);
-        }
-        if let Some(consumed) = self.try_step_exact_running_batch(external_event_cycle, stop_pc) {
-            #[cfg(feature = "behavior-trace")]
-            self.observe_behavior_trace();
-            return Ok(consumed);
-        }
-        self.step_until(external_event_cycle)
-    }
-
-    /// Execute the smallest exact OPT2-C window, or return `None` before
-    /// mutating state.  The first prototype deliberately accepts only core 0
-    /// running in Thread mode, core 1 blocked, no pending interrupt, no
-    /// unresolved autonomous source, and at least two cached one-cycle
-    /// sequential instructions.  These restrictions are false-negative only:
-    /// they reduce opportunity but cannot move an observable boundary.
-    #[cfg(feature = "exact-event-batching")]
-    fn try_step_exact_running_batch(
-        &mut self,
-        external_event_cycle: u64,
-        stop_pc: Option<u32>,
-    ) -> Option<u64> {
-        const MAX_BATCH_CYCLES: u64 = 64;
-
-        let now = self.clock.cycles;
-        if external_event_cycle <= now
-            || self.cores[0].is_halted()
-            || self.bus.wfe_waiting[0]
-            || !(self.cores[1].is_halted() || self.bus.wfe_waiting[1])
-            || self.cores[0].regs.xpsr & 0x1ff != 0
-            || self.bus.irq_pending != 0
-            || self.bus.nvics[0].pending_and_enabled() != 0
-            || self.bus.nvics[1].pending_and_enabled() != 0
-            || self.bus.ppb[0].icsr & ((1 << 28) | (1 << 26)) != 0
-            || self.bus.ppb[1].icsr & ((1 << 28) | (1 << 26)) != 0
-            || stop_pc.is_some_and(|pc| self.cores[0].regs.pc() == pc)
-        {
-            return None;
-        }
-
-        // Reject the overwhelmingly common non-candidate case with a cheap,
-        // cache-only scan before paying for the all-peripheral observation.
-        // This is read-only and does not claim safety by itself; it merely
-        // proves whether there is enough CPU work to make the full gate worth
-        // evaluating.
-        let stop = stop_pc.unwrap_or(u32::MAX);
-        let cached_run = self.cores[0]
-            .count_cached_batch_safe_one_cycle_instructions(stop, MAX_BATCH_CYCLES);
-        if cached_run < 2 {
-            return None;
-        }
-
-        // The same all-source classification used by exact idle forward is
-        // valid here because the accepted CPU instructions cannot touch the
-        // bus, FIFO, GPIO, interrupt mask, scheduler, or clock tree.  Exclude
-        // exact-bulk PWM work in this first prototype so a wrap whose final
-        // counter equals its initial value cannot disappear from the behavior
-        // event stream.
-        self.bus.master_cycle = now;
-        let observation = self.idle_source_observation();
-        if !observation.proven_safe()
-            || observation
-                .exact_bulk
-                .contains(idle_profile::IdleBlockerMask::PWM)
-        {
-            return None;
-        }
-        let horizon = self.idle_event_horizon_internal(Some(external_event_cycle));
-        if !horizon.complete_for_current_model {
-            return None;
-        }
-        let cap = horizon
-            .distance_cycles?
-            .min(external_event_cycle.saturating_sub(now))
-            .min(MAX_BATCH_CYCLES);
-        if cap < 2 {
-            return None;
-        }
-
-        let run = cached_run.min(cap);
-        if run < 2 {
-            return None;
-        }
-
-        self.bus.set_active_core(0);
-        for _ in 0..run {
-            let stepped = self.cores[0].step_cached_batch_safe_one_cycle();
-            debug_assert_eq!(stepped, Some(true));
-        }
-        self.exact_batching.batches = self.exact_batching.batches.wrapping_add(1);
-        self.exact_batching.cycles = self.exact_batching.cycles.wrapping_add(run);
-        self.exact_batching.dispatches_elided = self
-            .exact_batching
-            .dispatches_elided
-            .wrapping_add(run - 1);
-        self.exact_batching.max_cycles = self.exact_batching.max_cycles.max(run);
-        self.clock.cycles = now.wrapping_add(run);
-
-        // No accepted instruction can create cache invalidations or wake the
-        // peer core.  Autonomous sources were proven quiescent for the whole
-        // window, so the established bulk tick methods produce the same final
-        // state as `run` one-cycle dispatches while removing their repeated
-        // orchestration.  PIO is still ticked to preserve diagnostic counters;
-        // stationary SMs cannot generate an intermediate pin edge.
-        let pio_idle = self.bus.pio_all_idle();
-        let fast_path = pio_idle
-            && self.bus.irq_pending == 0
-            && !self.bus.systicks[self.bus.active_core()].is_enabled()
-            && self.bus.all_peripherals_idle();
-        if fast_path {
-            self.tick_pio(run as u32);
-            self.bus.advance_lazy_scheduled(run);
-            self.drain_pending_irqs_to_cores();
-            self.update_gpio();
-        } else {
-            self.bus.master_cycle = self.clock.cycles;
-            self.bus.tick_peripherals(run as u32);
-            self.tick_systick(run as u32, 0);
-            self.tick_pio_and_route_irqs(run as u32);
-            self.update_gpio();
-            self.drain_pending_irqs_to_cores();
-        }
-        // The one-cycle reference calls `update_gpio` once per dispatch on
-        // both its fast and slow paths.  A proven-stationary batch needs only
-        // one electrical sample, but PSRAM's call-count diagnostic is part of
-        // the report/exactness contract.  Account for the elided identical
-        // observations explicitly without re-running its edge state machine.
-        if run > 1
-            && let Some(psram) = self.bus.psram.as_mut()
-        {
-            psram.tick_count = psram.tick_count.wrapping_add(run - 1);
-        }
-        self.wake_checks();
-        Some(run)
-    }
-
-    /// Read-only OPT2-C prototype counters for evidence collection.
-    #[cfg(feature = "exact-event-batching")]
-    pub fn exact_event_batching_snapshot(&self) -> ExactEventBatchingSnapshot {
-        self.exact_batching
     }
 
     /// Serial-mode single-quantum step. Shared by [`Self::step`],
@@ -1645,8 +1471,6 @@ impl Emulator {
             idle_profiler: None,
             #[cfg(feature = "event-horizon-profiler")]
             running_profiler: None,
-            #[cfg(feature = "exact-event-batching")]
-            exact_batching: ExactEventBatchingSnapshot::default(),
             execution_model: ExecutionModel::Serial,
             threaded: None,
             panic_info: None,
@@ -2446,8 +2270,6 @@ impl EmulatorBuilder {
             idle_profiler: None,
             #[cfg(feature = "event-horizon-profiler")]
             running_profiler: None,
-            #[cfg(feature = "exact-event-batching")]
-            exact_batching: ExactEventBatchingSnapshot::default(),
             #[cfg(feature = "behavior-trace")]
             behavior_tracer: None,
             execution_model: self.execution,
@@ -3545,90 +3367,5 @@ mod stage5_lib_residue {
         let _ = emu.step().unwrap();
         // No exact assertion — accessor evaluates the idx==1 arm.
         let _ = emu.core_cycles(1);
-    }
-}
-
-#[cfg(all(test, feature = "exact-event-batching"))]
-mod exact_event_batching_tests {
-    use super::*;
-
-    const BASE: u32 = 0x2000_2000;
-    // MOVS r0,#1; ADDS r0,#1; ADDS r0,#1; B BASE.
-    const LOOP: [u8; 8] = [0x01, 0x20, 0x01, 0x30, 0x01, 0x30, 0xfb, 0xe7];
-
-    fn warmed_loop() -> Emulator {
-        let mut emu = EmulatorBuilder::new(Config::default())
-            .step_quantum(1)
-            .build()
-            .unwrap();
-        emu.load_image(BASE, &LOOP);
-        emu.cores[0].regs.set_pc(BASE);
-        // Populate all four decode-cache entries and return to BASE.
-        for _ in 0..4 {
-            assert!(emu.step_until(emu.clock.cycles + 100).unwrap() > 0);
-        }
-        assert_eq!(emu.cores[0].regs.pc(), BASE);
-        emu
-    }
-
-    #[test]
-    fn exact_batch_matches_three_one_cycle_reference_steps() {
-        let mut candidate = warmed_loop();
-        let mut reference = warmed_loop();
-        let before = candidate.clock.cycles;
-
-        let consumed = candidate
-            .step_until_exact_batched(before + 100, None)
-            .unwrap();
-        let mut reference_consumed = 0;
-        for _ in 0..3 {
-            reference_consumed += reference.step_until(reference.clock.cycles + 100).unwrap();
-        }
-
-        assert_eq!(consumed, 3);
-        assert_eq!(reference_consumed, 3);
-        assert_eq!(candidate.clock.cycles, reference.clock.cycles);
-        assert_eq!(candidate.core_cycles(0), reference.core_cycles(0));
-        assert_eq!(candidate.cores[0].regs.r, reference.cores[0].regs.r);
-        assert_eq!(candidate.cores[0].regs.xpsr, reference.cores[0].regs.xpsr);
-        assert_eq!(
-            candidate.cores[0].regs.primask,
-            reference.cores[0].regs.primask
-        );
-        assert_eq!(
-            candidate.cores[0].regs.control,
-            reference.cores[0].regs.control
-        );
-        assert_eq!(candidate.cores[0].regs.msp, reference.cores[0].regs.msp);
-        assert_eq!(candidate.cores[0].regs.psp, reference.cores[0].regs.psp);
-        assert_eq!(candidate.bus.master_cycle, reference.bus.master_cycle);
-        assert_eq!(candidate.pio_tick_count, reference.pio_tick_count);
-    }
-
-    #[test]
-    fn exact_batch_stops_before_stop_pc() {
-        let mut emu = warmed_loop();
-        let before = emu.clock.cycles;
-        let consumed = emu
-            .step_until_exact_batched(before + 100, Some(BASE + 4))
-            .unwrap();
-
-        assert_eq!(consumed, 2);
-        assert_eq!(emu.cores[0].regs.pc(), BASE + 4);
-        assert_eq!(emu.clock.cycles, before + 2);
-    }
-
-    #[test]
-    fn exact_batch_falls_back_without_two_cached_safe_instructions() {
-        let mut emu = EmulatorBuilder::new(Config::default())
-            .step_quantum(1)
-            .build()
-            .unwrap();
-        emu.load_image(BASE, &LOOP);
-        emu.cores[0].regs.set_pc(BASE);
-
-        let consumed = emu.step_until_exact_batched(100, None).unwrap();
-        assert_eq!(consumed, 1);
-        assert_eq!(emu.cores[0].regs.pc(), BASE + 2);
     }
 }
