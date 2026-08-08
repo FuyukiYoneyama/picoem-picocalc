@@ -192,6 +192,10 @@ pub struct UartRegs {
     /// enable gate) is appended here so harnesses can mirror the wire to
     /// stderr. Drained by `drain_tx_log`. Invisible to guest software.
     tx_wire_log: VecDeque<u8>,
+    #[cfg(feature = "behavior-trace")]
+    /// Canonical serial-event tap — drained as behavior events by
+    /// `drain_behavior_tx_log`.
+    tx_behavior_log: VecDeque<u8>,
 }
 
 impl UartRegs {
@@ -215,6 +219,8 @@ impl UartRegs {
             tx_cycle_accum: 0,
             nvic_irq,
             tx_wire_log: VecDeque::new(),
+            #[cfg(feature = "behavior-trace")]
+            tx_behavior_log: VecDeque::new(),
         }
     }
 
@@ -223,6 +229,11 @@ impl UartRegs {
     /// written. Does not affect the real TX FIFO / baud-rate model.
     pub fn drain_tx_log(&mut self) -> Vec<u8> {
         self.tx_wire_log.drain(..).collect()
+    }
+
+    #[cfg(feature = "behavior-trace")]
+    pub(crate) fn drain_behavior_tx_log(&mut self) -> Vec<u8> {
+        self.tx_behavior_log.drain(..).collect()
     }
 
     /// Reset every field to post-init defaults.
@@ -251,7 +262,6 @@ impl UartRegs {
     /// OPT0 diagnostic classification. Unlike [`Self::is_idle`], this
     /// separates state that advances with time from FIFO/IRQ state that is
     /// merely observable while both CPUs are stopped.
-    #[cfg(feature = "idle-profiler")]
     pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
         crate::idle_profile::IdlePeripheralState {
             temporal_work: self.is_tx_enabled() && !self.tx_fifo.is_empty(),
@@ -551,6 +561,8 @@ impl UartRegs {
         // Tap the byte before the overflow check so the diagnostic log
         // captures firmware *intent* even under simulated FIFO drops.
         self.tx_wire_log.push_back(byte);
+        #[cfg(feature = "behavior-trace")]
+        self.tx_behavior_log.push_back(byte);
         let cap = self.tx_capacity();
         if self.tx_fifo.len() >= cap {
             // Overflow drops the byte. The PL011 also latches an
@@ -914,5 +926,30 @@ mod tests {
         u.imsc = UART_INT_MASK;
         u.write32(UARTIMSC, UART_INT_TX, 3, &mut irqs); // BITCLR
         assert_eq!(u.imsc & UART_INT_TX, 0);
+    }
+
+    #[cfg(feature = "behavior-trace")]
+    #[test]
+    fn tx_wire_and_behavior_tx_logs_are_independent_and_preserve_payload_order() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let mut irqs = 0;
+        u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
+        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
+        u.write32(UARTDR, 0xA1, 0, &mut irqs);
+        u.write32(UARTDR, 0xB2, 0, &mut irqs);
+        u.write32(UARTDR, 0xC3, 0, &mut irqs);
+        let wire = u.drain_tx_log();
+        let behavior = u.drain_behavior_tx_log();
+        assert_eq!(wire, vec![0xA1, 0xB2, 0xC3]);
+        assert_eq!(behavior, vec![0xA1, 0xB2, 0xC3]);
+
+        u.write32(UARTDR, 0xD4, 0, &mut irqs);
+        u.write32(UARTDR, 0xE5, 0, &mut irqs);
+        let behavior2 = u.drain_behavior_tx_log();
+        let wire2 = u.drain_tx_log();
+        assert_eq!(behavior2, vec![0xD4, 0xE5]);
+        assert_eq!(wire2, vec![0xD4, 0xE5]);
+        assert!(u.drain_tx_log().is_empty());
+        assert!(u.drain_behavior_tx_log().is_empty());
     }
 }

@@ -1067,7 +1067,8 @@ fn run_loop(
             );
         }
 
-        let consumed = match emu.step() {
+        let external_event_cycle = next_poll_cycles.min(cycle_limit);
+        let consumed = match emu.step_until(external_event_cycle) {
             Ok(c) => c,
             Err(e) => {
                 let msg = e.to_string();

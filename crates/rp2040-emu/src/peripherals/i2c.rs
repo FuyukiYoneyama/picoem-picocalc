@@ -290,7 +290,6 @@ impl I2cRegs {
     /// OPT0 diagnostic classification. The current I2C model completes
     /// transactions synchronously on DATA_CMD writes, so `tick()` has no
     /// temporal transaction work; it only re-routes latched IRQ levels.
-    #[cfg(feature = "idle-profiler")]
     pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
         crate::idle_profile::IdlePeripheralState {
             temporal_work: false,

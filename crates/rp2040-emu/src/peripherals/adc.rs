@@ -195,7 +195,6 @@ impl AdcRegs {
 
     /// OPT0 diagnostic classification: conversions advance with time,
     /// whereas a filled FIFO or masked interrupt latch remains static.
-    #[cfg(feature = "idle-profiler")]
     pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
         crate::idle_profile::IdlePeripheralState {
             temporal_work: self.conversion_remaining.is_some()

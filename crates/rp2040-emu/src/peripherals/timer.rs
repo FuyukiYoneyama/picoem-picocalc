@@ -128,7 +128,7 @@ pub struct TimerRegs {
 }
 
 impl TimerRegs {
-    #[cfg(feature = "behavior-trace")]
+    #[cfg(any(feature = "behavior-trace", test))]
     pub(crate) fn behavior_trace_state(&self) -> [u64; 6] {
         [
             u64::from(self.armed),
@@ -242,7 +242,6 @@ impl TimerRegs {
 
     /// OPT0 diagnostic view of already-latched timer state. Future armed
     /// alarms are represented separately by `next_scheduled_lazy_deadline`.
-    #[cfg(feature = "idle-profiler")]
     pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
         crate::idle_profile::IdlePeripheralState {
             temporal_work: false,
@@ -277,7 +276,6 @@ impl TimerRegs {
     /// interrupt is currently masked.  A masked alarm still clears ARMED and
     /// latches INTR at its match cycle, so a complete event horizon must not
     /// skip it merely because it cannot wake a core.
-    #[cfg(feature = "idle-profiler")]
     pub(crate) fn next_armed_fire_cycle(&self) -> Option<u64> {
         let mut soonest: Option<u64> = None;
         for n in 0..4 {

@@ -24,8 +24,14 @@ pub mod irq;
 pub mod memory;
 pub mod peripherals;
 
-#[cfg(feature = "idle-profiler")]
 mod idle_profile;
+
+#[cfg(feature = "idle-profiler")]
+pub use idle_profile::{
+    CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_HORIZON_SCHEMA_VERSION,
+    IDLE_PROFILE_SCHEMA_VERSION, IdleBlockerCycles, IdleBlockerEpisodes, IdleCurrentProbe,
+    IdleEventHorizonProbe, IdleEventSourceMask, IdleHorizonEvents, IdleProfileSnapshot,
+};
 
 #[cfg(feature = "behavior-trace")]
 mod behavior_trace;
@@ -34,13 +40,6 @@ mod behavior_trace;
 pub use behavior_trace::{
     BEHAVIOR_TRACE_SCHEMA_VERSION, BehaviorEventDomain, BehaviorTraceDomainSnapshot,
     BehaviorTraceSnapshot,
-};
-
-#[cfg(feature = "idle-profiler")]
-pub use idle_profile::{
-    CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_HORIZON_SCHEMA_VERSION,
-    IDLE_PROFILE_SCHEMA_VERSION, IdleBlockerCycles, IdleBlockerEpisodes, IdleCurrentProbe,
-    IdleEventHorizonProbe, IdleEventSourceMask, IdleHorizonEvents, IdleProfileSnapshot,
 };
 
 // Dual-execution HLD V1 (Stage 3b.2) — threaded runtime scaffolding.
@@ -680,6 +679,56 @@ impl Emulator {
         Ok(consumed)
     }
 
+    /// Advance the system by one normal quantum, or exactly fast-forward a
+    /// both-cores-blocked interval to its next event boundary.
+    ///
+    /// In Serial mode this is the same execution pipeline as [`Self::step`],
+    /// but when both cores are blocked and every autonomous source is proven
+    /// safe, it may advance directly to the first internal or caller-owned
+    /// horizon. A blocked interval never advances past `external_event_cycle`;
+    /// a running core retains the existing instruction-boundary semantics. A
+    /// source without an exact bulk contract conservatively limits the advance
+    /// to one cycle.
+    ///
+    /// In Threaded mode, this remains unsupported and returns
+    /// [`EmulatorError::NotSupportedInThreadedMode`].
+    pub fn step_until(&mut self, external_event_cycle: u64) -> Result<u64, EmulatorError> {
+        if self.execution_model == ExecutionModel::Threaded {
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            if let Some((which, message)) = &self.panic_info {
+                return Err(EmulatorError::WorkerPanicked {
+                    which: *which,
+                    message: message.clone(),
+                });
+            }
+            #[cfg(all(
+                feature = "threading",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            if let Some((which, elapsed_ms)) = self.timeout_info {
+                return Err(EmulatorError::BarrierTimeout { which, elapsed_ms });
+            }
+            return Err(EmulatorError::NotSupportedInThreadedMode);
+        }
+        let consumed = self.step_serial_with_external(Some(external_event_cycle), true);
+        #[cfg(feature = "behavior-trace")]
+        self.observe_behavior_trace();
+        Ok(consumed)
+    }
+
+    /// Serial-mode single-quantum step. Shared by [`Self::step`],
+    /// [`Self::step_until`], [`Self::run`] (inner loop) and
+    /// [`Self::run_quantum`] (Serial path).
+    #[inline(always)]
+    fn step_serial(&mut self) -> u64 {
+        self.step_serial_with_external(None, false)
+    }
+
     /// Drain the bus's pending decode-cache invalidations into both
     /// cores' caches and reset the buffers. Called after each
     /// `core.step` in [`Self::step_serial`] (mirroring the rp2350_emu
@@ -708,9 +757,17 @@ impl Emulator {
         }
     }
 
-    /// Serial-mode single-quantum step. Shared by [`Self::step`] and
-    /// [`Self::run_quantum`] on the Serial path.
-    fn step_serial(&mut self) -> u64 {
+    /// Serial-mode single-quantum step with an optional external
+    /// synchronization boundary.
+    ///
+    /// `exact_idle_fast_forward` is enabled only by [`Self::step_until`].
+    /// The ordinary [`Self::step`] / [`Self::run`] paths retain their
+    /// historical one-quantum TIMER wake behavior.
+    fn step_serial_with_external(
+        &mut self,
+        external_event_cycle: Option<u64>,
+        exact_idle_fast_forward: bool,
+    ) -> u64 {
         debug_assert!(self.step_quantum > 0, "step_quantum must be >= 1");
         // Refresh the Bus's view of the master cycle count so any MMIO
         // reads / writes performed during this quantum (notably PLL CS
@@ -772,6 +829,51 @@ impl Emulator {
         }
 
         let consumed = self.clock.cycles.wrapping_sub(start);
+        let both_cores_blocked = (self.cores[0].is_halted() || self.bus.wfe_waiting[0])
+            && (self.cores[1].is_halted() || self.bus.wfe_waiting[1]);
+
+        let blocked_advance = if both_cores_blocked && exact_idle_fast_forward {
+            let observation = self.idle_source_observation();
+            let horizon = self.idle_event_horizon_internal(external_event_cycle);
+            horizon.distance_cycles.and_then(|distance| {
+                if distance == 0 {
+                    None
+                } else {
+                    // Only the fully classified quiescent path may cross a
+                    // quantum. Unresolved temporal sources use the complete
+                    // one-cycle fallback encoded by the horizon.
+                    let cap = if observation.proven_safe() {
+                        u64::from(u32::MAX)
+                    } else {
+                        1
+                    };
+                    Some((distance.min(cap), distance, observation, horizon))
+                }
+            })
+        } else if both_cores_blocked {
+            // Preserve the established public step/run contract: ordinary
+            // stepping advances only toward an IRQ-enabled TIMER alarm and
+            // never by more than one configured quantum.
+            self.bus
+                .next_scheduled_lazy_deadline()
+                .and_then(|deadline| {
+                    let distance = deadline.saturating_sub(self.bus.master_cycle);
+                    if distance == 0 {
+                        None
+                    } else {
+                        let horizon = self.idle_event_horizon_internal(None);
+                        Some((
+                            distance.min(self.step_quantum as u64),
+                            distance,
+                            self.idle_source_observation(),
+                            horizon,
+                        ))
+                    }
+                })
+        } else {
+            None
+        };
+
         // tech_debt §1649: when both cores are blocked (halted-or-WFE)
         // and the inner loop made no progress, `consumed == 0` and
         // neither the fast-path nor the slow-path below would advance
@@ -784,25 +886,28 @@ impl Emulator {
         // the early return so we don't double-advance via fast/slow
         // path. Production fix per HLD V2 / tech_debt §1649 Option 1.
         if consumed == 0
-            && (self.cores[0].is_halted() || self.bus.wfe_waiting[0])
-            && (self.cores[1].is_halted() || self.bus.wfe_waiting[1])
+            && both_cores_blocked
             && self.bus.irq_pending == 0
             && self.bus.nvics[0].pending_and_enabled() == 0
             && self.bus.nvics[1].pending_and_enabled() == 0
-            && let Some(deadline) = self.bus.next_scheduled_lazy_deadline()
-            && deadline > self.bus.master_cycle
+            && let Some((advance, horizon_distance, observation, horizon)) = blocked_advance
+            && advance > 0
         {
-            // Cap a single advance at `step_quantum`. If the deadline is
-            // farther out, the caller's `run`/`run_quantum` loop iterates
-            // and the next `step()` re-enters this branch, closing the
-            // gap across multiple quanta — never silently stalls.
-            let max_advance = self.step_quantum as u64;
-            let horizon_distance = deadline - self.bus.master_cycle;
-            let advance = horizon_distance.min(max_advance);
+            #[cfg(feature = "behavior-trace")]
+            let exact_pwm_boundary = exact_idle_fast_forward
+                && advance == horizon_distance
+                && horizon
+                    .limiting_sources
+                    .contains(idle_profile::IdleEventSourceMask::PWM)
+                && !horizon
+                    .one_cycle_fallback_sources
+                    .contains(idle_profile::IdleEventSourceMask::PWM);
+            #[cfg(not(feature = "idle-profiler"))]
+            let _ = (observation, horizon, horizon_distance);
             #[cfg(feature = "idle-profiler")]
             let blocked_observation = (
-                self.idle_source_observation(),
-                self.idle_event_horizon(None),
+                observation,
+                horizon,
                 self.cores[0].is_halted(),
                 self.bus.wfe_waiting[0],
                 self.cores[1].is_halted(),
@@ -813,6 +918,10 @@ impl Emulator {
             self.bus.tick_peripherals(advance as u32);
             self.drain_pending_irqs_to_cores();
             self.wake_checks();
+            #[cfg(feature = "behavior-trace")]
+            if exact_pwm_boundary {
+                self.observe_behavior_trace_timer_pwm_boundary();
+            }
             #[cfg(feature = "idle-profiler")]
             if let Some(profiler) = self.idle_profiler.as_mut() {
                 let (observation, event_horizon, c0_halted, c0_wfe, c1_halted, c1_wfe) =
@@ -929,7 +1038,6 @@ impl Emulator {
     /// include FIFO contents and sticky IRQ bits, while an idle jump needs to
     /// know whether state changes *with time*. Static state and work already
     /// handled by an exact bulk tick are retained as separate evidence.
-    #[cfg(feature = "idle-profiler")]
     fn idle_source_observation(&self) -> idle_profile::IdleSourceObservation {
         use idle_profile::IdleBlockerMask as M;
 
@@ -1656,14 +1764,7 @@ impl Emulator {
     /// UART0 `DR` since the previous call. Returns empty if idle.
     pub fn drain_uart0_tx_log(&mut self) -> Vec<u8> {
         self.assert_not_placeholder();
-        let bytes = self.bus.drain_uart0_tx_log();
-        #[cfg(feature = "behavior-trace")]
-        if !bytes.is_empty()
-            && let Some(tracer) = self.behavior_tracer.as_mut()
-        {
-            tracer.record(BehaviorEventDomain::SerialBus, 1, self.clock.cycles, &bytes);
-        }
-        bytes
+        self.bus.drain_uart0_tx_log()
     }
 
     /// Enable and reset the OPT0-B streaming event trace.
@@ -1676,6 +1777,9 @@ impl Emulator {
         if self.execution_model != ExecutionModel::Serial {
             return Err(EmulatorError::NotSupportedInThreadedMode);
         }
+        // Events that predate trace enablement are outside this stream.  Keep
+        // the independent UART tap aligned with the initial observation.
+        let _ = self.bus.drain_uart0_behavior_tx_log();
         let observation = self.behavior_observation();
         self.behavior_tracer = Some(behavior_trace::BehaviorTracer::new(observation));
         Ok(())
@@ -1730,10 +1834,35 @@ impl Emulator {
     }
 
     #[cfg(feature = "behavior-trace")]
+    fn record_uart0_behavior_events(&mut self) {
+        let bytes = self.bus.drain_uart0_behavior_tx_log();
+        if let Some(tracer) = self.behavior_tracer.as_mut() {
+            for byte in bytes {
+                tracer.record(
+                    BehaviorEventDomain::SerialBus,
+                    1,
+                    self.clock.cycles,
+                    &[byte],
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "behavior-trace")]
     fn observe_behavior_trace(&mut self) {
+        self.record_uart0_behavior_events();
         let observation = self.behavior_observation();
         if let Some(tracer) = self.behavior_tracer.as_mut() {
             tracer.observe(observation);
+        }
+    }
+
+    #[cfg(feature = "behavior-trace")]
+    fn observe_behavior_trace_timer_pwm_boundary(&mut self) {
+        self.record_uart0_behavior_events();
+        let observation = self.behavior_observation();
+        if let Some(tracer) = self.behavior_tracer.as_mut() {
+            tracer.observe_timer_pwm_boundary(observation);
         }
     }
 
@@ -1833,17 +1962,12 @@ impl Emulator {
         }
     }
 
-    /// Compute a complete, conservative next-event horizon while both cores
-    /// are blocked.
-    ///
-    /// Exact deadlines are used for TIMER alarms, PWM wraps, and the optional
-    /// caller-owned external boundary. Every other temporal source is
-    /// represented by a one-cycle fallback. The fallback can reduce an
-    /// optimization opportunity, but can never allow the probe to jump over
-    /// an event that the current model could observe.
-    #[cfg(feature = "idle-profiler")]
-    #[inline(never)]
-    pub fn idle_event_horizon(&self, external_event_cycle: Option<u64>) -> IdleEventHorizonProbe {
+    /// Internal helper used by both the normal execution path and the
+    /// diagnostic-only public API.
+    fn idle_event_horizon_internal(
+        &self,
+        external_event_cycle: Option<u64>,
+    ) -> crate::idle_profile::IdleEventHorizonProbe {
         use idle_profile::{IdleBlockerMask as B, IdleEventSourceMask as S};
 
         self.assert_not_placeholder();
@@ -1910,7 +2034,7 @@ impl Emulator {
             consider(deadline, S::EXTERNAL);
         }
 
-        IdleEventHorizonProbe {
+        crate::idle_profile::IdleEventHorizonProbe {
             master_cycle: now,
             next_event_cycle,
             distance_cycles: next_event_cycle.map(|cycle| cycle.saturating_sub(now)),
@@ -1918,6 +2042,23 @@ impl Emulator {
             one_cycle_fallback_sources: S::from_bits(fallback_bits),
             complete_for_current_model: true,
         }
+    }
+
+    /// Compute a complete, conservative next-event horizon while both cores
+    /// are blocked.
+    ///
+    /// Exact deadlines are used for TIMER alarms, PWM wraps, and the optional
+    /// caller-owned external boundary. Every other temporal source is
+    /// represented by a one-cycle fallback. The fallback can reduce an
+    /// optimization opportunity, but can never allow the probe to jump over
+    /// an event that the current model could observe.
+    #[cfg(feature = "idle-profiler")]
+    #[inline(never)]
+    pub fn idle_event_horizon(
+        &self,
+        external_event_cycle: Option<u64>,
+    ) -> crate::idle_profile::IdleEventHorizonProbe {
+        self.idle_event_horizon_internal(external_event_cycle)
     }
 }
 
@@ -2332,6 +2473,19 @@ mod stage4_lib_residue {
     }
 
     #[test]
+    fn step_respects_quantum_cap_when_both_cores_running() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(32)
+            .build()
+            .unwrap();
+        emu.wake_core1();
+        let _ = emu.step().unwrap();
+        // Existing serial scheduler can still return fewer cycles when one
+        // core exits, but it must not exceed the configured quantum.
+        assert!(emu.cycles() <= 32);
+    }
+
+    #[test]
     fn step_serial_returns_ok() {
         let mut emu = Emulator::new(Config::default());
         // Both cores halt quickly with zero-data ROM, but step still
@@ -2653,6 +2807,100 @@ mod stage5_lib_residue {
             emu.cores[1].is_halted(),
             emu.bus.master_cycle,
             emu.bus.next_scheduled_lazy_deadline(),
+        );
+    }
+
+    #[test]
+    fn step_until_stops_at_external_boundary_when_shorter_than_internal_horizon() {
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(64)
+            .build()
+            .unwrap();
+        emu.cores[0].halt();
+        emu.halt_core1();
+        let sys_hz = emu.bus.clock_tree.sys_clk_hz;
+        emu.bus
+            .timer
+            .write32(INTE_OFFSET, 1, 0, emu.bus.master_cycle, sys_hz);
+        emu.bus
+            .timer
+            .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
+
+        let now = emu.bus.master_cycle;
+        let consumed = emu.step_until(now + 7).unwrap();
+        assert_eq!(consumed, 7);
+        assert_eq!(emu.bus.master_cycle, now + 7);
+        assert_eq!(emu.bus.irq_pending, 0);
+    }
+
+    #[test]
+    fn step_until_active_pio_fallback_is_one_cycle() {
+        use crate::bus::PIO0_BASE;
+        use crate::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET};
+
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(64)
+            .build()
+            .unwrap();
+        emu.cores[0].halt();
+        emu.halt_core1();
+        emu.bus.write32(PIO0_BASE + 0x2000, 1);
+        let sys_hz = emu.bus.clock_tree.sys_clk_hz;
+        emu.bus
+            .timer
+            .write32(INTE_OFFSET, 1, 0, emu.bus.master_cycle, sys_hz);
+        emu.bus
+            .timer
+            .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
+
+        let consumed = emu.step_until(emu.bus.master_cycle + 64).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(emu.bus.master_cycle, 1);
+    }
+
+    #[test]
+    fn step_until_matches_one_cycle_reference_at_masked_timer_boundary() {
+        use crate::peripherals::timer::ALARM0_OFFSET;
+
+        let mut bulk = EmulatorBuilder::new(Config::default())
+            .step_quantum(64)
+            .build()
+            .unwrap();
+        let mut ref_emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .unwrap();
+
+        let sys_hz = bulk.bus.clock_tree.sys_clk_hz;
+        for emu in [&mut bulk, &mut ref_emu] {
+            emu.cores[0].halt();
+            emu.halt_core1();
+            emu.bus
+                .timer
+                .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
+        }
+
+        let target = bulk.bus.timer.next_armed_fire_cycle().unwrap();
+        assert!(target - bulk.bus.master_cycle > bulk.step_quantum as u64);
+        let bulk_consumed = bulk.step_until(target).unwrap();
+        while ref_emu.cycles() < target {
+            let next = ref_emu.cycles() + 1;
+            assert_eq!(ref_emu.step_until(next).unwrap(), 1);
+        }
+
+        assert_eq!(bulk_consumed, target);
+        assert_eq!(bulk.bus.master_cycle, target);
+        assert_eq!(ref_emu.bus.master_cycle, target);
+        assert_eq!(
+            bulk.bus.timer.behavior_trace_state(),
+            ref_emu.bus.timer.behavior_trace_state()
+        );
+        assert_eq!(bulk.bus.irq_pending, ref_emu.bus.irq_pending);
+        assert_eq!(
+            bulk.bus.nvics[0].pending_and_enabled(),
+            ref_emu.bus.nvics[0].pending_and_enabled()
         );
     }
 

@@ -1,8 +1,11 @@
 //! OPT0-A Serial idle-path profiler.
 //!
-//! This module is compiled only with the `idle-profiler` feature. The
-//! normal correctness/performance build therefore pays no field, branch,
-//! counter, or histogram cost.
+//! The semantic source and horizon types are also compiled for OPT1-A's
+//! production quiescent path. Profiler fields, counters, and public diagnostic
+//! APIs remain behind `idle-profiler`, so normal execution pays no profiling
+//! branch, counter, allocation, or histogram cost.
+
+#![cfg_attr(not(feature = "idle-profiler"), allow(dead_code))]
 
 /// Machine-readable profile schema emitted by diagnostic harnesses.
 pub const IDLE_PROFILE_SCHEMA_VERSION: u32 = 3;

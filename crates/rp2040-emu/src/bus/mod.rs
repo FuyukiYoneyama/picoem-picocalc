@@ -864,6 +864,11 @@ impl Bus {
     }
 
     #[cfg(feature = "behavior-trace")]
+    pub(crate) fn drain_uart0_behavior_tx_log(&mut self) -> Vec<u8> {
+        self.uart0.drain_behavior_tx_log()
+    }
+
+    #[cfg(feature = "behavior-trace")]
     pub(crate) fn behavior_serial_state(&self) -> [u64; 34] {
         let mut state = [0u64; 34];
         state[0..4].copy_from_slice(&self.uart0.behavior_trace_state());

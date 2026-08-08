@@ -6,7 +6,7 @@
 
 use sha2::{Digest, Sha256};
 
-pub const BEHAVIOR_TRACE_SCHEMA_VERSION: u32 = 1;
+pub const BEHAVIOR_TRACE_SCHEMA_VERSION: u32 = 2;
 const EVENT_MAGIC: &[u8] = b"PICOEM-EVENT\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +152,17 @@ impl BehaviorTracer {
     }
 
     pub(crate) fn observe(&mut self, current: BehaviorObservation) {
+        self.observe_internal(current, false);
+    }
+
+    /// Record an exact PWM wrap reached by a bulk idle advance even when
+    /// the counter completes a full period and therefore has the same value
+    /// as the preceding sampled state.
+    pub(crate) fn observe_timer_pwm_boundary(&mut self, current: BehaviorObservation) {
+        self.observe_internal(current, true);
+    }
+
+    fn observe_internal(&mut self, current: BehaviorObservation, force_timer_pwm: bool) {
         let previous = self.previous.clone();
         if current.clock_hz != previous.clock_hz {
             self.record_words(
@@ -214,7 +225,10 @@ impl BehaviorTracer {
             }
             self.record(BehaviorEventDomain::DmaDreq, 1, current.cycle, &payload);
         }
-        if current.timer != previous.timer || pwm_boundary(&previous.pwm, &current.pwm) {
+        if force_timer_pwm
+            || current.timer != previous.timer
+            || pwm_boundary(&previous.pwm, &current.pwm)
+        {
             let mut payload = Vec::with_capacity(6 * 8 + 8 * 5);
             for value in current.timer {
                 push_u64(&mut payload, value);

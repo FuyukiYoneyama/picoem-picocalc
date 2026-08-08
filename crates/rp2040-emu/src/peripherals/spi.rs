@@ -239,7 +239,6 @@ impl SpiRegs {
 
     /// OPT0 diagnostic classification: distinguish an actively shifting
     /// transmitter from static FIFO/interrupt state.
-    #[cfg(feature = "idle-profiler")]
     pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
         crate::idle_profile::IdlePeripheralState {
             temporal_work: self.is_enabled() && !self.tx_fifo.is_empty(),

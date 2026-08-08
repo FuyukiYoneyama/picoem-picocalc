@@ -196,7 +196,6 @@ impl PwmRegs {
     /// OPT0 diagnostic classification. An enabled slice with no enabled
     /// wrap IRQ is exactly bulk-advanceable by [`Self::tick`]; an enabled
     /// IRQ needs a next-wrap horizon before it may be skipped.
-    #[cfg(feature = "idle-profiler")]
     pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePwmState {
         let enabled = self.pwm_en_view() != 0;
         crate::idle_profile::IdlePwmState {
@@ -212,7 +211,6 @@ impl PwmRegs {
     /// The wrap is observable because it updates CTR and latches INTR even
     /// when the NVIC mask is clear. `tick(cycles)` already performs the
     /// corresponding state advance exactly in O(number-of-slices).
-    #[cfg(feature = "idle-profiler")]
     pub(crate) fn next_wrap_distance(&self) -> Option<u64> {
         self.slices
             .iter()

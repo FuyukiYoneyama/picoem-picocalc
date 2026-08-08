@@ -47,6 +47,10 @@ jobs:
         run: |
           cargo test -p rp2040-emu --features idle-profiler
           cargo test -p picocalc-harness --features idle-profiler
+      - name: Test the behavior-contract build
+        run: |
+          cargo test -p rp2040-emu --features behavior-trace
+          cargo test -p picocalc-harness --features behavior-trace
       - name: Build the runner picocalc_emu invokes
         # picocalc_emu's firmware regression shells out to
         # target/release/picocalc-run. A release build that fails should
@@ -94,3 +98,7 @@ jobs:
         run: |
           cargo clippy -p rp2040-emu --features idle-profiler --lib -- -D warnings
           cargo clippy -p picocalc-harness --features idle-profiler -- -D warnings
+      - name: Lint the behavior-contract build
+        run: |
+          cargo clippy -p rp2040-emu --features behavior-trace --lib -- -D warnings
+          cargo clippy -p picocalc-harness --features behavior-trace -- -D warnings

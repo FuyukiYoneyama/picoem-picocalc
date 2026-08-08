@@ -318,7 +318,6 @@ impl Dma {
 
     /// OPT0 diagnostic classification. A latched but masked completion is
     /// static; only a BUSY channel advances transfer state with time.
-    #[cfg(feature = "idle-profiler")]
     pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
         crate::idle_profile::IdlePeripheralState {
             temporal_work: self.channels.iter().any(|c| c.busy),
