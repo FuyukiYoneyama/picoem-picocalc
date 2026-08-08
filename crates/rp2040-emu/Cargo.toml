@@ -45,6 +45,10 @@ idle-profiler = []
 # horizon and OPT0-B observable-state snapshots, but normal execution does
 # not compile any of its counters or MMIO classification hooks.
 event-horizon-profiler = ["idle-profiler", "behavior-trace"]
+# OPT2-C bounded exact-running prototype.  This is deliberately opt-in until
+# the firmware exactness and trace-off performance gates decide whether the
+# candidate is retained.
+exact-event-batching = []
 # OPT0-B deterministic streaming event contract. Kept out of default
 # builds so the performance path contains neither a disabled branch nor a
 # hash state. The optional dependency exists only in diagnostic binaries.

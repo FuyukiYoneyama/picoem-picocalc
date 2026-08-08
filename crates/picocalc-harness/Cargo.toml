@@ -19,6 +19,9 @@ idle-profiler = ["rp2040-emu/idle-profiler"]
 # This deliberately includes the existing behavior observation machinery;
 # its output is not valid for wall-time measurement.
 event-horizon-profiler = ["idle-profiler", "behavior-trace", "rp2040-emu/event-horizon-profiler"]
+# OPT2-C bounded production candidate.  The runner forwards the feature to
+# the backend and uses its stop-PC-aware entry point.
+exact-event-batching = ["rp2040-emu/exact-event-batching"]
 # Diagnostic-only OPT0-B correctness build. Normal conformance and
 # performance runners do not compile the streaming hash path.
 behavior-trace = ["rp2040-emu/behavior-trace"]
