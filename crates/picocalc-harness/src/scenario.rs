@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use picocalc_board::sha256::sha256_hex;
-use picocalc_board::{Keyboard, St7365p, pins};
+use picocalc_board::{KeyEvent, KeyState, Keyboard, St7365p, pins};
 
 use serde_json::Value;
 
@@ -154,6 +154,8 @@ pub enum Op {
         repeat: u32,
         gap_ms: u64,
     },
+    /// Queue explicit raw keyboard events with fixed `state`/`code`.
+    KeyEvents { events: Vec<KeyEvent>, gap_ms: u64 },
     /// Record the framebuffer hash, and optionally write a PNG.
     Snapshot { png: Option<PathBuf> },
     /// Check a condition now. A failure is recorded and the scenario
@@ -169,6 +171,7 @@ impl Op {
             Op::WaitCycles { .. } => "wait_cycles",
             Op::WaitUntil { .. } => "wait_until",
             Op::Key { .. } => "key",
+            Op::KeyEvents { .. } => "key_events",
             Op::Snapshot { .. } => "snapshot",
             Op::Assert { .. } => "assert",
         }
@@ -193,7 +196,9 @@ impl Scenario {
     /// True if any step sends keys, so the caller can attach the
     /// controller rather than letting the run fail at the first `key`.
     pub fn needs_keyboard(&self) -> bool {
-        self.steps.iter().any(|s| matches!(s.op, Op::Key { .. }))
+        self.steps
+            .iter()
+            .any(|s| matches!(s.op, Op::Key { .. } | Op::KeyEvents { .. }))
     }
 
     /// True if any step looks at the panel. Unlike the keyboard, the
@@ -367,6 +372,56 @@ fn parse_step(raw: &Value) -> Result<Step, String> {
                 gap_ms,
             }
         }
+        "key_events" => {
+            let raw_events = obj
+                .get("events")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "events: required, must be an array".to_string())?;
+            if raw_events.is_empty() {
+                return Err("events: must not be empty".to_string());
+            }
+            let mut events = Vec::with_capacity(raw_events.len());
+            for (i, raw_event) in raw_events.iter().enumerate() {
+                let raw_event = raw_event
+                    .as_object()
+                    .ok_or_else(|| format!("events[{i}]: must be an object"))?;
+                let state = raw_event
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("events[{i}].state: required, must be a string"))?;
+                let state = match state {
+                    "pressed" => KeyState::Pressed,
+                    "held" => KeyState::Held,
+                    "released" => KeyState::Released,
+                    _ => {
+                        return Err(format!(
+                            "events[{i}].state: unknown state '{state}' (expected \
+                             pressed, held or released)"
+                        ));
+                    }
+                };
+                let code = raw_event
+                    .get("code")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("events[{i}].code: required, must be an integer"))?;
+                let code = u8::try_from(code)
+                    .map_err(|_| format!("events[{i}].code: {code} does not fit in u8"))?;
+                events.push(KeyEvent { state, code });
+            }
+            let gap_ms = match obj.get("gap_ms") {
+                None => 0,
+                Some(v) => {
+                    let n = v
+                        .as_u64()
+                        .ok_or_else(|| "gap_ms: must be an integer".to_string())?;
+                    if n > MAX_WAIT_MS {
+                        return Err(format!("gap_ms: {n} exceeds the {MAX_WAIT_MS} ms limit"));
+                    }
+                    n
+                }
+            };
+            Op::KeyEvents { events, gap_ms }
+        }
         "snapshot" => Op::Snapshot {
             png: obj
                 .get("png")
@@ -395,7 +450,7 @@ fn parse_step(raw: &Value) -> Result<Step, String> {
         other => {
             return Err(format!(
                 "op: unknown operation '{other}' (expected wait, wait_cycles, \
-                 wait_until, key, snapshot or assert)"
+                 wait_until, key, key_events, snapshot or assert)"
             ));
         }
     };
@@ -850,6 +905,11 @@ enum Pending {
         queue: Vec<u8>,
         next_at_ns: u64,
     },
+    KeyEvents {
+        queue: Vec<KeyEvent>,
+        next_at_ns: u64,
+        gap_ms: u64,
+    },
 }
 
 /// Drives a [`Scenario`] against a running emulator.
@@ -1166,6 +1226,46 @@ impl Engine {
                     text.chars().count() * *repeat as usize
                 ))
             }
+            Op::KeyEvents { events, gap_ms } => {
+                let Some(kbd) = obs.keyboard else {
+                    return Progress::Faulted(
+                        "key steps need the keyboard model (pass --keyboard)".to_string(),
+                    );
+                };
+                if !matches!(self.pending, Pending::KeyEvents { .. }) {
+                    self.pending = Pending::KeyEvents {
+                        queue: events.iter().copied().rev().collect(),
+                        next_at_ns: obs.now_ns,
+                        gap_ms: *gap_ms,
+                    };
+                }
+                let Pending::KeyEvents {
+                    queue,
+                    next_at_ns,
+                    gap_ms,
+                } = &mut self.pending
+                else {
+                    unreachable!("just installed")
+                };
+                while let Some(event) = queue.pop() {
+                    if obs.now_ns < *next_at_ns {
+                        self.next_poll_ns = *next_at_ns;
+                        return Progress::Blocked;
+                    }
+                    match kbd.lock() {
+                        Ok(mut guard) => guard.push_event(event),
+                        Err(_) => {
+                            return Progress::Faulted("keyboard model mutex poisoned".to_string());
+                        }
+                    }
+                    *next_at_ns = obs.now_ns + *gap_ms * 1_000_000;
+                    if *gap_ms > 0 && !queue.is_empty() {
+                        self.next_poll_ns = *next_at_ns;
+                        return Progress::Blocked;
+                    }
+                }
+                Progress::pass(format!("sent {} raw key event(s)", events.len()))
+            }
             Op::Snapshot { png } => {
                 let Some(lcd) = obs.lcd else {
                     return Progress::Faulted(
@@ -1370,6 +1470,11 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use picocalc_board::keyboard::REG_KEY_FIFO;
+    use picocalc_board::{KeyEvent, KeyState, Keyboard};
+    use rp2040_emu::peripherals::i2c::I2cExternalDevice;
+    use serde_json::json;
+    use std::sync::Mutex;
 
     fn scenario_json(steps: &str) -> String {
         format!(r#"{{"schema": 1, "name": "t", "steps": {steps}}}"#)
@@ -1508,6 +1613,44 @@ mod tests {
     fn wide_characters_are_refused_rather_than_substituted() {
         let e = parse_str(&scenario_json(r#"[{"op": "key", "text": "あ"}]"#)).unwrap_err();
         assert!(e.contains("8-bit"), "{e}");
+    }
+
+    #[test]
+    fn key_events_must_not_be_empty() {
+        let e = parse_str(&scenario_json(
+            r#"[{"op": "key_events", "events": [], "gap_ms": 1}]"#,
+        ))
+        .unwrap_err();
+        assert!(e.contains("events: must not be empty"), "{e}");
+    }
+
+    #[test]
+    fn key_events_validates_state_code_and_gap() {
+        let e = parse_str(&scenario_json(
+            r#"[{"op":"key_events","events":[{"state":"n/a","code":1}]}]"#,
+        ))
+        .unwrap_err();
+        assert!(e.contains("events[0].state"), "{e}");
+
+        let e = parse_str(&scenario_json(
+            r#"[{"op":"key_events","events":[{"state":"pressed","code":999}]}]"#,
+        ))
+        .unwrap_err();
+        assert!(e.contains("events[0].code"), "{e}");
+
+        let e = parse(&json!({
+            "schema": 1,
+            "name": "t",
+            "steps": [
+                {
+                    "op": "key_events",
+                    "events": [{ "state": "pressed", "code": 1 }],
+                    "gap_ms": "1",
+                }
+            ]
+        }))
+        .unwrap_err();
+        assert!(e.contains("gap_ms"), "{e}");
     }
 
     #[test]
@@ -1663,6 +1806,82 @@ mod tests {
         assert!(!e.passed());
         assert_eq!(e.status(), "error");
         assert!(e.fault().unwrap().contains("--keyboard"));
+    }
+
+    #[test]
+    fn key_events_step_without_a_keyboard_is_an_error_not_a_silent_pass() {
+        let mut e = engine(vec![step(Op::KeyEvents {
+            events: vec![KeyEvent {
+                state: KeyState::Pressed,
+                code: b'a',
+            }],
+            gap_ms: 0,
+        })]);
+        e.poll(&obs(0, b""));
+        assert!(e.is_done());
+        assert!(!e.passed());
+        assert_eq!(e.status(), "error");
+        assert!(e.fault().unwrap().contains("--keyboard"));
+    }
+
+    #[test]
+    fn key_events_sequence_is_delivered_in_order_and_holds_remain_held() {
+        let keyboard = Mutex::new(Keyboard::picocalc());
+
+        let mut e = engine(vec![step(Op::KeyEvents {
+            events: vec![
+                KeyEvent {
+                    state: KeyState::Pressed,
+                    code: 11,
+                },
+                KeyEvent {
+                    state: KeyState::Held,
+                    code: 22,
+                },
+                KeyEvent {
+                    state: KeyState::Released,
+                    code: 11,
+                },
+            ],
+            gap_ms: 0,
+        })]);
+
+        let obs = Observation {
+            now_ns: 0,
+            cycles: 0,
+            lcd: None,
+            keyboard: Some(&keyboard),
+            uart: b"",
+        };
+        e.poll(&obs);
+        assert!(e.is_done());
+        assert!(e.passed());
+        assert_eq!(e.results()[0].status, StepStatus::Pass);
+
+        let mut guard = keyboard.lock().expect("keyboard mutex");
+        guard.write_byte(REG_KEY_FIFO);
+        let first = {
+            let lo = guard.read_byte() as u16;
+            let hi = guard.read_byte() as u16;
+            lo | (hi << 8)
+        };
+        guard.transaction_end();
+        guard.write_byte(REG_KEY_FIFO);
+        let second = {
+            let lo = guard.read_byte() as u16;
+            let hi = guard.read_byte() as u16;
+            lo | (hi << 8)
+        };
+        guard.transaction_end();
+        guard.write_byte(REG_KEY_FIFO);
+        let third = {
+            let lo = guard.read_byte() as u16;
+            let hi = guard.read_byte() as u16;
+            lo | (hi << 8)
+        };
+        assert_eq!(first, (11u16 << 8) | KeyState::Pressed as u16);
+        assert_eq!(second, (22u16 << 8) | KeyState::Held as u16);
+        assert_eq!(third, (11u16 << 8) | KeyState::Released as u16);
     }
 
     #[test]
