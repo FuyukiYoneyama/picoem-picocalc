@@ -312,6 +312,27 @@ pub const UNSUPPORTED_MMIO_LOG_CAP: usize = 4096;
 /// `Some((pin, level))` to drive an input pin back.
 pub trait PinWatchingDevice: Send {
     fn tick(&mut self, gpio_out: u32) -> Option<(u8, bool)>;
+
+    /// Explicit OPT2-F opt-in. The default is deliberately fail-closed:
+    /// an unknown device must continue to observe every system cycle.
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn supports_constant_pin_bulk(&self) -> bool {
+        false
+    }
+
+    /// Observe `repetitions` identical consecutive pad samples.
+    ///
+    /// The exact default retains the reference semantics. Implementations
+    /// may collapse the loop only after opting in above and proving that
+    /// no autonomous time transition occurs between identical samples.
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn tick_constant_pins(&mut self, gpio_out: u32, repetitions: u32) -> Option<(u8, bool)> {
+        let mut driven = None;
+        for _ in 0..repetitions {
+            driven = self.tick(gpio_out);
+        }
+        driven
+    }
 }
 
 pub struct Bus {
@@ -2115,6 +2136,17 @@ impl Bus {
     #[inline]
     pub fn has_pin_watching_device(&self) -> bool {
         self.psram.is_some() || !self.pin_devices.is_empty()
+    }
+
+    /// True only when every device reached from `update_gpio` explicitly
+    /// accepts identical-sample bulk observation. Empty slots are safe.
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    pub(crate) fn supports_constant_pin_bulk(&self) -> bool {
+        self.pin_devices
+            .iter()
+            .all(|device| device.supports_constant_pin_bulk())
+            && self.spi0.supports_constant_pin_bulk()
+            && self.spi1.supports_constant_pin_bulk()
     }
 
     /// Collect the current DREQ (data-request) bitmap for all 64 TREQ

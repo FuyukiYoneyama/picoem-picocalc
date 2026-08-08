@@ -85,6 +85,20 @@ pub trait SpiExternalDevice: Send {
     /// Called once per [`SpiRegs::tick`], before the FIFO drain. Devices
     /// with no side-band pins can ignore it.
     fn observe_pins(&mut self, _gpio_out_levels: u32) {}
+
+    /// Explicit OPT2-F opt-in for collapsing identical side-band samples.
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn supports_constant_pin_bulk(&self) -> bool {
+        false
+    }
+
+    /// Exact fallback for devices which do not provide a closed form.
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn observe_constant_pins(&mut self, gpio_out_levels: u32, repetitions: u32) {
+        for _ in 0..repetitions {
+            self.observe_pins(gpio_out_levels);
+        }
+    }
 }
 
 /// Offset: `SSPCR0` — frame format / clock rate.
@@ -210,6 +224,20 @@ impl SpiRegs {
     pub fn observe_pins(&mut self, gpio_out_levels: u32) {
         if let Some(dev) = self.device.as_mut() {
             dev.observe_pins(gpio_out_levels);
+        }
+    }
+
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    pub(crate) fn supports_constant_pin_bulk(&self) -> bool {
+        self.device
+            .as_ref()
+            .is_none_or(|device| device.supports_constant_pin_bulk())
+    }
+
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    pub(crate) fn observe_constant_pins(&mut self, gpio_out_levels: u32, repetitions: u32) {
+        if let Some(device) = self.device.as_mut() {
+            device.observe_constant_pins(gpio_out_levels, repetitions);
         }
     }
 

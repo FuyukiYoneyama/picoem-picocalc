@@ -48,6 +48,9 @@ event-horizon-profiler = ["idle-profiler", "behavior-trace"]
 # Post-OPT2-D prototype: exact bulk advance while PIO is stationary on
 # an unresolved empty-TX pull stall.
 pio-exact-bulk-prototype = ["picoem-common/pio-exact-bulk-prototype"]
+# OPT2-F: combine the exact stationary-PIO advance with explicit,
+# fail-closed constant-pin device observation.
+stationary-pin-bulk-prototype = ["pio-exact-bulk-prototype"]
 # OPT0-B deterministic streaming event contract. Kept out of default
 # builds so the performance path contains neither a disabled branch nor a
 # hash state. The optional dependency exists only in diagnostic binaries.

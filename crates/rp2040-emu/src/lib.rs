@@ -217,6 +217,10 @@ pub struct PioExactBulkPrototypeAggregateSnapshot {
     pub calls: u64,
     pub system_cycles: u64,
     pub pio_ticks: u64,
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    pub outer_calls: u64,
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    pub update_gpio_calls_elided: u64,
 }
 
 /// Emulator configuration.
@@ -279,6 +283,11 @@ pub struct Emulator {
     /// PC moved this tick. Initialised to a sentinel `0xFF` so the
     /// very first observation always counts as an advance.
     pub(crate) pio0_sm0_last_pc: u8,
+    /// OPT2-F proof-of-use counters. Absent from normal builds.
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    stationary_pin_bulk_outer_calls: u64,
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    stationary_pin_bulk_update_gpio_calls_elided: u64,
     /// OPT0-A Serial idle profiler. Entirely absent from normal builds;
     /// diagnostic harnesses opt in through the `idle-profiler` feature.
     #[cfg(feature = "idle-profiler")]
@@ -468,6 +477,11 @@ impl Emulator {
         self.pio0_sm0_max_pc = 0;
         self.pio0_sm0_pc_advances = 0;
         self.pio0_sm0_last_pc = 0xFF;
+        #[cfg(feature = "stationary-pin-bulk-prototype")]
+        {
+            self.stationary_pin_bulk_outer_calls = 0;
+            self.stationary_pin_bulk_update_gpio_calls_elided = 0;
+        }
         #[cfg(feature = "idle-profiler")]
         if let Some(profiler) = self.idle_profiler.as_mut() {
             *profiler = idle_profile::IdleProfiler::default();
@@ -1048,9 +1062,36 @@ impl Emulator {
             // (see §5.4); the per-cycle case delivers at ≤1 cycle same as
             // the fast path, as a side effect of the finer granularity.
             if !pio_idle && consumed > 1 && self.bus.has_pin_watching_device() {
-                for _ in 0..consumed {
-                    self.tick_pio_and_route_irqs(1);
-                    self.update_gpio();
+                #[cfg(feature = "stationary-pin-bulk-prototype")]
+                {
+                    let stationary_pin_bulk = self.bus.pio.iter().any(|pio| pio.any_sm_enabled())
+                        && self
+                            .bus
+                            .pio
+                            .iter()
+                            .all(|pio| pio.supports_exact_pull_stall_bulk())
+                        && self.bus.supports_constant_pin_bulk();
+                    if stationary_pin_bulk {
+                        self.tick_pio_and_route_irqs(consumed as u32);
+                        self.update_gpio_constant_pins(consumed as u32);
+                        self.stationary_pin_bulk_outer_calls =
+                            self.stationary_pin_bulk_outer_calls.wrapping_add(1);
+                        self.stationary_pin_bulk_update_gpio_calls_elided = self
+                            .stationary_pin_bulk_update_gpio_calls_elided
+                            .wrapping_add(consumed.saturating_sub(1));
+                    } else {
+                        for _ in 0..consumed {
+                            self.tick_pio_and_route_irqs(1);
+                            self.update_gpio();
+                        }
+                    }
+                }
+                #[cfg(not(feature = "stationary-pin-bulk-prototype"))]
+                {
+                    for _ in 0..consumed {
+                        self.tick_pio_and_route_irqs(1);
+                        self.update_gpio();
+                    }
                 }
             } else {
                 self.tick_pio_and_route_irqs(consumed as u32);
@@ -1476,6 +1517,11 @@ impl Emulator {
             pio0_sm0_max_pc: self.pio0_sm0_max_pc,
             pio0_sm0_pc_advances: self.pio0_sm0_pc_advances,
             pio0_sm0_last_pc: self.pio0_sm0_last_pc,
+            #[cfg(feature = "stationary-pin-bulk-prototype")]
+            stationary_pin_bulk_outer_calls: self.stationary_pin_bulk_outer_calls,
+            #[cfg(feature = "stationary-pin-bulk-prototype")]
+            stationary_pin_bulk_update_gpio_calls_elided: self
+                .stationary_pin_bulk_update_gpio_calls_elided,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
             #[cfg(feature = "event-horizon-profiler")]
@@ -1572,6 +1618,46 @@ impl Emulator {
             let pads = self.bus.pad_out_levels();
             self.bus.spi0.observe_pins(pads);
             self.bus.spi1.observe_pins(pads);
+        }
+    }
+
+    /// OPT2-F equivalent of `repetitions` consecutive `update_gpio` calls
+    /// when PIO/SIO pads are stationary and every attached device has
+    /// explicitly opted into the identical-sample contract.
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn update_gpio_constant_pins(&mut self, repetitions: u32) {
+        debug_assert!(repetitions > 1);
+        debug_assert!(self.bus.supports_constant_pin_bulk());
+
+        let mut out = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
+        for pio in &self.bus.pio {
+            let pio_mask = pio.pad_oe;
+            out = (out & !pio_mask) | (pio.pad_out & pio_mask);
+        }
+        out &= 0x3FFF_FFFF;
+        if let Some(ref mut psram) = self.bus.psram
+            && let Some(miso) = psram.tick_constant_pins(out, repetitions)
+        {
+            let pin = psram.pin_miso();
+            let mask = 1u32 << pin;
+            out = (out & !mask) | ((miso as u32) << pin);
+        }
+        for device in &mut self.bus.pin_devices {
+            if let Some((pin, level)) = device.tick_constant_pins(out, repetitions) {
+                let mask = 1u32 << pin;
+                out = (out & !mask) | ((level as u32) << pin);
+            }
+        }
+        let ext_mask = self.bus.external_gpio_in_mask;
+        if ext_mask != 0 {
+            out = (out & !ext_mask) | (self.bus.external_gpio_in_override & ext_mask);
+        }
+        self.bus.gpio_in = out;
+
+        if self.bus.spi_has_device(0) || self.bus.spi_has_device(1) {
+            let pads = self.bus.pad_out_levels();
+            self.bus.spi0.observe_constant_pins(pads, repetitions);
+            self.bus.spi1.observe_constant_pins(pads, repetitions);
         }
     }
 
@@ -2058,6 +2144,10 @@ impl Emulator {
             calls: p0.calls.wrapping_add(p1.calls),
             system_cycles: p0.system_cycles.wrapping_add(p1.system_cycles),
             pio_ticks: p0.pio_ticks.wrapping_add(p1.pio_ticks),
+            #[cfg(feature = "stationary-pin-bulk-prototype")]
+            outer_calls: self.stationary_pin_bulk_outer_calls,
+            #[cfg(feature = "stationary-pin-bulk-prototype")]
+            update_gpio_calls_elided: self.stationary_pin_bulk_update_gpio_calls_elided,
         }
     }
 
@@ -2298,6 +2388,10 @@ impl EmulatorBuilder {
             pio0_sm0_max_pc: 0,
             pio0_sm0_pc_advances: 0,
             pio0_sm0_last_pc: 0xFF,
+            #[cfg(feature = "stationary-pin-bulk-prototype")]
+            stationary_pin_bulk_outer_calls: 0,
+            #[cfg(feature = "stationary-pin-bulk-prototype")]
+            stationary_pin_bulk_update_gpio_calls_elided: 0,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
             #[cfg(feature = "event-horizon-profiler")]

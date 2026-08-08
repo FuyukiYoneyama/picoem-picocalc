@@ -2678,6 +2678,16 @@ fn run() -> Result<Verdict, String> {
     #[cfg(feature = "pio-exact-bulk-prototype")]
     {
         let snapshot = emu.exact_bulk_prototype_snapshot();
+        #[cfg(feature = "stationary-pin-bulk-prototype")]
+        eprintln!(
+            "stationary-pin-bulk-prototype snapshot: outer_calls={} system_cycles={} update_gpio_calls_elided={} pio_block_calls={} pio_ticks={}",
+            snapshot.outer_calls,
+            snapshot.system_cycles,
+            snapshot.update_gpio_calls_elided,
+            snapshot.calls,
+            snapshot.pio_ticks
+        );
+        #[cfg(not(feature = "stationary-pin-bulk-prototype"))]
         eprintln!(
             "pio-exact-bulk-prototype snapshot: calls={} system_cycles={} pio_ticks={}",
             snapshot.calls, snapshot.system_cycles, snapshot.pio_ticks

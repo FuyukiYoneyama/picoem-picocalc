@@ -161,6 +161,19 @@ impl PinWatchingDevice for LcdPioWire {
         }
         Some((pins::PIN_MISO, self.miso_level))
     }
+
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn supports_constant_pin_bulk(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn tick_constant_pins(&mut self, gpio_out: u32, repetitions: u32) -> Option<(u8, bool)> {
+        if repetitions == 0 {
+            return None;
+        }
+        self.tick(gpio_out)
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +270,72 @@ mod tests {
         assert!(panel.lock().unwrap().in_reset());
         w.tick(IDLE);
         assert!(!panel.lock().unwrap().in_reset());
+    }
+
+    #[test]
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn tick_constant_ticks_once_after_priming() {
+        let (mut w_ref, panel_ref) = wire();
+        let (mut w_bulk, panel_bulk) = wire();
+
+        let bulk = &mut w_bulk as &mut dyn PinWatchingDevice;
+        assert!(bulk.supports_constant_pin_bulk());
+        assert_eq!(w_ref.tick(IDLE), bulk.tick_constant_pins(IDLE, 1));
+        send(&mut w_ref, RESET, crate::st7365p::CMD_DISPON);
+        send(&mut w_bulk, RESET, crate::st7365p::CMD_DISPON);
+        assert_eq!(
+            panel_ref.lock().unwrap().dispon_count,
+            panel_bulk.lock().unwrap().dispon_count
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn tick_constant_matches_reference_for_cs_rising_after_partial_byte() {
+        let (mut w_ref, panel_ref) = wire();
+        let (mut w_bulk, panel_bulk) = wire();
+
+        // Four bits into a partial byte with CS asserted.
+        for _ in 0..4 {
+            w_ref.tick(RESET | MOSI);
+            w_ref.tick(RESET | MOSI | SCK);
+
+            w_bulk.tick(RESET | MOSI);
+            w_bulk.tick(RESET | MOSI | SCK);
+        }
+
+        let mut ref_out = None;
+        for _ in 0..3 {
+            ref_out = w_ref.tick(IDLE);
+        }
+        let bulk = &mut w_bulk as &mut dyn PinWatchingDevice;
+        let bulk_out = bulk.tick_constant_pins(IDLE, 3);
+
+        assert_eq!(bulk_out, ref_out);
+        assert_eq!(w_ref.partial_bytes, w_bulk.partial_bytes);
+        assert_eq!(w_ref.bytes, w_bulk.bytes);
+        assert_eq!(
+            panel_ref.lock().unwrap().dispon_count,
+            panel_bulk.lock().unwrap().dispon_count
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn tick_constant_falling_then_repeated_rising_sck_sample_matches_reference() {
+        let (mut w_ref, _panel_ref) = wire();
+        let (mut w_bulk, _panel_bulk) = wire();
+
+        let pre = RESET | SCK;
+        w_ref.tick(pre);
+        w_bulk.tick(pre);
+
+        let mut ref_out = None;
+        for _ in 0..3 {
+            ref_out = w_ref.tick(RESET);
+        }
+        let bulk = &mut w_bulk as &mut dyn PinWatchingDevice;
+        let bulk_out = bulk.tick_constant_pins(RESET, 3);
+        assert_eq!(bulk_out, ref_out);
     }
 }

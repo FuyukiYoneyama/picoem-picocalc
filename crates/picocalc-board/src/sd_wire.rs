@@ -54,11 +54,28 @@ impl SpiExternalDevice for SdCardWire {
         }
         self.cs_high = cs;
     }
+
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn supports_constant_pin_bulk(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn observe_constant_pins(&mut self, gpio_out_levels: u32, repetitions: u32) {
+        if repetitions == 0 {
+            return;
+        }
+        self.observe_pins(gpio_out_levels);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn pin_level(cs: bool) -> u32 {
+        (cs as u32) << SD_PIN_CS
+    }
 
     fn wire() -> (SdCardWire, Arc<Mutex<SdCard>>) {
         // Wire-protocol tests need only a few blocks; use the compact
@@ -199,5 +216,55 @@ mod tests {
         let (mut w, card) = wire();
         let _ = command(&mut w, 62, 0);
         assert_eq!(card.lock().unwrap().unknown_commands, vec![(62, 1)]);
+    }
+
+    #[test]
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn observe_constant_pins_is_one_observe_when_supported() {
+        let (mut w, card) = wire();
+        w.observe_pins(pin_level(false)); // select
+        {
+            let device = &mut w as &mut dyn SpiExternalDevice;
+            assert!(device.supports_constant_pin_bulk());
+            device.observe_constant_pins(pin_level(true), 3);
+        }
+        assert_eq!(card.lock().unwrap().commands_seen, 0);
+        {
+            let device = &mut w as &mut dyn SpiExternalDevice;
+            device.observe_constant_pins(pin_level(false), 0);
+        }
+        assert_eq!(card.lock().unwrap().commands_seen, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "stationary-pin-bulk-prototype")]
+    fn observe_constant_observe_control_edge_matches_reference() {
+        let (mut wire_ref, card_ref) = wire();
+        let (mut wire_bulk, card_bulk) = wire();
+
+        wire_ref.observe_pins(pin_level(false));
+        wire_bulk.observe_pins(pin_level(false));
+
+        // Start a command in progress, then raise CS while keeping it
+        // raised for subsequent repeated observe calls.
+        wire_ref.transfer(0x40, 8);
+        wire_bulk.transfer(0x40, 8);
+
+        wire_ref.observe_pins(pin_level(true));
+        wire_ref.observe_pins(pin_level(true));
+        wire_ref.observe_pins(pin_level(true));
+
+        {
+            let bulk = &mut wire_bulk as &mut dyn SpiExternalDevice;
+            bulk.observe_constant_pins(pin_level(true), 3);
+        }
+
+        let ref_r1 = r1(&command(&mut wire_ref, 0, 0));
+        let bulk_r1 = r1(&command(&mut wire_bulk, 0, 0));
+        assert_eq!(ref_r1, bulk_r1);
+        assert_eq!(
+            card_ref.lock().unwrap().commands_seen,
+            card_bulk.lock().unwrap().commands_seen
+        );
     }
 }

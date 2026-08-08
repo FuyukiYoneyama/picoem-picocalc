@@ -482,6 +482,16 @@ impl PioBlock {
         true
     }
 
+    /// OPT2-F gate: every enabled SM is already stationary on an
+    /// unresolved empty-TX `PULL`. A block with no enabled SM is harmless
+    /// and is accepted here; the caller must require at least one enabled
+    /// SM across all blocks before selecting a bulk path.
+    #[cfg(feature = "pio-exact-bulk-prototype")]
+    #[inline]
+    pub fn supports_exact_pull_stall_bulk(&self) -> bool {
+        self.is_exact_bulk_pull_stall_candidate()
+    }
+
     #[inline]
     fn local_gpio_window(&self, gpio_pins: u64) -> u32 {
         ((gpio_pins >> self.gpio_base) & 0xFFFF_FFFF) as u32
