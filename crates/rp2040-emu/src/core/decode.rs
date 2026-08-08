@@ -179,11 +179,20 @@ impl CortexM0Plus {
         } else {
             None
         };
+        #[cfg(feature = "event-horizon-profiler")]
+        let hit = entry.is_some();
 
         let entry = match entry {
             Some(e) => e,
             None => self.populate_decode_cache(bus, pc),
         };
+        #[cfg(feature = "event-horizon-profiler")]
+        {
+            let cacheable = is_cacheable_pc(pc);
+            let entry_width_bytes = if entry.is_wide() { 4 } else { 2 };
+            self.decode_profile
+                .record_decode_lookup(pc, entry_width_bytes, cacheable, hit);
+        }
 
         let hw0 = entry.hw0;
         let hw1 = entry.hw1;
@@ -699,4 +708,94 @@ mod classifier_tests {
     /// FNV-1a 64-bit hash of `classify_thumb16_misc_pure` over the
     /// 16 misc sub-ops (canonical prefix 1011_0).
     const MISC_PURE_FINGERPRINT: u64 = 0x08fb8e07b596aaac;
+}
+
+#[cfg(all(test, feature = "event-horizon-profiler"))]
+mod decode_profile_tests {
+    use super::*;
+    use crate::bus::Bus;
+
+    fn run_decode_at(core: &mut CortexM0Plus, bus: &mut Bus, pc: u32) {
+        core.regs.set_pc(pc);
+        core.decode_execute(bus);
+    }
+
+    #[test]
+    fn decode_profile_records_first_miss_then_hit() {
+        let mut core = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        const PC: u32 = 0x2000_0000;
+
+        bus.write16(PC, 0xBF00); // NOP
+        run_decode_at(&mut core, &mut bus, PC);
+        run_decode_at(&mut core, &mut bus, PC);
+
+        let profile = core.decode_profile_snapshot();
+        assert_eq!(profile.cacheable_hits, 1);
+        assert_eq!(profile.cacheable_misses, 1);
+        assert_eq!(profile.noncacheable_fetches, 0);
+        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[0], 1);
+        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[0], 1);
+    }
+
+    #[test]
+    fn decode_profile_sequential_cache_hit_runs_are_cumulative() {
+        let mut core = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        const PC0: u32 = 0x2000_0000;
+
+        bus.write16(PC0, 0xBF00);
+        bus.write16(PC0 + 2, 0xBF00);
+        bus.write16(PC0 + 4, 0xBF00);
+
+        // Prime cache: first pass misses.
+        run_decode_at(&mut core, &mut bus, PC0);
+        run_decode_at(&mut core, &mut bus, PC0 + 2);
+        run_decode_at(&mut core, &mut bus, PC0 + 4);
+        // Second pass: a three-instruction sequential hit run.
+        run_decode_at(&mut core, &mut bus, PC0);
+        run_decode_at(&mut core, &mut bus, PC0 + 2);
+        run_decode_at(&mut core, &mut bus, PC0 + 4);
+
+        let profile = core.decode_profile_snapshot();
+        assert_eq!(profile.cacheable_hits, 3);
+        assert_eq!(profile.cacheable_misses, 3);
+        assert_eq!(profile.noncacheable_fetches, 0);
+        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[0], 1);
+        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[1], 1);
+        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[0], 3);
+        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[1], 3);
+    }
+
+    #[test]
+    fn decode_profile_closes_hit_run_on_nonsequential_pc() {
+        let mut core = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        const PC0: u32 = 0x2000_0010;
+        const PC1: u32 = PC0 + 2;
+        const PC2: u32 = PC0 + 8;
+
+        bus.write16(PC0, 0xBF00);
+        bus.write16(PC1, 0xBF00);
+        bus.write16(PC2, 0xBF00);
+
+        // Prime cache.
+        run_decode_at(&mut core, &mut bus, PC0);
+        run_decode_at(&mut core, &mut bus, PC1);
+        run_decode_at(&mut core, &mut bus, PC2);
+        // Hit run of length 2 then non-sequential hit of length 1.
+        run_decode_at(&mut core, &mut bus, PC0);
+        run_decode_at(&mut core, &mut bus, PC1);
+        run_decode_at(&mut core, &mut bus, PC2);
+
+        let profile = core.decode_profile_snapshot();
+        assert_eq!(profile.cacheable_hits, 3);
+        assert_eq!(profile.cacheable_misses, 3);
+        assert_eq!(profile.noncacheable_fetches, 0);
+        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[0], 2);
+        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[1], 1);
+        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[2], 0);
+        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[0], 3);
+        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[1], 2);
+    }
 }

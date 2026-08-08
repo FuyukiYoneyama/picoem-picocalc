@@ -38,8 +38,9 @@ pub use idle_profile::{
 
 #[cfg(feature = "event-horizon-profiler")]
 pub use running_profile::{
+    DecodeProfileSnapshot, ONE_CYCLE_FALLBACK_SIGNATURE_BUCKETS,
     RUNNING_EVENT_PROFILE_SCHEMA_VERSION, RunningBoundaryEvents, RunningBoundaryMask,
-    RunningBoundarySnapshot,
+    RunningBoundarySnapshot, RunningEventProfileSnapshot,
 };
 
 #[cfg(feature = "behavior-trace")]
@@ -2009,7 +2010,7 @@ impl Emulator {
         bits
     }
 
-    /// Enable and reset the OPT2-B running event-horizon opportunity
+    /// Enable and reset the OPT2-D running event-horizon/decode opportunity
     /// profiler. This diagnostic is Serial-only and is intentionally
     /// separate from the wall-time measurement binary.
     #[cfg(feature = "event-horizon-profiler")]
@@ -2018,15 +2019,24 @@ impl Emulator {
             return Err(EmulatorError::NotSupportedInThreadedMode);
         }
         self.running_profiler = Some(running_profile::RunningProfile::default());
+        for core in &mut self.cores {
+            core.reset_decode_profile();
+        }
         Ok(())
     }
 
-    /// Snapshot OPT2-B aggregate counters without mutating the open interval.
+    /// Snapshot OPT2-D aggregate counters without mutating open intervals.
     #[cfg(feature = "event-horizon-profiler")]
-    pub fn running_event_profile_snapshot(&self) -> Option<RunningBoundarySnapshot> {
+    pub fn running_event_profile_snapshot(&self) -> Option<RunningEventProfileSnapshot> {
         self.running_profiler
             .as_ref()
-            .map(running_profile::RunningProfile::snapshot)
+            .map(|profile| RunningEventProfileSnapshot {
+                boundary: profile.snapshot(),
+                decode_by_core: [
+                    self.cores[0].decode_profile_snapshot(),
+                    self.cores[1].decode_profile_snapshot(),
+                ],
+            })
     }
 
     /// Enable and reset the diagnostic Serial idle profiler.

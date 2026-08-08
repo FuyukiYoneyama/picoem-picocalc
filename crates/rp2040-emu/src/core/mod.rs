@@ -80,6 +80,9 @@ pub struct CortexM0Plus {
     /// [`Self::invalidate_decode_cache_all`] (everything). Modelled on
     /// the rp2350_emu per-core cache (commit `0c31479`).
     pub(crate) decode_cache: Box<[crate::bus::DecodedOp; crate::bus::DECODE_CACHE_SIZE]>,
+    /// Decode-cache hit/miss profiler state (feature gated).
+    #[cfg(feature = "event-horizon-profiler")]
+    pub(crate) decode_profile: crate::running_profile::DecodeProfile,
 }
 
 impl CortexM0Plus {
@@ -105,6 +108,8 @@ impl CortexM0Plus {
             pending_fault: None,
             halted: false,
             decode_cache,
+            #[cfg(feature = "event-horizon-profiler")]
+            decode_profile: crate::running_profile::DecodeProfile::default(),
         }
     }
 
@@ -203,6 +208,17 @@ impl CortexM0Plus {
     /// drive fault entry from this flag.
     pub fn has_pending_fault(&self) -> bool {
         self.pending_fault.is_some()
+    }
+
+    /// Snapshot decode-cache reuse counters for OPT2-D profiling.
+    #[cfg(feature = "event-horizon-profiler")]
+    pub fn decode_profile_snapshot(&self) -> crate::running_profile::DecodeProfileSnapshot {
+        self.decode_profile.snapshot()
+    }
+
+    #[cfg(feature = "event-horizon-profiler")]
+    pub(crate) fn reset_decode_profile(&mut self) {
+        self.decode_profile = crate::running_profile::DecodeProfile::default();
     }
 
     /// True iff the CPU is currently executing the HardFault handler,

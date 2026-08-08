@@ -48,7 +48,8 @@ use rp2040_emu::{
 };
 #[cfg(feature = "event-horizon-profiler")]
 use rp2040_emu::{
-    RUNNING_EVENT_PROFILE_SCHEMA_VERSION, RunningBoundaryEvents, RunningBoundarySnapshot,
+    DecodeProfileSnapshot, RUNNING_EVENT_PROFILE_SCHEMA_VERSION, RunningBoundaryEvents,
+    RunningEventProfileSnapshot,
 };
 
 mod scenario;
@@ -1365,6 +1366,20 @@ fn running_boundary_events_json(value: &RunningBoundaryEvents) -> String {
 }
 
 #[cfg(feature = "event-horizon-profiler")]
+fn decode_profile_json(value: &DecodeProfileSnapshot) -> String {
+    format!(
+        concat!(
+            "{{\"cacheable_hits\": {}, \"cacheable_misses\": {}, ",
+            "\"noncacheable_fetches\": {}, \"sequential_cache_hit_runs\": {}}}"
+        ),
+        value.cacheable_hits,
+        value.cacheable_misses,
+        value.noncacheable_fetches,
+        histogram_json(&value.sequential_cache_hit_runs),
+    )
+}
+
+#[cfg(feature = "event-horizon-profiler")]
 #[allow(clippy::too_many_arguments)]
 fn build_running_event_profile_report(
     backend_commit: &str,
@@ -1373,8 +1388,9 @@ fn build_running_event_profile_report(
     firmware_sha: &str,
     step_quantum: u32,
     outcome: &RunOutcome,
-    profile: &RunningBoundarySnapshot,
+    profile: &RunningEventProfileSnapshot,
 ) -> String {
+    let boundary = &profile.boundary;
     let thresholds: [u64; IDLE_HISTOGRAM_BUCKETS] = std::array::from_fn(|i| 1u64 << i);
     format!(
         concat!(
@@ -1387,6 +1403,8 @@ fn build_running_event_profile_report(
             "  \"instrumented\": true,\n",
             "  \"valid_for_wall_time\": false,\n",
             "  \"observed_gaps_are_safe_windows\": false,\n",
+            "  \"fallback_occupancy_is_safe_window\": false,\n",
+            "  \"decode_hit_runs_are_speedup_prediction\": false,\n",
             "  \"conservative_horizon_complete_for_current_model\": true,\n",
             "  \"step_quantum\": {},\n",
             "  \"stop_reason\": {},\n",
@@ -1402,7 +1420,14 @@ fn build_running_event_profile_report(
             "  \"observed_candidate_cycles\": {},\n",
             "  \"conservative_horizon_distances\": {},\n",
             "  \"boundary_events\": {},\n",
-            "  \"one_cycle_fallback_cycles\": {}\n",
+            "  \"one_cycle_fallback_cycles\": {},\n",
+            "  \"one_cycle_fallback_signatures\": {{\"bit_order\": ",
+            "[\"pio\", \"uart\", \"dma\", \"any_other\"], ",
+            "\"steps\": [{}], \"cycle_mass\": [{}]}},\n",
+            "  \"decode_opportunity_by_core\": [\n",
+            "    {},\n",
+            "    {}\n",
+            "  ]\n",
             "}}\n"
         ),
         RUNNING_EVENT_PROFILE_SCHEMA_VERSION,
@@ -1414,20 +1439,24 @@ fn build_running_event_profile_report(
         json_string(outcome.stop_reason.as_str()),
         outcome.cycles,
         u64_json_array(&thresholds),
-        profile.running_steps,
-        profile.total_running_cycles,
-        profile.boundary_steps,
-        profile.no_known_horizon_steps,
-        profile.no_known_horizon_cycles,
-        profile.candidate_dispatches,
-        profile.candidate_cycles,
-        histogram_json(&profile.observed_inter_boundary_dispatches),
-        histogram_json(&profile.observed_inter_boundary_cycles),
-        histogram_json(&profile.observed_candidate_dispatches),
-        histogram_json(&profile.observed_candidate_cycles),
-        histogram_json(&profile.conservative_horizon_distances),
-        running_boundary_events_json(&profile.boundary_events),
-        horizon_events_json(&profile.one_cycle_fallback_cycles),
+        boundary.running_steps,
+        boundary.total_running_cycles,
+        boundary.boundary_steps,
+        boundary.no_known_horizon_steps,
+        boundary.no_known_horizon_cycles,
+        boundary.candidate_dispatches,
+        boundary.candidate_cycles,
+        histogram_json(&boundary.observed_inter_boundary_dispatches),
+        histogram_json(&boundary.observed_inter_boundary_cycles),
+        histogram_json(&boundary.observed_candidate_dispatches),
+        histogram_json(&boundary.observed_candidate_cycles),
+        histogram_json(&boundary.conservative_horizon_distances),
+        running_boundary_events_json(&boundary.boundary_events),
+        horizon_events_json(&boundary.one_cycle_fallback_cycles),
+        u64_json_array(&boundary.one_cycle_fallback_signatures.steps),
+        u64_json_array(&boundary.one_cycle_fallback_signatures.cycle_mass),
+        decode_profile_json(&profile.decode_by_core[0]),
+        decode_profile_json(&profile.decode_by_core[1]),
     )
 }
 
@@ -2682,7 +2711,7 @@ mod tests {
     #[cfg(feature = "event-horizon-profiler")]
     use super::build_running_event_profile_report;
     #[cfg(feature = "event-horizon-profiler")]
-    use rp2040_emu::RunningBoundarySnapshot;
+    use rp2040_emu::RunningEventProfileSnapshot;
     #[cfg(feature = "behavior-trace")]
     use rp2040_emu::{BehaviorEventDomain, BehaviorTraceDomainSnapshot, BehaviorTraceSnapshot};
 
@@ -3022,18 +3051,23 @@ mod tests {
     #[cfg(feature = "event-horizon-profiler")]
     #[test]
     fn running_event_profile_report_is_deterministic_valid_json() {
-        let mut profile = RunningBoundarySnapshot {
-            running_steps: 7,
-            total_running_cycles: 12,
-            boundary_steps: 3,
-            candidate_dispatches: 5,
-            candidate_cycles: 9,
-            ..RunningBoundarySnapshot::default()
-        };
-        profile.boundary_events.cpu_mmio = 2;
-        profile.one_cycle_fallback_cycles.pio = 8;
-        profile.observed_candidate_dispatches.episodes_ge[1] = 1;
-        profile.observed_candidate_dispatches.cycle_mass_ge[1] = 5;
+        let mut profile = RunningEventProfileSnapshot::default();
+        profile.boundary.running_steps = 7;
+        profile.boundary.total_running_cycles = 12;
+        profile.boundary.boundary_steps = 3;
+        profile.boundary.candidate_dispatches = 5;
+        profile.boundary.candidate_cycles = 9;
+        profile.boundary.boundary_events.cpu_mmio = 2;
+        profile.boundary.one_cycle_fallback_cycles.pio = 8;
+        profile.boundary.one_cycle_fallback_signatures.steps[1] = 4;
+        profile.boundary.one_cycle_fallback_signatures.cycle_mass[1] = 8;
+        profile.boundary.observed_candidate_dispatches.episodes_ge[1] = 1;
+        profile.boundary.observed_candidate_dispatches.cycle_mass_ge[1] = 5;
+        profile.decode_by_core[0].cacheable_hits = 11;
+        profile.decode_by_core[0].cacheable_misses = 2;
+        profile.decode_by_core[0]
+            .sequential_cache_hit_runs
+            .episodes_ge[2] = 3;
         let run = outcome(StopReason::ScenarioDone, b"");
         let report = build_running_event_profile_report(
             "0123456789012345678901234567890123456789",
@@ -3050,11 +3084,23 @@ mod tests {
             "rp2040_serial_running_event_horizon_profile"
         );
         assert_eq!(parsed["observed_gaps_are_safe_windows"], false);
+        assert_eq!(parsed["fallback_occupancy_is_safe_window"], false);
+        assert_eq!(parsed["decode_hit_runs_are_speedup_prediction"], false);
         assert_eq!(parsed["counters"]["running_steps"], 7);
         assert_eq!(parsed["counters"]["candidate_dispatches"], 5);
         assert_eq!(parsed["counters"]["candidate_cycles"], 9);
         assert_eq!(parsed["boundary_events"]["cpu_mmio"], 2);
         assert_eq!(parsed["one_cycle_fallback_cycles"]["pio"], 8);
+        assert_eq!(parsed["one_cycle_fallback_signatures"]["steps"][1], 4);
+        assert_eq!(parsed["one_cycle_fallback_signatures"]["cycle_mass"][1], 8);
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["cacheable_hits"],
+            11
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["sequential_cache_hit_runs"]["episodes_ge"][2],
+            3
+        );
         assert_eq!(
             parsed["observed_candidate_dispatches"]["cycle_mass_ge"][1],
             5

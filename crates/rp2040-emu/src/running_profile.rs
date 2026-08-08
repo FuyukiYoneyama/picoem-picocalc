@@ -8,7 +8,20 @@ use crate::idle_profile::{
     CumulativeHistogramSnapshot, IdleEventHorizonProbe, IdleEventSourceMask, IdleHorizonEvents,
 };
 
-pub const RUNNING_EVENT_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const RUNNING_EVENT_PROFILE_SCHEMA_VERSION: u32 = 2;
+pub const ONE_CYCLE_FALLBACK_SIGNATURE_BUCKETS: usize = 16;
+
+/// Signature buckets for one-cycle fallback-source overlap recording.
+///
+/// Bit `0` is PIO, `1` is UART, `2` is DMA, and `3` is "any other"
+/// source that appears in [`IdleEventSourceMask`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OneCycleFallbackSignatureHistogram {
+    /// Number of one-cycle fallback events by source signature.
+    pub steps: [u64; ONE_CYCLE_FALLBACK_SIGNATURE_BUCKETS],
+    /// Total cycles charged to those one-cycle fallback events by signature.
+    pub cycle_mass: [u64; ONE_CYCLE_FALLBACK_SIGNATURE_BUCKETS],
+}
 
 /// Bitset describing what terminated the current observed running interval.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -80,6 +93,9 @@ pub struct RunningBoundarySnapshot {
     pub boundary_events: RunningBoundaryEvents,
     /// Cycles charged to each source when `horizon.distance_cycles == Some(1)`.
     pub one_cycle_fallback_cycles: IdleHorizonEvents,
+    /// One-cycle fallback overlap signatures keyed by `{PIO, UART, DMA, ANY_OTHER}`
+    /// source bits.
+    pub one_cycle_fallback_signatures: OneCycleFallbackSignatureHistogram,
 }
 
 /// Overlapping boundary counts by observed cause.
@@ -123,6 +139,43 @@ struct RunningProfileState {
     conservative_horizon_distances: CumulativeHistogramSnapshot,
     boundary_events: RunningBoundaryEvents,
     one_cycle_fallback_cycles: IdleHorizonEvents,
+    one_cycle_fallback_signatures: OneCycleFallbackSignatureHistogram,
+}
+
+/// Decode-cache lookup opportunities while stepping.
+#[derive(Clone, Debug, Default)]
+pub struct DecodeProfile {
+    state: DecodeProfileState,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DecodeProfileState {
+    cacheable_hits: u64,
+    cacheable_misses: u64,
+    noncacheable_fetches: u64,
+    sequential_cache_hit_runs: CumulativeHistogramSnapshot,
+    open_hit_run_instructions: u64,
+    open_hit_run_next_pc: Option<u32>,
+}
+
+/// Snapshot of decode-cache reuse behavior.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecodeProfileSnapshot {
+    pub cacheable_hits: u64,
+    pub cacheable_misses: u64,
+    pub noncacheable_fetches: u64,
+    pub sequential_cache_hit_runs: CumulativeHistogramSnapshot,
+}
+
+/// Complete OPT2-D opportunity snapshot.
+///
+/// Peripheral fallback occupancy and CPU decode reuse are deliberately kept
+/// side by side: both are diagnostic upper-bound inputs, not proofs that the
+/// corresponding work can be skipped safely.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunningEventProfileSnapshot {
+    pub boundary: RunningBoundarySnapshot,
+    pub decode_by_core: [DecodeProfileSnapshot; 2],
 }
 
 impl RunningProfile {
@@ -155,6 +208,12 @@ impl RunningProfile {
                     cycles,
                     horizon_probe.one_cycle_fallback_sources,
                 );
+                if horizon_probe.one_cycle_fallback_sources.bits() != 0 {
+                    self.accumulate_one_cycle_fallback_signatures(
+                        cycles,
+                        horizon_probe.one_cycle_fallback_sources,
+                    );
+                }
             }
         } else {
             self.state.no_known_horizon_steps = self.state.no_known_horizon_steps.saturating_add(1);
@@ -212,6 +271,7 @@ impl RunningProfile {
             conservative_horizon_distances: copy.state.conservative_horizon_distances,
             boundary_events: copy.state.boundary_events,
             one_cycle_fallback_cycles: copy.state.one_cycle_fallback_cycles,
+            one_cycle_fallback_signatures: copy.state.one_cycle_fallback_signatures,
         }
     }
 
@@ -292,6 +352,39 @@ impl RunningProfile {
         }
     }
 
+    fn accumulate_one_cycle_fallback_signatures(
+        &mut self,
+        cycles: u64,
+        sources: IdleEventSourceMask,
+    ) {
+        let mut signature = 0u8;
+        if sources.contains(IdleEventSourceMask::PIO) {
+            signature |= 1;
+        }
+        if sources.contains(IdleEventSourceMask::UART) {
+            signature |= 1 << 1;
+        }
+        if sources.contains(IdleEventSourceMask::DMA) {
+            signature |= 1 << 2;
+        }
+
+        let any_other = sources.bits()
+            & !(IdleEventSourceMask::PIO | IdleEventSourceMask::UART | IdleEventSourceMask::DMA);
+        if any_other != 0 {
+            signature |= 1 << 3;
+        }
+
+        if signature == 0 {
+            return;
+        }
+
+        let i = signature as usize;
+        self.state.one_cycle_fallback_signatures.steps[i] =
+            self.state.one_cycle_fallback_signatures.steps[i].saturating_add(1);
+        self.state.one_cycle_fallback_signatures.cycle_mass[i] =
+            self.state.one_cycle_fallback_signatures.cycle_mass[i].saturating_add(cycles);
+    }
+
     fn accumulate_one_cycle_fallback(&mut self, cycles: u64, fallback_mask: IdleEventSourceMask) {
         if fallback_mask.contains(IdleEventSourceMask::PIO) {
             self.state.one_cycle_fallback_cycles.pio = self
@@ -370,6 +463,69 @@ impl RunningProfile {
                 .external
                 .saturating_add(cycles);
         }
+    }
+}
+
+impl DecodeProfile {
+    /// Record a decode cache lookup.
+    ///
+    /// `entry_width_bytes` is 2 for narrow and 4 for wide lookups and is
+    /// used to determine whether a hit continues a sequential run.
+    pub fn record_decode_lookup(
+        &mut self,
+        pc: u32,
+        entry_width_bytes: u32,
+        cacheable: bool,
+        hit: bool,
+    ) {
+        if cacheable && hit {
+            self.state.cacheable_hits = self.state.cacheable_hits.saturating_add(1);
+            if self.state.open_hit_run_instructions == 0 {
+                self.state.open_hit_run_instructions = 1;
+            } else if self.state.open_hit_run_next_pc == Some(pc) {
+                self.state.open_hit_run_instructions =
+                    self.state.open_hit_run_instructions.saturating_add(1);
+            } else {
+                self.close_hit_run();
+                self.state.open_hit_run_instructions = 1;
+            }
+            self.state.open_hit_run_next_pc = Some(pc.wrapping_add(entry_width_bytes));
+            return;
+        }
+
+        if cacheable {
+            self.state.cacheable_misses = self.state.cacheable_misses.saturating_add(1);
+        } else {
+            self.state.noncacheable_fetches = self.state.noncacheable_fetches.saturating_add(1);
+        }
+        self.close_hit_run();
+        self.state.open_hit_run_next_pc = None;
+    }
+
+    /// Flush decode-profile counters into a snapshot.
+    ///
+    /// This closes any open run in a clone so callers can snapshot at any
+    /// time without mutating profiler state.
+    pub fn snapshot(&self) -> DecodeProfileSnapshot {
+        let mut copy = self.clone();
+        copy.close_hit_run();
+        DecodeProfileSnapshot {
+            cacheable_hits: copy.state.cacheable_hits,
+            cacheable_misses: copy.state.cacheable_misses,
+            noncacheable_fetches: copy.state.noncacheable_fetches,
+            sequential_cache_hit_runs: copy.state.sequential_cache_hit_runs,
+        }
+    }
+
+    fn close_hit_run(&mut self) {
+        if self.state.open_hit_run_instructions == 0 {
+            return;
+        }
+        self.state
+            .sequential_cache_hit_runs
+            .record(self.state.open_hit_run_instructions);
+        self.state.open_hit_run_instructions = 0;
+        self.state.open_hit_run_next_pc = None;
     }
 }
 
@@ -461,6 +617,30 @@ mod tests {
         assert_eq!(snap.observed_inter_boundary_cycles.episodes_ge[0], 1);
         assert_eq!(snap.observed_inter_boundary_cycles.cycle_mass_ge[0], 4);
         assert_eq!(snap.observed_candidate_cycles.episodes_ge[0], 0);
+    }
+
+    #[test]
+    fn one_cycle_fallback_signatures_track_overlap() {
+        let mut p = RunningProfile::default();
+        let signature = IdleEventSourceMask::from_bits(
+            IdleEventSourceMask::PIO
+                | IdleEventSourceMask::UART
+                | IdleEventSourceMask::DMA
+                | IdleEventSourceMask::PWM,
+        );
+        p.record_running(
+            4,
+            RunningBoundaryMask::from_bits(0),
+            horizon(1, signature.bits()),
+        );
+
+        let snap = p.snapshot();
+        assert_eq!(snap.one_cycle_fallback_signatures.steps[0b1111], 1);
+        assert_eq!(snap.one_cycle_fallback_signatures.cycle_mass[0b1111], 4);
+        assert_eq!(snap.one_cycle_fallback_cycles.pio, 4);
+        assert_eq!(snap.one_cycle_fallback_cycles.uart, 4);
+        assert_eq!(snap.one_cycle_fallback_cycles.dma, 4);
+        assert_eq!(snap.one_cycle_fallback_cycles.pwm, 4);
     }
 
     #[test]
