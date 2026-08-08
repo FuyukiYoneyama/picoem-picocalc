@@ -134,6 +134,9 @@ const QUANTUM_PSRAM: u32 = 1;
 /// Draining is cheap (a `mem::take` of a `Vec`), but not free at one
 /// call per cycle.
 const UART_DRAIN_INTERVAL: u64 = 256;
+/// Batch only the harness dispatch loop; core/single-quantum execution
+/// semantics remain unchanged (hardware quantum stays 1 for this path).
+const EXACT_DISPATCH_BATCH_CYCLES: u64 = 64;
 
 /// Backend commit, embedded at build time when the environment
 /// provides it (`PICOEM_BACKEND_COMMIT=$(git rev-parse HEAD) cargo
@@ -1068,7 +1071,12 @@ fn run_loop(
         }
 
         let external_event_cycle = next_poll_cycles.min(cycle_limit);
-        let consumed = match emu.step_until(external_event_cycle) {
+        let consumed = if stop_pc.is_some() {
+            emu.step_until(external_event_cycle)
+        } else {
+            emu.step_until_batched(external_event_cycle, EXACT_DISPATCH_BATCH_CYCLES)
+        };
+        let consumed = match consumed {
             Ok(c) => c,
             Err(e) => {
                 let msg = e.to_string();
