@@ -946,11 +946,10 @@ impl Emulator {
         //
         // HLD V7 §5.5 broadens the gate from "PIO idle" to "PIO idle
         // AND peripherals (including DMA) idle AND no IRQ pending".
-        // Phase 1 peripherals are all lazy (TIMER/WATCHDOG_TICK), and
-        // DMA is a Phase 1 always-idle stub, so in practice the gate
-        // still reduces to the PIO check — but the extra conditions
-        // are in place so later phases don't need to reopen this
-        // site.
+        // TIMER/WATCHDOG_TICK are lazy. DMA and the other stateful
+        // peripherals remain part of `all_peripherals_idle()`; the
+        // short-circuit below only avoids evaluating them after active
+        // PIO has already made the slow path mandatory.
         let pio_idle = self.bus.pio_all_idle();
         // SysTick fires by ORing into `bus.ppb[active].icsr` — NOT by
         // setting `bus.irq_pending` — so the IRQ check below does
