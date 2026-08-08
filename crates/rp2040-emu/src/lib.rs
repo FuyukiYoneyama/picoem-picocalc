@@ -211,14 +211,6 @@ pub use picoem_common::{Clock, PacerSnapshot, PacerStats};
 /// firmware.
 pub use picoem_common::ROSC_FREQ_HZ;
 
-#[cfg(feature = "pio-exact-bulk-prototype")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PioExactBulkPrototypeAggregateSnapshot {
-    pub calls: u64,
-    pub system_cycles: u64,
-    pub pio_ticks: u64,
-}
-
 /// Emulator configuration.
 pub struct Config {
     /// System clock frequency in Hz. Default: ROSC (~6.5 MHz).
@@ -2045,20 +2037,6 @@ impl Emulator {
                     self.cores[1].decode_profile_snapshot(),
                 ],
             })
-    }
-
-    /// Snapshot aggregate PIO exact bulk-advance counters across both PIO
-    /// blocks. Useful for coarse `picocalc-harness` diagnostics.
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    pub fn exact_bulk_prototype_snapshot(&self) -> PioExactBulkPrototypeAggregateSnapshot {
-        self.assert_not_placeholder();
-        let p0 = self.bus.pio[0].exact_bulk_prototype_snapshot();
-        let p1 = self.bus.pio[1].exact_bulk_prototype_snapshot();
-        PioExactBulkPrototypeAggregateSnapshot {
-            calls: p0.calls.wrapping_add(p1.calls),
-            system_cycles: p0.system_cycles.wrapping_add(p1.system_cycles),
-            pio_ticks: p0.pio_ticks.wrapping_add(p1.pio_ticks),
-        }
     }
 
     /// Enable and reset the diagnostic Serial idle profiler.

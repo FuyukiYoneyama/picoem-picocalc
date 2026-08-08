@@ -8,15 +8,6 @@ use sm::{StallKind, StateMachine};
 /// `FDEBUG_TXSTALL_LSB + n`.
 const FDEBUG_TXSTALL_LSB: u32 = 24;
 
-/// Exact pull-stall bulk-advance prototype counters.
-#[cfg(feature = "pio-exact-bulk-prototype")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PioExactBulkPrototypeSnapshot {
-    pub calls: u64,
-    pub system_cycles: u64,
-    pub pio_ticks: u64,
-}
-
 /// One PIO block (RP2350 has three: PIO0, PIO1, PIO2).
 pub struct PioBlock {
     /// Per-SM state. `StateMachine` fields are `pub(crate)` — invariants
@@ -34,12 +25,6 @@ pub struct PioBlock {
     /// Shared pad direction latch — OUT/SET/MOV PINDIRS from any SM writes
     /// here. Reset to 0 (all pins input). Side-set can overlay on top.
     pub(crate) shared_pin_dirs: u32,
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    pio_exact_bulk_calls: u64,
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    pio_exact_bulk_system_cycles: u64,
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    pio_exact_bulk_pio_ticks: u64,
     pub pad_out: u32,
     pub pad_oe: u32,
     /// Bit `i` is set iff `sm[i].enabled`. Deliberately redundant with
@@ -123,12 +108,6 @@ impl PioBlock {
             gpio_base: 0,
             shared_pin_values: u32::MAX,
             shared_pin_dirs: 0,
-            #[cfg(feature = "pio-exact-bulk-prototype")]
-            pio_exact_bulk_calls: 0,
-            #[cfg(feature = "pio-exact-bulk-prototype")]
-            pio_exact_bulk_system_cycles: 0,
-            #[cfg(feature = "pio-exact-bulk-prototype")]
-            pio_exact_bulk_pio_ticks: 0,
             pad_out: 0,
             pad_oe: 0,
             sm_enabled_mask: 0,
@@ -157,12 +136,6 @@ impl PioBlock {
         self.gpio_base = 0;
         self.shared_pin_values = u32::MAX;
         self.shared_pin_dirs = 0;
-        #[cfg(feature = "pio-exact-bulk-prototype")]
-        {
-            self.pio_exact_bulk_calls = 0;
-            self.pio_exact_bulk_system_cycles = 0;
-            self.pio_exact_bulk_pio_ticks = 0;
-        }
         self.pad_out = 0;
         self.pad_oe = 0;
         self.sm_enabled_mask = 0;
@@ -434,52 +407,9 @@ impl PioBlock {
         if self.sm_enabled_mask == 0 {
             return;
         }
-        if n == 0 {
-            return;
-        }
-        #[cfg(feature = "pio-exact-bulk-prototype")]
-        {
-            if self.is_exact_bulk_pull_stall_candidate() {
-                let mut pio_ticks = 0u64;
-                for i in 0..4 {
-                    if self.sm[i].enabled {
-                        pio_ticks += self.sm[i].bulk_pull_stall_advance(n);
-                    }
-                }
-                self.pio_exact_bulk_calls = self.pio_exact_bulk_calls.wrapping_add(1);
-                self.pio_exact_bulk_system_cycles =
-                    self.pio_exact_bulk_system_cycles.wrapping_add(n as u64);
-                self.pio_exact_bulk_pio_ticks =
-                    self.pio_exact_bulk_pio_ticks.wrapping_add(pio_ticks);
-                self.latch_tx_stalls();
-                self.merge_pin_outputs();
-                #[cfg(feature = "pio-pad-diag")]
-                {
-                    self.bump_pad_out_diag();
-                    if n > 1 {
-                        self.bump_pad_out_diag_bulk(n - 1);
-                    }
-                }
-                return;
-            }
-        }
         for _ in 0..n {
             self.step_with_pins(gpio_pins);
         }
-    }
-
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    #[inline]
-    fn is_exact_bulk_pull_stall_candidate(&self) -> bool {
-        for i in 0..4 {
-            if !self.sm[i].enabled {
-                continue;
-            }
-            if !self.sm[i].can_bulk_advance_on_pull_stall() {
-                return false;
-            }
-        }
-        true
     }
 
     #[inline]
@@ -618,26 +548,6 @@ impl PioBlock {
             self.pad_out_mosi_writes_of_1 = self.pad_out_mosi_writes_of_1.wrapping_add(1);
         }
         self.prev_pad_out_diag = cur;
-    }
-
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    #[cfg(feature = "pio-pad-diag")]
-    #[inline]
-    fn bump_pad_out_diag_bulk(&mut self, cycles: u32) {
-        let cycles = cycles as u64;
-        if (self.pad_out >> 3) & 1 != 0 {
-            self.pad_out_mosi_writes_of_1 = self.pad_out_mosi_writes_of_1.wrapping_add(cycles);
-        }
-        self.prev_pad_out_diag = self.pad_out;
-    }
-
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    pub fn exact_bulk_prototype_snapshot(&self) -> PioExactBulkPrototypeSnapshot {
-        PioExactBulkPrototypeSnapshot {
-            calls: self.pio_exact_bulk_calls,
-            system_cycles: self.pio_exact_bulk_system_cycles,
-            pio_ticks: self.pio_exact_bulk_pio_ticks,
-        }
     }
 
     /// Compute FSTAT register from current SM FIFO states.
@@ -3559,169 +3469,6 @@ mod tests {
         pio.sm[0].clkdiv_frac = 0;
         pio.step_n_with_pins(1, 0);
         assert_eq!(pio.sm[0].x, 1, "SET X, 1 executed via step_n_with_pins");
-    }
-
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    fn make_pull_stall_block(clkdiv_int: u16, clkdiv_frac: u8, pc: u8) -> PioBlock {
-        let mut pio = PioBlock::new();
-        pio.set_sm_enabled(0, true);
-        pio.sm[0].clkdiv_int = clkdiv_int;
-        pio.sm[0].clkdiv_frac = clkdiv_frac;
-        pio.sm[0].clkdiv_acc = 0;
-        pio.sm[0].pc = pc;
-        pio.sm[0].stalled = true;
-        pio.sm[0].stall_kind = StallKind::Pull;
-        pio
-    }
-
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    #[test]
-    fn step_n_pull_stall_bulk_uses_closed_form_divider_and_counters() {
-        for (int, frac, initial_acc, n) in [
-            (0, 0, 0, 97),
-            (1, 0, 0, 97),
-            (1, 128, 127, 97),
-            (1, 255, 510, 1025),
-            (2, 1, 512, 4097),
-            (u16::MAX, 255, 16_000_000, 1_000_000),
-        ] {
-            let mut bulk = make_pull_stall_block(int, frac, 0x19);
-            let mut reference = make_pull_stall_block(int, frac, 0x19);
-            bulk.sm[0].clkdiv_acc = initial_acc;
-            reference.sm[0].clkdiv_acc = initial_acc;
-
-            bulk.step_n_with_pins(n, 0);
-            for _ in 0..n {
-                reference.step_with_pins(0);
-            }
-
-            assert_eq!(bulk.sm[0].clkdiv_acc, reference.sm[0].clkdiv_acc);
-            assert_eq!(bulk.sm[0].pc, reference.sm[0].pc);
-            assert_eq!(bulk.sm[0].stalled, reference.sm[0].stalled);
-            assert_eq!(bulk.sm[0].delay_count, reference.sm[0].delay_count);
-            assert_eq!(bulk.sm[0].osr_count, reference.sm[0].osr_count);
-            assert_eq!(bulk.sm[0].stall_cycles, reference.sm[0].stall_cycles);
-            assert_eq!(
-                bulk.sm[0].cycles_stalled_at_pc_0x19,
-                reference.sm[0].cycles_stalled_at_pc_0x19
-            );
-            assert_eq!(bulk.irq_flags, reference.irq_flags);
-            assert_eq!(bulk.fdebug, reference.fdebug);
-            assert_eq!(bulk.shared_pin_values, reference.shared_pin_values);
-            assert_eq!(bulk.shared_pin_dirs, reference.shared_pin_dirs);
-            assert_eq!(bulk.pad_out, reference.pad_out);
-            assert_eq!(bulk.pad_oe, reference.pad_oe);
-            let snapshot = bulk.exact_bulk_prototype_snapshot();
-            assert_eq!(snapshot.calls, 1);
-            assert_eq!(snapshot.system_cycles, n as u64);
-            assert_eq!(snapshot.pio_ticks, reference.sm[0].stall_cycles);
-        }
-    }
-
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    #[test]
-    fn step_n_pull_stall_zero_cycles_is_exact_noop() {
-        let mut pio = make_pull_stall_block(1, 128, 0x19);
-        pio.step_n_with_pins(0, 0);
-        assert_eq!(
-            pio.exact_bulk_prototype_snapshot(),
-            PioExactBulkPrototypeSnapshot::default()
-        );
-        assert_eq!(pio.sm[0].clkdiv_acc, 0);
-        assert_eq!(pio.sm[0].stall_cycles, 0);
-        assert_eq!(pio.fdebug, 0);
-    }
-
-    #[cfg(all(feature = "pio-exact-bulk-prototype", feature = "pio-pad-diag"))]
-    #[test]
-    fn step_n_pull_stall_bulk_preserves_pad_diagnostics() {
-        let n = 17;
-        let mut bulk = make_pull_stall_block(1, 128, 0);
-        let mut reference = make_pull_stall_block(1, 128, 0);
-        bulk.pad_out = (1 << 1) | (1 << 3);
-        reference.pad_out = bulk.pad_out;
-        bulk.prev_pad_out_diag = 0;
-        reference.prev_pad_out_diag = 0;
-
-        bulk.step_n_with_pins(n, 0);
-        for _ in 0..n {
-            reference.step_with_pins(0);
-        }
-
-        assert_eq!(bulk.pad_out_cs_falls, reference.pad_out_cs_falls);
-        assert_eq!(bulk.pad_out_cs_rises, reference.pad_out_cs_rises);
-        assert_eq!(bulk.pad_out_sck_toggles, reference.pad_out_sck_toggles);
-        assert_eq!(
-            bulk.pad_out_mosi_writes_of_1,
-            reference.pad_out_mosi_writes_of_1
-        );
-        assert_eq!(bulk.prev_pad_out_diag, reference.prev_pad_out_diag);
-    }
-
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    #[test]
-    fn step_n_pull_stall_bulk_rejects_refill() {
-        let mut bulk = make_pull_stall_block(1, 0, 0x00);
-        let mut reference = make_pull_stall_block(1, 0, 0x00);
-        assert!(
-            bulk.sm[0].tx_fifo.push(0xABCD_0123),
-            "tx push succeeds when empty"
-        );
-        assert!(
-            reference.sm[0].tx_fifo.push(0xABCD_0123),
-            "tx push succeeds when empty"
-        );
-
-        bulk.step_n_with_pins(4, 0);
-        reference.step_n_with_pins(4, 0);
-
-        let snapshot = bulk.exact_bulk_prototype_snapshot();
-        assert_eq!(
-            snapshot.calls, 0,
-            "refill on pull-stall must stay in loop path"
-        );
-        assert_eq!(snapshot.system_cycles, 0);
-        assert_eq!(snapshot.pio_ticks, 0);
-        assert_eq!(bulk.sm[0].stall_cycles, reference.sm[0].stall_cycles);
-    }
-
-    #[cfg(feature = "pio-exact-bulk-prototype")]
-    #[test]
-    fn step_n_pull_stall_bulk_rejects_mixed_stall_kinds() {
-        let mut bulk = make_pull_stall_block(1, 0, 0x00);
-        let mut reference = make_pull_stall_block(1, 0, 0x00);
-        bulk.set_sm_enabled(1, true);
-        bulk.sm[1].clkdiv_int = 1;
-        bulk.sm[1].clkdiv_frac = 0;
-        bulk.sm[1].pc = 0x05;
-        bulk.sm[1].stalled = true;
-        bulk.sm[1].stall_kind = StallKind::WaitIrq {
-            polarity: true,
-            index: 0,
-        };
-        reference.set_sm_enabled(1, true);
-        reference.sm[1].clkdiv_int = 1;
-        reference.sm[1].clkdiv_frac = 0;
-        reference.sm[1].pc = 0x05;
-        reference.sm[1].stalled = true;
-        reference.sm[1].stall_kind = StallKind::WaitIrq {
-            polarity: true,
-            index: 0,
-        };
-
-        bulk.step_n_with_pins(4, 0);
-        reference.step_n_with_pins(4, 0);
-
-        let snapshot = bulk.exact_bulk_prototype_snapshot();
-        assert_eq!(
-            snapshot.calls, 0,
-            "non-pull stall in any enabled SM disables bulk"
-        );
-        assert_eq!(snapshot.system_cycles, 0);
-        assert_eq!(snapshot.pio_ticks, 0);
-        assert_eq!(bulk.sm[0].clkdiv_acc, reference.sm[0].clkdiv_acc);
-        assert_eq!(bulk.sm[0].stall_cycles, reference.sm[0].stall_cycles);
-        assert_eq!(bulk.sm[1].stall_cycles, reference.sm[1].stall_cycles);
     }
 
     /// `step_with_pins` unconditional path: enabled SM with a u64 GPIO

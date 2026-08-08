@@ -31,11 +31,6 @@ test-hooks = []
 # work that needs the per-edge counters.
 pio-pad-diag = []
 
-# Feature-gated PIO pull-stall prototype optimization. Adds optional
-# exact bulk-advance counters and helpers used only by the OPT prototype
-# harness build.
-pio-exact-bulk-prototype = []
-
 [dependencies]
 tracing = { workspace = true }
 
