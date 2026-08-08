@@ -262,6 +262,24 @@ impl TimerRegs {
         soonest
     }
 
+    /// Return the soonest observable alarm match, including alarms whose
+    /// interrupt is currently masked.  A masked alarm still clears ARMED and
+    /// latches INTR at its match cycle, so a complete event horizon must not
+    /// skip it merely because it cannot wake a core.
+    #[cfg(feature = "idle-profiler")]
+    pub(crate) fn next_armed_fire_cycle(&self) -> Option<u64> {
+        let mut soonest: Option<u64> = None;
+        for n in 0..4 {
+            if self.armed & (1 << n) == 0 {
+                continue;
+            }
+            if let Some(fc) = self.alarm_fire_cycle[n] {
+                soonest = Some(soonest.map_or(fc, |current| current.min(fc)));
+            }
+        }
+        soonest
+    }
+
     // -------------------------------------------------------------------
     // Register dispatch
     // -------------------------------------------------------------------

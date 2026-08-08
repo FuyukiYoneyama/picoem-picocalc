@@ -29,8 +29,9 @@ mod idle_profile;
 
 #[cfg(feature = "idle-profiler")]
 pub use idle_profile::{
-    CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_PROFILE_SCHEMA_VERSION,
-    IdleBlockerCycles, IdleBlockerEpisodes, IdleCurrentProbe, IdleProfileSnapshot,
+    CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_HORIZON_SCHEMA_VERSION,
+    IDLE_PROFILE_SCHEMA_VERSION, IdleBlockerCycles, IdleBlockerEpisodes, IdleCurrentProbe,
+    IdleEventHorizonProbe, IdleEventSourceMask, IdleHorizonEvents, IdleProfileSnapshot,
 };
 
 // Dual-execution HLD V1 (Stage 3b.2) — threaded runtime scaffolding.
@@ -785,6 +786,7 @@ impl Emulator {
             #[cfg(feature = "idle-profiler")]
             let blocked_observation = (
                 self.idle_source_observation(),
+                self.idle_event_horizon(None),
                 self.cores[0].is_halted(),
                 self.bus.wfe_waiting[0],
                 self.cores[1].is_halted(),
@@ -797,11 +799,13 @@ impl Emulator {
             self.wake_checks();
             #[cfg(feature = "idle-profiler")]
             if let Some(profiler) = self.idle_profiler.as_mut() {
-                let (observation, c0_halted, c0_wfe, c1_halted, c1_wfe) = blocked_observation;
+                let (observation, event_horizon, c0_halted, c0_wfe, c1_halted, c1_wfe) =
+                    blocked_observation;
                 profiler.record_blocked(
                     advance,
                     horizon_distance,
                     observation,
+                    event_horizon,
                     c0_halted,
                     c0_wfe,
                     c1_halted,
@@ -924,8 +928,7 @@ impl Emulator {
         let mut pio_enabled = false;
         let mut pio_all_enabled_stalled = true;
         let irq_can_wake = |irq: u32| {
-            self.bus.nvics[0].is_enabled(irq as u8)
-                || self.bus.nvics[1].is_enabled(irq as u8)
+            self.bus.nvics[0].is_enabled(irq as u8) || self.bus.nvics[1].is_enabled(irq as u8)
         };
         let mut pio_static_irq = false;
         let mut pio_wake_irq = false;
@@ -991,31 +994,11 @@ impl Emulator {
             M::UART,
             irq_can_wake(21),
         );
-        classify(
-            self.bus.spi0.idle_profile_state(),
-            M::SPI,
-            irq_can_wake(18),
-        );
-        classify(
-            self.bus.spi1.idle_profile_state(),
-            M::SPI,
-            irq_can_wake(19),
-        );
-        classify(
-            self.bus.i2c0.idle_profile_state(),
-            M::I2C,
-            irq_can_wake(23),
-        );
-        classify(
-            self.bus.i2c1.idle_profile_state(),
-            M::I2C,
-            irq_can_wake(24),
-        );
-        classify(
-            self.bus.adc.idle_profile_state(),
-            M::ADC,
-            irq_can_wake(22),
-        );
+        classify(self.bus.spi0.idle_profile_state(), M::SPI, irq_can_wake(18));
+        classify(self.bus.spi1.idle_profile_state(), M::SPI, irq_can_wake(19));
+        classify(self.bus.i2c0.idle_profile_state(), M::I2C, irq_can_wake(23));
+        classify(self.bus.i2c1.idle_profile_state(), M::I2C, irq_can_wake(24));
+        classify(self.bus.adc.idle_profile_state(), M::ADC, irq_can_wake(22));
         classify(
             self.bus.timer.idle_profile_state(),
             M::TIMER,
@@ -1699,6 +1682,93 @@ impl Emulator {
             stationary_source_count: observation.stationary.count(),
             exact_bulk_source_count: observation.exact_bulk.count(),
             proven_jump_safe: observation.proven_safe(),
+        }
+    }
+
+    /// Compute a complete, conservative next-event horizon while both cores
+    /// are blocked.
+    ///
+    /// Exact deadlines are used for TIMER alarms, PWM wraps, and the optional
+    /// caller-owned external boundary. Every other temporal source is
+    /// represented by a one-cycle fallback. The fallback can reduce an
+    /// optimization opportunity, but can never allow the probe to jump over
+    /// an event that the current model could observe.
+    #[cfg(feature = "idle-profiler")]
+    #[inline(never)]
+    pub fn idle_event_horizon(&self, external_event_cycle: Option<u64>) -> IdleEventHorizonProbe {
+        use idle_profile::{IdleBlockerMask as B, IdleEventSourceMask as S};
+
+        self.assert_not_placeholder();
+        let now = self.bus.master_cycle;
+        let observation = self.idle_source_observation();
+        let mut next_event_cycle = None;
+        let mut limiting_bits = 0u16;
+        let mut fallback_bits = 0u16;
+
+        let mut consider = |cycle: u64, source: u16| {
+            let cycle = cycle.max(now);
+            match next_event_cycle {
+                None => {
+                    next_event_cycle = Some(cycle);
+                    limiting_bits = source;
+                }
+                Some(current) if cycle < current => {
+                    next_event_cycle = Some(cycle);
+                    limiting_bits = source;
+                }
+                Some(current) if cycle == current => limiting_bits |= source,
+                Some(_) => {}
+            }
+        };
+
+        if observation.blockers.contains(B::PENDING_IRQ) {
+            consider(now, S::PENDING_IRQ);
+        }
+
+        // These sources do not yet expose a promoted exact deadline. A
+        // one-cycle boundary is nevertheless complete and safe.
+        for (blocker, source) in [
+            (B::PIO, S::PIO),
+            (B::DMA, S::DMA),
+            (B::SYSTICK, S::SYSTICK),
+            (B::UART, S::UART),
+            (B::SPI, S::SPI),
+            (B::I2C, S::I2C),
+            (B::ADC, S::ADC),
+            (B::TIMER, S::TIMER),
+        ] {
+            if observation.blockers.contains(blocker) {
+                fallback_bits |= source;
+                consider(now.saturating_add(1), source);
+            }
+        }
+
+        // PWM has an exact first-wrap distance, but an already-routable IRQ
+        // can still require the conservative one-cycle boundary above.
+        if observation.blockers.contains(B::PWM) {
+            fallback_bits |= S::PWM;
+            consider(now.saturating_add(1), S::PWM);
+        }
+        if let Some(distance) = self.bus.pwm.next_wrap_distance() {
+            consider(now.saturating_add(distance), S::PWM);
+        }
+
+        // Include masked alarms: their INTR/ARMED state changes at match even
+        // though they cannot currently wake either core.
+        if let Some(deadline) = self.bus.timer.next_armed_fire_cycle() {
+            consider(deadline, S::TIMER);
+        }
+        if let Some(deadline) = external_event_cycle {
+            consider(deadline, S::EXTERNAL);
+        }
+
+        IdleEventHorizonProbe {
+            master_cycle: now,
+            next_event_cycle,
+            distance_cycles: next_event_cycle.map(|cycle| cycle.saturating_sub(now)),
+            limiting_sources: S::from_bits(limiting_bits),
+            one_cycle_fallback_sources: S::from_bits(fallback_bits),
+            complete_for_current_model: true,
         }
     }
 }
@@ -2524,6 +2594,78 @@ mod stage5_lib_residue {
         assert_eq!(probe.blocker_count, 0);
         assert_eq!(probe.stationary_source_count, 1);
         assert_eq!(probe.exact_bulk_source_count, 0);
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_horizon_includes_masked_timer_alarm() {
+        use crate::peripherals::timer::ALARM0_OFFSET;
+
+        let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
+        let sys_hz = emu.bus.clock_tree.sys_clk_hz;
+        emu.bus
+            .timer
+            .write32(ALARM0_OFFSET, 200, 0, emu.bus.master_cycle, sys_hz);
+
+        let horizon = emu.idle_event_horizon(None);
+        assert!(horizon.complete_for_current_model);
+        assert_eq!(
+            horizon.distance_cycles,
+            Some(200 * (sys_hz as u64 / 1_000_000))
+        );
+        assert!(
+            horizon
+                .limiting_sources
+                .contains(IdleEventSourceMask::TIMER)
+        );
+        assert_eq!(horizon.one_cycle_fallback_sources.bits(), 0);
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_horizon_uses_one_cycle_fallback_for_active_pio() {
+        use crate::bus::PIO0_BASE;
+
+        let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
+        emu.bus.write32(PIO0_BASE + 0x2000, 1);
+
+        let horizon = emu.idle_event_horizon(None);
+        assert_eq!(horizon.distance_cycles, Some(1));
+        assert!(horizon.limiting_sources.contains(IdleEventSourceMask::PIO));
+        assert!(
+            horizon
+                .one_cycle_fallback_sources
+                .contains(IdleEventSourceMask::PIO)
+        );
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_horizon_external_boundary_wins_and_ties_are_retained() {
+        let emu = EmulatorBuilder::new(Config::default()).build().unwrap();
+        let now = emu.bus.master_cycle;
+        let horizon = emu.idle_event_horizon(Some(now + 7));
+        assert_eq!(horizon.next_event_cycle, Some(now + 7));
+        assert_eq!(horizon.distance_cycles, Some(7));
+        assert!(
+            horizon
+                .limiting_sources
+                .contains(IdleEventSourceMask::EXTERNAL)
+        );
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_horizon_pending_irq_is_current_boundary() {
+        let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
+        emu.bus.irq_pending = 1;
+        let horizon = emu.idle_event_horizon(Some(emu.bus.master_cycle + 100));
+        assert_eq!(horizon.distance_cycles, Some(0));
+        assert!(
+            horizon
+                .limiting_sources
+                .contains(IdleEventSourceMask::PENDING_IRQ)
+        );
     }
 
     // ------------------- step_serial: slow-path / fast-path gating (line 750) -------------------

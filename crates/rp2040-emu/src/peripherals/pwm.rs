@@ -207,6 +207,20 @@ impl PwmRegs {
         }
     }
 
+    /// Distance in system clocks to the first enabled-slice wrap.
+    ///
+    /// The wrap is observable because it updates CTR and latches INTR even
+    /// when the NVIC mask is clear. `tick(cycles)` already performs the
+    /// corresponding state advance exactly in O(number-of-slices).
+    #[cfg(feature = "idle-profiler")]
+    pub(crate) fn next_wrap_distance(&self) -> Option<u64> {
+        self.slices
+            .iter()
+            .filter(|slice| slice.csr & CSR_EN != 0)
+            .map(|slice| (slice.top as u64 + 1).saturating_sub(slice.ctr as u64))
+            .min()
+    }
+
     // --- Offset decoding -----------------------------------------------
 
     /// Decode a register offset into `(slice, inner_offset)` if it
@@ -493,6 +507,19 @@ mod tests {
         p.write32(EN, 1, 0, &mut irqs);
         p.tick(50, &default_tree(), &mut irqs);
         assert_eq!(p.slices[0].ctr, 50);
+    }
+
+    #[cfg(feature = "idle-profiler")]
+    #[test]
+    fn idle_horizon_uses_soonest_enabled_slice_wrap() {
+        let mut p = PwmRegs::default();
+        p.slices[0].csr = CSR_EN;
+        p.slices[0].top = 100;
+        p.slices[0].ctr = 40;
+        p.slices[3].csr = CSR_EN;
+        p.slices[3].top = 20;
+        p.slices[3].ctr = 18;
+        assert_eq!(p.next_wrap_distance(), Some(3));
     }
 
     #[test]

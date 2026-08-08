@@ -5,7 +5,10 @@
 //! counter, or histogram cost.
 
 /// Machine-readable profile schema emitted by diagnostic harnesses.
-pub const IDLE_PROFILE_SCHEMA_VERSION: u32 = 2;
+pub const IDLE_PROFILE_SCHEMA_VERSION: u32 = 3;
+
+/// Schema for the complete, conservative all-source event-horizon probe.
+pub const IDLE_HORIZON_SCHEMA_VERSION: u32 = 1;
 
 /// Number of power-of-two thresholds: 1 through 2^63 cycles.
 pub const IDLE_HISTOGRAM_BUCKETS: usize = 64;
@@ -138,6 +141,73 @@ pub struct IdleCurrentProbe {
     pub proven_jump_safe: bool,
 }
 
+/// Source bits used by [`IdleEventHorizonProbe`].
+///
+/// A source may conservatively limit the horizon to one cycle even when a
+/// more distant exact deadline could be derived later.  This keeps the probe
+/// complete without claiming unsafe skip distance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdleEventSourceMask(u16);
+
+impl IdleEventSourceMask {
+    pub const PIO: u16 = 1 << 0;
+    pub const DMA: u16 = 1 << 1;
+    pub const PWM: u16 = 1 << 2;
+    pub const SYSTICK: u16 = 1 << 3;
+    pub const UART: u16 = 1 << 4;
+    pub const SPI: u16 = 1 << 5;
+    pub const I2C: u16 = 1 << 6;
+    pub const ADC: u16 = 1 << 7;
+    pub const TIMER: u16 = 1 << 8;
+    pub const PENDING_IRQ: u16 = 1 << 9;
+    pub const EXTERNAL: u16 = 1 << 10;
+
+    pub(crate) const fn from_bits(bits: u16) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    pub const fn contains(self, bit: u16) -> bool {
+        self.0 & bit != 0
+    }
+}
+
+/// Read-only all-source event horizon for a both-cores-blocked interval.
+///
+/// `distance_cycles == 0` denotes work already pending at the current
+/// boundary. `None` means no autonomous or caller-supplied event is known.
+/// Every temporal source is represented: sources without a promoted exact
+/// deadline conservatively contribute a one-cycle horizon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdleEventHorizonProbe {
+    pub master_cycle: u64,
+    pub next_event_cycle: Option<u64>,
+    pub distance_cycles: Option<u64>,
+    pub limiting_sources: IdleEventSourceMask,
+    pub one_cycle_fallback_sources: IdleEventSourceMask,
+    pub complete_for_current_model: bool,
+}
+
+/// Event-boundary counts attributed to the source(s) that limited a safe
+/// interval. Simultaneous sources intentionally overlap.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdleHorizonEvents {
+    pub pio: u64,
+    pub dma: u64,
+    pub pwm: u64,
+    pub systick: u64,
+    pub uart: u64,
+    pub spi: u64,
+    pub i2c: u64,
+    pub adc: u64,
+    pub timer: u64,
+    pub pending_irq: u64,
+    pub external: u64,
+}
+
 /// Stable snapshot of the opt-in Serial idle profiler.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdleProfileSnapshot {
@@ -167,6 +237,11 @@ pub struct IdleProfileSnapshot {
     pub blocked_lengths: CumulativeHistogramSnapshot,
     /// Length distribution for conservatively proven-safe sub-episodes.
     pub proven_safe_lengths: CumulativeHistogramSnapshot,
+    /// Safe lengths split at every complete all-source event horizon.
+    /// This is the actionable `S(K)` for an exact fast-forward candidate.
+    pub event_bounded_safe_lengths: CumulativeHistogramSnapshot,
+    /// Number of closed safe boundaries attributed to each limiting source.
+    pub horizon_boundary_events: IdleHorizonEvents,
     /// Initial timer-horizon distance distribution for blocked episodes.
     pub initial_horizon_distances: CumulativeHistogramSnapshot,
     /// Overlapping per-source reasons why blocked cycles were not proven safe.
@@ -206,7 +281,7 @@ impl IdleBlockerMask {
         Self(self.0 | other.0)
     }
 
-    fn contains(self, bit: u16) -> bool {
+    pub(crate) fn contains(self, bit: u16) -> bool {
         self.0 & bit != 0
     }
 
@@ -239,6 +314,7 @@ pub(crate) struct IdleProfiler {
     snapshot: IdleProfileSnapshot,
     open_blocked_length: u64,
     open_safe_length: u64,
+    open_event_bounded_safe_length: u64,
     open_blockers: IdleBlockerMask,
     open_stationary: IdleBlockerMask,
     open_exact_bulk: IdleBlockerMask,
@@ -262,6 +338,7 @@ impl IdleProfiler {
         cycles: u64,
         horizon_distance: u64,
         observation: IdleSourceObservation,
+        event_horizon: IdleEventHorizonProbe,
         core0_halted: bool,
         core0_wfe: bool,
         core1_halted: bool,
@@ -311,8 +388,21 @@ impl IdleProfiler {
             self.snapshot.proven_safe_cycles =
                 self.snapshot.proven_safe_cycles.saturating_add(cycles);
             self.open_safe_length = self.open_safe_length.saturating_add(cycles);
+            self.open_event_bounded_safe_length =
+                self.open_event_bounded_safe_length.saturating_add(cycles);
+            if event_horizon
+                .distance_cycles
+                .is_some_and(|distance| distance <= cycles)
+            {
+                self.close_event_bounded_safe_episode();
+                Self::add_horizon_events(
+                    &mut self.snapshot.horizon_boundary_events,
+                    event_horizon.limiting_sources,
+                );
+            }
         } else {
             self.close_safe_episode();
+            self.close_event_bounded_safe_episode();
             Self::add_source_cycles(&mut self.snapshot.blockers, observation.blockers, cycles);
         }
         Self::add_source_cycles(
@@ -347,8 +437,16 @@ impl IdleProfiler {
         self.open_safe_length = 0;
     }
 
+    fn close_event_bounded_safe_episode(&mut self) {
+        self.snapshot
+            .event_bounded_safe_lengths
+            .record(self.open_event_bounded_safe_length);
+        self.open_event_bounded_safe_length = 0;
+    }
+
     fn close_blocked_episode(&mut self) {
         self.close_safe_episode();
+        self.close_event_bounded_safe_episode();
         self.snapshot
             .blocked_lengths
             .record(self.open_blocked_length);
@@ -402,11 +500,40 @@ impl IdleProfiler {
         add(IdleBlockerMask::TIMER, &mut dst.timer);
         add(IdleBlockerMask::PENDING_IRQ, &mut dst.pending_irq);
     }
+
+    fn add_horizon_events(dst: &mut IdleHorizonEvents, mask: IdleEventSourceMask) {
+        let add = |bit, value: &mut u64| {
+            if mask.contains(bit) {
+                *value = value.saturating_add(1);
+            }
+        };
+        add(IdleEventSourceMask::PIO, &mut dst.pio);
+        add(IdleEventSourceMask::DMA, &mut dst.dma);
+        add(IdleEventSourceMask::PWM, &mut dst.pwm);
+        add(IdleEventSourceMask::SYSTICK, &mut dst.systick);
+        add(IdleEventSourceMask::UART, &mut dst.uart);
+        add(IdleEventSourceMask::SPI, &mut dst.spi);
+        add(IdleEventSourceMask::I2C, &mut dst.i2c);
+        add(IdleEventSourceMask::ADC, &mut dst.adc);
+        add(IdleEventSourceMask::TIMER, &mut dst.timer);
+        add(IdleEventSourceMask::PENDING_IRQ, &mut dst.pending_irq);
+        add(IdleEventSourceMask::EXTERNAL, &mut dst.external);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn horizon(distance_cycles: u64, source: u16) -> IdleEventHorizonProbe {
+        IdleEventHorizonProbe {
+            next_event_cycle: Some(distance_cycles),
+            distance_cycles: Some(distance_cycles),
+            limiting_sources: IdleEventSourceMask::from_bits(source),
+            complete_for_current_model: true,
+            ..IdleEventHorizonProbe::default()
+        }
+    }
 
     #[test]
     fn cumulative_histogram_records_episode_count_and_cycle_mass() {
@@ -429,6 +556,7 @@ mod tests {
             4,
             20,
             IdleSourceObservation::default(),
+            horizon(20, IdleEventSourceMask::TIMER),
             false,
             true,
             true,
@@ -441,6 +569,7 @@ mod tests {
                 blockers: IdleBlockerMask::from_bits(IdleBlockerMask::PWM),
                 ..IdleSourceObservation::default()
             },
+            horizon(1, IdleEventSourceMask::PWM),
             false,
             true,
             true,
@@ -450,6 +579,7 @@ mod tests {
             3,
             14,
             IdleSourceObservation::default(),
+            horizon(14, IdleEventSourceMask::TIMER),
             false,
             true,
             true,
@@ -464,5 +594,29 @@ mod tests {
         assert_eq!(s.proven_safe_lengths.cycle_mass_ge[0], 7);
         assert_eq!(s.blockers.pwm, 2);
         assert_eq!(s.initial_horizon_distances.episodes_ge[4], 1);
+    }
+
+    #[test]
+    fn complete_horizon_splits_safe_mass_at_exact_boundaries() {
+        let mut p = IdleProfiler::default();
+        for distance in [3, 2, 1, 4, 3, 2, 1] {
+            p.record_blocked(
+                1,
+                100,
+                IdleSourceObservation::default(),
+                horizon(distance, IdleEventSourceMask::PWM),
+                false,
+                true,
+                true,
+                false,
+            );
+        }
+        let s = p.snapshot();
+        assert_eq!(s.proven_safe_cycles, 7);
+        assert_eq!(s.event_bounded_safe_lengths.episodes_ge[0], 2);
+        assert_eq!(s.event_bounded_safe_lengths.cycle_mass_ge[0], 7);
+        assert_eq!(s.event_bounded_safe_lengths.episodes_ge[2], 1);
+        assert_eq!(s.event_bounded_safe_lengths.cycle_mass_ge[2], 4);
+        assert_eq!(s.horizon_boundary_events.pwm, 2);
     }
 }

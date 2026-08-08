@@ -11,11 +11,17 @@ use std::time::Instant;
 use rp2040_emu::bus::peripheral_dispatch::RESET_TIMER;
 use rp2040_emu::bus::{RESETS_BASE, TIMER_BASE};
 use rp2040_emu::peripherals::timer::{ALARM0_OFFSET, INTE_OFFSET};
-use rp2040_emu::{Config, Emulator, EmulatorBuilder};
+use rp2040_emu::{Config, Emulator, EmulatorBuilder, IdleEventSourceMask};
 use serde_json::{Value, json};
 
 const BUILT_BACKEND_COMMIT: &str = env!("PICOEM_BUILT_COMMIT");
 const ADVANCE_LENGTHS: [u32; 4] = [1, 64, 1024, 1_048_576];
+const BLOCKED_STEP_LENGTHS: [u32; 4] = [1, 64, 125, 1024];
+const BENCH_SYS_HZ: u32 = 125_000_000;
+const TIMER_INTR_OFFSET: u32 = 0x34;
+const NVIC_ISER0: u32 = 0xE000_E100;
+const NVIC_ICPR0: u32 = 0xE000_E280;
+const TIMER_BOUNDARY_CYCLES: u32 = 125;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Args {
@@ -76,17 +82,60 @@ fn built_backend_dirty() -> bool {
     env!("PICOEM_BUILT_DIRTY") == "true"
 }
 
-fn blocked_emulator() -> Emulator {
-    let mut emu = EmulatorBuilder::new(Config::default())
-        .step_quantum(1)
-        .build()
-        .expect("Serial benchmark emulator");
+fn blocked_emulator(step_quantum: u32) -> Emulator {
+    let mut emu = EmulatorBuilder::new(Config {
+        sys_clk_hz: BENCH_SYS_HZ,
+    })
+    .step_quantum(step_quantum)
+    .build()
+    .expect("Serial benchmark emulator");
     emu.core_mut(0).halt();
     emu.halt_core1();
     emu.mmio_write32(RESETS_BASE + 0x3000, 1u32 << RESET_TIMER);
     emu.mmio_write32(TIMER_BASE + INTE_OFFSET, 1);
     emu.mmio_write32(TIMER_BASE + ALARM0_OFFSET, 4_000_000_000);
     emu
+}
+
+fn timer_boundary_emulator() -> Emulator {
+    let mut emu = EmulatorBuilder::new(Config {
+        sys_clk_hz: BENCH_SYS_HZ,
+    })
+    .step_quantum(TIMER_BOUNDARY_CYCLES)
+    .build()
+    .expect("Serial benchmark emulator");
+    emu.core_mut(0).halt();
+    emu.halt_core1();
+    emu.mmio_write32(RESETS_BASE + 0x3000, 1u32 << RESET_TIMER);
+    emu.mmio_write32(TIMER_BASE + INTE_OFFSET, 1);
+    emu.mmio_write32(NVIC_ISER0, 1);
+    emu
+}
+
+fn prepare_timer_boundary(emu: &mut Emulator, target_us: u32) {
+    emu.core_mut(0).halt();
+    emu.mmio_write32(NVIC_ICPR0, 1);
+    emu.mmio_write32(TIMER_BASE + TIMER_INTR_OFFSET, 1);
+    emu.mmio_write32(TIMER_BASE + ALARM0_OFFSET, target_us);
+}
+
+fn event_source_names(mask: IdleEventSourceMask) -> Vec<&'static str> {
+    [
+        (IdleEventSourceMask::PIO, "pio"),
+        (IdleEventSourceMask::DMA, "dma"),
+        (IdleEventSourceMask::PWM, "pwm"),
+        (IdleEventSourceMask::SYSTICK, "systick"),
+        (IdleEventSourceMask::UART, "uart"),
+        (IdleEventSourceMask::SPI, "spi"),
+        (IdleEventSourceMask::I2C, "i2c"),
+        (IdleEventSourceMask::ADC, "adc"),
+        (IdleEventSourceMask::TIMER, "timer"),
+        (IdleEventSourceMask::PENDING_IRQ, "pending_irq"),
+        (IdleEventSourceMask::EXTERNAL, "external"),
+    ]
+    .into_iter()
+    .filter_map(|(bit, name)| mask.contains(bit).then_some(name))
+    .collect()
 }
 
 fn ns_per_iteration(iterations: u64, mut body: impl FnMut(u64)) -> f64 {
@@ -124,13 +173,14 @@ fn measurement(values: Vec<f64>, loop_overhead_median: f64) -> Value {
 fn run(args: &Args) -> Result<Value, String> {
     // Untimed warm-up forces code pages and allocator state into the same
     // condition before each family of retained samples.
-    let mut warm = blocked_emulator();
+    let mut warm = blocked_emulator(1);
     for _ in 0..10_000 {
         black_box(warm.step().map_err(|error| error.to_string())?);
     }
-    let warm_probe = blocked_emulator();
+    let warm_probe = blocked_emulator(1);
     for _ in 0..10_000 {
         black_box(warm_probe.idle_current_probe());
+        black_box(warm_probe.idle_event_horizon(None));
     }
 
     let loop_samples = collect_samples(args.samples, || {
@@ -140,25 +190,45 @@ fn run(args: &Args) -> Result<Value, String> {
     });
     let loop_median = median(&loop_samples);
 
-    let probe_emu = blocked_emulator();
+    let probe_emu = blocked_emulator(1);
     let initial_probe = probe_emu.idle_current_probe();
+    let initial_horizon = probe_emu.idle_event_horizon(None);
     let probe_samples = collect_samples(args.samples, || {
         ns_per_iteration(args.iterations, |_| {
             black_box(probe_emu.idle_current_probe());
         })
     });
 
+    let horizon_samples = collect_samples(args.samples, || {
+        ns_per_iteration(args.iterations, |_| {
+            black_box(probe_emu.idle_event_horizon(None));
+        })
+    });
+
     let blocked_samples = collect_samples(args.samples, || {
-        let mut emu = blocked_emulator();
+        let mut emu = blocked_emulator(1);
         ns_per_iteration(args.iterations, |_| {
             black_box(emu.step().expect("blocked step"));
         })
     });
 
+    let mut blocked_step_results = serde_json::Map::new();
+    for length in BLOCKED_STEP_LENGTHS {
+        let samples = collect_samples(args.samples, || {
+            let mut emu = blocked_emulator(length);
+            let result = ns_per_iteration(args.iterations, |_| {
+                black_box(emu.step().expect("blocked step"));
+            });
+            black_box(&emu);
+            result
+        });
+        blocked_step_results.insert(length.to_string(), measurement(samples, loop_median));
+    }
+
     let mut advance_results = serde_json::Map::new();
     for length in ADVANCE_LENGTHS {
         let samples = collect_samples(args.samples, || {
-            let mut emu = blocked_emulator();
+            let mut emu = blocked_emulator(1);
             let result = ns_per_iteration(args.iterations, |_| {
                 emu.bus.tick_peripherals(black_box(length));
             });
@@ -168,8 +238,28 @@ fn run(args: &Args) -> Result<Value, String> {
         advance_results.insert(length.to_string(), measurement(samples, loop_median));
     }
 
+    let timer_setup_samples = collect_samples(args.samples, || {
+        let mut emu = timer_boundary_emulator();
+        ns_per_iteration(args.iterations, |iteration| {
+            prepare_timer_boundary(&mut emu, iteration as u32 + 1);
+            black_box(&emu);
+        })
+    });
+    let timer_boundary_samples = collect_samples(args.samples, || {
+        let mut emu = timer_boundary_emulator();
+        ns_per_iteration(args.iterations, |iteration| {
+            prepare_timer_boundary(&mut emu, iteration as u32 + 1);
+            let advanced = emu.step().expect("timer boundary step");
+            assert_eq!(advanced, TIMER_BOUNDARY_CYCLES as u64);
+            black_box(advanced);
+        })
+    });
+
     let probe_measurement = measurement(probe_samples, loop_median);
+    let horizon_measurement = measurement(horizon_samples, loop_median);
     let blocked_measurement = measurement(blocked_samples, loop_median);
+    let timer_setup_measurement = measurement(timer_setup_samples, loop_median);
+    let timer_boundary_measurement = measurement(timer_boundary_samples, loop_median);
     let probe_net = probe_measurement["median_net_of_loop_ns_per_op"]
         .as_f64()
         .ok_or("probe median missing")?;
@@ -184,24 +274,36 @@ fn run(args: &Args) -> Result<Value, String> {
     } else {
         0
     };
+    let timer_setup_net = timer_setup_measurement["median_net_of_loop_ns_per_op"]
+        .as_f64()
+        .ok_or("timer setup median missing")?;
+    let timer_boundary_net = timer_boundary_measurement["median_net_of_loop_ns_per_op"]
+        .as_f64()
+        .ok_or("timer boundary median missing")?;
+    let timer_boundary_path_net = (timer_boundary_net - timer_setup_net).max(0.0);
+    let no_event_125_net = blocked_step_results["125"]["median_net_of_loop_ns_per_op"]
+        .as_f64()
+        .ok_or("125-cycle blocked step median missing")?;
+    let timer_event_route_wake_increment = (timer_boundary_path_net - no_event_125_net).max(0.0);
 
     Ok(json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "rp2040_serial_idle_cost_microbenchmark",
         "backend_build": {
             "commit": BUILT_BACKEND_COMMIT,
             "dirty": built_backend_dirty(),
         },
         "execution_model": "Serial",
+        "configured_sys_clk_hz": BENCH_SYS_HZ,
         "diagnostic": true,
         "valid_for_realtime_baseline": false,
         "iterations_per_sample": args.iterations,
         "retained_samples": args.samples,
         "warmup_iterations_per_family": 10_000,
         "current_probe_scope": {
-            "complete_event_horizon": false,
-            "lazy_deadline_sources": ["timer"],
-            "active_sources_are_classified_not_deadlines": true,
+            "complete_event_horizon": true,
+            "exact_deadline_sources": ["timer", "pwm", "external"],
+            "one_cycle_conservative_sources": ["pio", "dma", "systick", "uart", "spi", "i2c", "adc", "currently-routable timer/pwm"],
             "initial_probe": {
                 "master_cycle": initial_probe.master_cycle,
                 "next_lazy_deadline": initial_probe.next_lazy_deadline,
@@ -210,19 +312,33 @@ fn run(args: &Args) -> Result<Value, String> {
                 "exact_bulk_source_count": initial_probe.exact_bulk_source_count,
                 "proven_jump_safe": initial_probe.proven_jump_safe,
             },
+            "initial_horizon": {
+                "master_cycle": initial_horizon.master_cycle,
+                "next_event_cycle": initial_horizon.next_event_cycle,
+                "distance_cycles": initial_horizon.distance_cycles,
+                "limiting_sources": event_source_names(initial_horizon.limiting_sources),
+                "one_cycle_fallback_sources": event_source_names(initial_horizon.one_cycle_fallback_sources),
+                "complete_for_current_model": initial_horizon.complete_for_current_model,
+            },
         },
         "measurements": {
             "loop_overhead": measurement(loop_samples, 0.0),
             "current_conservative_probe": probe_measurement,
+            "full_all_source_horizon_probe": horizon_measurement,
             "blocked_step_quantum_1": blocked_measurement,
+            "blocked_step_by_advance_cycles": blocked_step_results,
             "quiescent_tick_peripherals_by_advance_cycles": advance_results,
+            "timer_boundary_setup_only": timer_setup_measurement,
+            "timer_boundary_setup_and_step": timer_boundary_measurement,
+            "timer_boundary_path_net_of_setup_ns": timer_boundary_path_net,
+            "timer_event_route_wake_increment_over_no_event_125_ns": timer_event_route_wake_increment,
         },
         "screening": {
             "optimistic_break_even_cycles_excluding_boundary_and_routing_cost": optimistic_break_even,
-            "event_fire_and_route_cost_measured": false,
-            "clock_update_and_wake_check_cost_measured": false,
-            "full_all_source_horizon_cost_measured": false,
-            "eligible_for_optimization_priority_decision": false,
+            "event_fire_route_and_wake_increment_measured": true,
+            "clock_update_and_wake_check_included_in_blocked_step_measurements": true,
+            "full_all_source_horizon_cost_measured": true,
+            "eligible_for_optimization_priority_decision": true,
         },
     }))
 }

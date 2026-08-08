@@ -42,7 +42,7 @@ use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 #[cfg(feature = "idle-profiler")]
 use rp2040_emu::{
     CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_PROFILE_SCHEMA_VERSION,
-    IdleBlockerCycles, IdleBlockerEpisodes, IdleProfileSnapshot,
+    IdleBlockerCycles, IdleBlockerEpisodes, IdleHorizonEvents, IdleProfileSnapshot,
 };
 
 mod scenario;
@@ -1174,6 +1174,28 @@ fn source_episodes_json(value: &IdleBlockerEpisodes) -> String {
 }
 
 #[cfg(feature = "idle-profiler")]
+fn horizon_events_json(value: &IdleHorizonEvents) -> String {
+    format!(
+        concat!(
+            "{{\"pio\": {}, \"dma\": {}, \"pwm\": {}, \"systick\": {}, ",
+            "\"uart\": {}, \"spi\": {}, \"i2c\": {}, \"adc\": {}, ",
+            "\"timer\": {}, \"pending_irq\": {}, \"external\": {}}}"
+        ),
+        value.pio,
+        value.dma,
+        value.pwm,
+        value.systick,
+        value.uart,
+        value.spi,
+        value.i2c,
+        value.adc,
+        value.timer,
+        value.pending_irq,
+        value.external,
+    )
+}
+
+#[cfg(feature = "idle-profiler")]
 #[allow(clippy::too_many_arguments)]
 fn build_idle_profile_report(
     backend_commit: &str,
@@ -1214,6 +1236,8 @@ fn build_idle_profile_report(
             "  }},\n",
             "  \"blocked_lengths\": {},\n",
             "  \"proven_safe_lengths\": {},\n",
+            "  \"event_bounded_safe_lengths\": {},\n",
+            "  \"horizon_boundary_events\": {},\n",
             "  \"initial_horizon_distances\": {},\n",
             "  \"blocker_cycles\": {},\n",
             "  \"blocker_episodes\": {},\n",
@@ -1245,6 +1269,8 @@ fn build_idle_profile_report(
         profile.core1_wfe_blocked_cycles,
         histogram_json(&profile.blocked_lengths),
         histogram_json(&profile.proven_safe_lengths),
+        histogram_json(&profile.event_bounded_safe_lengths),
+        horizon_events_json(&profile.horizon_boundary_events),
         histogram_json(&profile.initial_horizon_distances),
         source_cycles_json(&profile.blockers),
         source_episodes_json(&profile.blocker_episodes),
@@ -2479,6 +2505,9 @@ mod tests {
         profile.exact_bulk_source_episodes.pwm = 1;
         profile.blocked_lengths.episodes_ge[0] = 2;
         profile.blocked_lengths.cycle_mass_ge[0] = 80;
+        profile.event_bounded_safe_lengths.episodes_ge[0] = 3;
+        profile.event_bounded_safe_lengths.cycle_mass_ge[0] = 64;
+        profile.horizon_boundary_events.pwm = 2;
         let run = outcome(StopReason::ScenarioDone, b"");
         let report = build_idle_profile_report(
             "0123456789012345678901234567890123456789",
@@ -2500,6 +2529,8 @@ mod tests {
         assert_eq!(parsed["stationary_source_episodes"]["uart"], 2);
         assert_eq!(parsed["exact_bulk_source_cycles"]["pwm"], 64);
         assert_eq!(parsed["exact_bulk_source_episodes"]["pwm"], 1);
+        assert_eq!(parsed["event_bounded_safe_lengths"]["cycle_mass_ge"][0], 64);
+        assert_eq!(parsed["horizon_boundary_events"]["pwm"], 2);
         assert_eq!(
             parsed["histogram_thresholds_cycles"]
                 .as_array()
