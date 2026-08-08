@@ -198,6 +198,13 @@ impl StateMachine {
         self.stalled && matches!(self.stall_kind, StallKind::Pull)
     }
 
+    /// True when this state machine is eligible for the exact bulk
+    /// pull-stall optimization in this feature branch.
+    #[cfg(feature = "pio-exact-bulk-prototype")]
+    pub(crate) fn can_bulk_advance_on_pull_stall(&self) -> bool {
+        self.stalled_on_empty_tx() && self.enabled && self.tx_fifo.is_empty()
+    }
+
     pub fn pc(&self) -> u8 {
         self.pc
     }
@@ -319,6 +326,51 @@ impl StateMachine {
         } else {
             false
         }
+    }
+
+    /// Advance `clkdiv_acc` over `cycles` system clocks as `clock_tick`
+    /// would have done, and, while the machine is in pull-stall, bump
+    /// the same stall counters on each PIO tick.
+    ///
+    /// This helper is intentionally conservative: use only when the state
+    /// machine is already known to stay stalled on empty TX for the whole
+    /// interval.
+    #[cfg(feature = "pio-exact-bulk-prototype")]
+    pub(crate) fn bulk_pull_stall_advance(&mut self, cycles: u32) -> u64 {
+        if cycles == 0 {
+            return 0;
+        }
+        if cycles == 1 {
+            let did_tick = self.clock_tick();
+            if did_tick {
+                self.stall_cycles = self.stall_cycles.wrapping_add(1);
+                if self.pc == 0x19 {
+                    self.cycles_stalled_at_pc_0x19 = self.cycles_stalled_at_pc_0x19.wrapping_add(1);
+                }
+                return 1;
+            }
+            return 0;
+        }
+
+        let threshold = if self.clkdiv_int == 0 {
+            256u32
+        } else {
+            (self.clkdiv_int as u32) * 256 + self.clkdiv_frac as u32
+        };
+
+        let total_acc = self.clkdiv_acc as u64 + (cycles as u64) * 256;
+        let threshold = threshold as u64;
+        let pio_ticks = total_acc / threshold;
+        self.clkdiv_acc = (total_acc % threshold) as u32;
+
+        if pio_ticks > 0 {
+            let delta = pio_ticks;
+            self.stall_cycles = self.stall_cycles.wrapping_add(delta);
+            if self.pc == 0x19 {
+                self.cycles_stalled_at_pc_0x19 = self.cycles_stalled_at_pc_0x19.wrapping_add(delta);
+            }
+        }
+        pio_ticks
     }
 
     /// Execute one PIO cycle. Called when clock_tick() returns true.

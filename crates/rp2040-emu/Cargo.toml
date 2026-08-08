@@ -45,6 +45,9 @@ idle-profiler = []
 # horizon and OPT0-B observable-state snapshots, but normal execution does
 # not compile any of its counters or MMIO classification hooks.
 event-horizon-profiler = ["idle-profiler", "behavior-trace"]
+# Post-OPT2-D prototype: exact bulk advance while PIO is stationary on
+# an unresolved empty-TX pull stall.
+pio-exact-bulk-prototype = ["picoem-common/pio-exact-bulk-prototype"]
 # OPT0-B deterministic streaming event contract. Kept out of default
 # builds so the performance path contains neither a disabled branch nor a
 # hash state. The optional dependency exists only in diagnostic binaries.

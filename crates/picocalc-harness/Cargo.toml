@@ -19,6 +19,8 @@ idle-profiler = ["rp2040-emu/idle-profiler"]
 # This deliberately includes the existing behavior observation machinery;
 # its output is not valid for wall-time measurement.
 event-horizon-profiler = ["idle-profiler", "behavior-trace", "rp2040-emu/event-horizon-profiler"]
+# Prototype bulk-advance diagnostics from the PIO pull-stall fast-path.
+pio-exact-bulk-prototype = ["rp2040-emu/pio-exact-bulk-prototype"]
 # Diagnostic-only OPT0-B correctness build. Normal conformance and
 # performance runners do not compile the streaming hash path.
 behavior-trace = ["rp2040-emu/behavior-trace"]
