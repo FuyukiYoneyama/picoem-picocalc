@@ -27,6 +27,15 @@ pub mod peripherals;
 #[cfg(feature = "idle-profiler")]
 mod idle_profile;
 
+#[cfg(feature = "behavior-trace")]
+mod behavior_trace;
+
+#[cfg(feature = "behavior-trace")]
+pub use behavior_trace::{
+    BEHAVIOR_TRACE_SCHEMA_VERSION, BehaviorEventDomain, BehaviorTraceDomainSnapshot,
+    BehaviorTraceSnapshot,
+};
+
 #[cfg(feature = "idle-profiler")]
 pub use idle_profile::{
     CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_HORIZON_SCHEMA_VERSION,
@@ -257,6 +266,10 @@ pub struct Emulator {
     /// diagnostic harnesses opt in through the `idle-profiler` feature.
     #[cfg(feature = "idle-profiler")]
     idle_profiler: Option<idle_profile::IdleProfiler>,
+    /// OPT0-B streaming correctness trace. Entirely absent from normal
+    /// builds so performance mode has no disabled hot-path branch.
+    #[cfg(feature = "behavior-trace")]
+    behavior_tracer: Option<behavior_trace::BehaviorTracer>,
     /// Execution model chosen at build time; cannot change
     /// post-construction. Dispatch for [`Self::step`] / [`Self::run`] /
     /// [`Self::run_quantum`] branches on this. Defaults to
@@ -661,7 +674,10 @@ impl Emulator {
             }
             return Err(EmulatorError::NotSupportedInThreadedMode);
         }
-        Ok(self.step_serial())
+        let consumed = self.step_serial();
+        #[cfg(feature = "behavior-trace")]
+        self.observe_behavior_trace();
+        Ok(consumed)
     }
 
     /// Drain the bus's pending decode-cache invalidations into both
@@ -1640,7 +1656,138 @@ impl Emulator {
     /// UART0 `DR` since the previous call. Returns empty if idle.
     pub fn drain_uart0_tx_log(&mut self) -> Vec<u8> {
         self.assert_not_placeholder();
-        self.bus.drain_uart0_tx_log()
+        let bytes = self.bus.drain_uart0_tx_log();
+        #[cfg(feature = "behavior-trace")]
+        if !bytes.is_empty()
+            && let Some(tracer) = self.behavior_tracer.as_mut()
+        {
+            tracer.record(BehaviorEventDomain::SerialBus, 1, self.clock.cycles, &bytes);
+        }
+        bytes
+    }
+
+    /// Enable and reset the OPT0-B streaming event trace.
+    ///
+    /// Only Serial mode is accepted. The initial observable state is
+    /// recorded immediately, then subsequent calls to [`Self::step`] fold
+    /// changed domains into SHA-256 without retaining an event array.
+    #[cfg(feature = "behavior-trace")]
+    pub fn enable_behavior_trace(&mut self) -> Result<(), EmulatorError> {
+        if self.execution_model != ExecutionModel::Serial {
+            return Err(EmulatorError::NotSupportedInThreadedMode);
+        }
+        let observation = self.behavior_observation();
+        self.behavior_tracer = Some(behavior_trace::BehaviorTracer::new(observation));
+        Ok(())
+    }
+
+    /// Add a harness-owned event (scenario input, LCD observation, or
+    /// another external boundary) to the same canonical stream.
+    #[cfg(feature = "behavior-trace")]
+    pub fn record_behavior_event(
+        &mut self,
+        domain: BehaviorEventDomain,
+        source: u16,
+        payload: &[u8],
+    ) {
+        if let Some(tracer) = self.behavior_tracer.as_mut() {
+            tracer.record(domain, source, self.clock.cycles, payload);
+        }
+    }
+
+    /// Route one PIO block's pin-edge events to a device domain. This
+    /// keeps the generic RP2040 backend board-agnostic while allowing a
+    /// harness to declare that, for example, PIO0 drives an LCD and PIO1
+    /// drives PSRAM in the selected target.
+    #[cfg(feature = "behavior-trace")]
+    pub fn map_behavior_pio_domain(&mut self, block: usize, domain: BehaviorEventDomain) {
+        let Some(pio) = self.bus.pio.get(block) else {
+            return;
+        };
+        let state = [pio.pad_out, pio.pad_oe];
+        if let Some(tracer) = self.behavior_tracer.as_mut() {
+            tracer.map_pio_domain(block, domain, self.clock.cycles, state);
+        }
+    }
+
+    /// Route observable GPIO input edges to a device domain. PicoCalc's
+    /// PSRAM MISO line is the motivating case; the board harness owns
+    /// that pin assignment, not the generic emulator.
+    #[cfg(feature = "behavior-trace")]
+    pub fn map_behavior_gpio_input_domain(&mut self, domain: BehaviorEventDomain) {
+        if let Some(tracer) = self.behavior_tracer.as_mut() {
+            tracer.map_gpio_input_domain(domain, self.clock.cycles, self.bus.gpio_in);
+        }
+    }
+
+    /// Finalize a clone of the streaming hash state. This is read-only and
+    /// may be called repeatedly; no event is closed or consumed.
+    #[cfg(feature = "behavior-trace")]
+    pub fn behavior_trace_snapshot(&self) -> Option<BehaviorTraceSnapshot> {
+        self.behavior_tracer
+            .as_ref()
+            .map(behavior_trace::BehaviorTracer::snapshot)
+    }
+
+    #[cfg(feature = "behavior-trace")]
+    fn observe_behavior_trace(&mut self) {
+        let observation = self.behavior_observation();
+        if let Some(tracer) = self.behavior_tracer.as_mut() {
+            tracer.observe(observation);
+        }
+    }
+
+    #[cfg(feature = "behavior-trace")]
+    fn behavior_observation(&self) -> behavior_trace::BehaviorObservation {
+        let mut pio_state = [0u32; 4];
+        for (block, pio) in self.bus.pio.iter().enumerate() {
+            pio_state[block * 2] = pio.pad_out;
+            pio_state[block * 2 + 1] = pio.pad_oe;
+        }
+        let mut dma_transfers = [0u64; crate::dma::NUM_CHANNELS];
+        for (index, value) in dma_transfers.iter_mut().enumerate() {
+            *value = self.bus.dma_channel(index).transfers_issued;
+        }
+        let mut pwm = [behavior_trace::PwmObservation::default(); 8];
+        for (index, value) in pwm.iter_mut().enumerate() {
+            if let Some(slice) = self.bus.pwm().slice(index) {
+                *value = behavior_trace::PwmObservation {
+                    enabled: slice.csr & crate::peripherals::pwm::CSR_EN != 0,
+                    ctr: slice.ctr,
+                    top: slice.top,
+                };
+            }
+        }
+        let psram = self
+            .bus
+            .psram
+            .as_ref()
+            .map(|value| behavior_trace::PsramObservation {
+                cs_falling_count: value.cs_falling_count,
+                bytes_written: value.bytes_written,
+                bytes_read: value.bytes_read,
+            });
+        behavior_trace::BehaviorObservation {
+            cycle: self.clock.cycles,
+            clock_hz: [
+                self.bus.clock_tree.sys_clk_hz,
+                self.bus.clock_tree.ref_clk_hz,
+                self.bus.clock_tree.peri_clk_hz,
+            ],
+            irq: [
+                self.bus.irq_pending,
+                self.bus.nvics[0].pending,
+                self.bus.nvics[1].pending,
+                self.cores[0].regs.xpsr & 0x1ff,
+                self.cores[1].regs.xpsr & 0x1ff,
+            ],
+            gpio_in: self.bus.gpio_in,
+            pio_state,
+            dma_transfers,
+            timer: self.bus.timer.behavior_trace_state(),
+            pwm,
+            psram,
+        }
     }
 
     /// Enable and reset the diagnostic Serial idle profiler.
@@ -1870,6 +2017,8 @@ impl EmulatorBuilder {
             pio0_sm0_last_pc: 0xFF,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
+            #[cfg(feature = "behavior-trace")]
+            behavior_tracer: None,
             execution_model: self.execution,
             #[cfg(all(
                 feature = "threading",

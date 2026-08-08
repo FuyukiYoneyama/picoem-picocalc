@@ -128,6 +128,17 @@ pub struct TimerRegs {
 }
 
 impl TimerRegs {
+    #[cfg(feature = "behavior-trace")]
+    pub(crate) fn behavior_trace_state(&self) -> [u64; 6] {
+        [
+            u64::from(self.armed),
+            u64::from(self.intr),
+            self.alarm_fire_cycle[0].unwrap_or(u64::MAX),
+            self.alarm_fire_cycle[1].unwrap_or(u64::MAX),
+            self.alarm_fire_cycle[2].unwrap_or(u64::MAX),
+            self.alarm_fire_cycle[3].unwrap_or(u64::MAX),
+        ]
+    }
     /// Create in the post-init state (all fields zero / disarmed).
     pub fn new() -> Self {
         Self {

@@ -38,6 +38,8 @@ use picocalc_board::{
     Framebuffer, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire, SdFormat, St7365p,
     St7365pWire, pins,
 };
+#[cfg(feature = "behavior-trace")]
+use rp2040_emu::{BehaviorEventDomain, BehaviorTraceSnapshot};
 use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 #[cfg(feature = "idle-profiler")]
 use rp2040_emu::{
@@ -238,6 +240,8 @@ struct Args {
     expected_uart: Vec<String>,
     #[cfg(feature = "idle-profiler")]
     idle_profile: Option<PathBuf>,
+    #[cfg(feature = "behavior-trace")]
+    behavior_trace: Option<PathBuf>,
 }
 
 /// Parse a `start:len` range, e.g. `0:10000` or `0x100:0x2000` (either
@@ -325,6 +329,11 @@ fn print_usage() {
     eprintln!(
         "         --idle-profile <path>   OPT0-A diagnostic JSON (not valid for wall-time measurement)."
     );
+    #[cfg(feature = "behavior-trace")]
+    eprintln!(
+        "         --behavior-trace <path> OPT0-B correctness artifact with streaming event hashes.\n\
+                                          Not valid for wall-time measurement."
+    );
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -363,6 +372,8 @@ fn parse_args() -> Result<Args, String> {
     let mut expected_uart: Vec<String> = Vec::new();
     #[cfg(feature = "idle-profiler")]
     let mut idle_profile: Option<PathBuf> = None;
+    #[cfg(feature = "behavior-trace")]
+    let mut behavior_trace: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -435,6 +446,8 @@ fn parse_args() -> Result<Args, String> {
             }
             #[cfg(feature = "idle-profiler")]
             "--idle-profile" => idle_profile = Some(PathBuf::from(value("--idle-profile")?)),
+            #[cfg(feature = "behavior-trace")]
+            "--behavior-trace" => behavior_trace = Some(PathBuf::from(value("--behavior-trace")?)),
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
                 psram_verify_range = Some(parse_range(&raw)?);
@@ -480,6 +493,12 @@ fn parse_args() -> Result<Args, String> {
     if stop_pc.is_some() && expected_stop.is_some() && expected_stop != Some(StopReason::PcMatch) {
         return Err("--stop-pc only permits --expect-stop pc_match".to_string());
     }
+    #[cfg(all(feature = "idle-profiler", feature = "behavior-trace"))]
+    if idle_profile.is_some() && behavior_trace.is_some() {
+        return Err(
+            "--idle-profile and --behavior-trace are separate diagnostic modes".to_string(),
+        );
+    }
 
     Ok(Args {
         bin: bin.ok_or_else(|| "missing required --bin <path>".to_string())?,
@@ -505,6 +524,8 @@ fn parse_args() -> Result<Args, String> {
         expected_uart,
         #[cfg(feature = "idle-profiler")]
         idle_profile,
+        #[cfg(feature = "behavior-trace")]
+        behavior_trace,
     })
 }
 
@@ -985,6 +1006,18 @@ fn run_loop(
                 keyboard: board.keyboard.as_deref(),
                 uart: &uart_bytes,
             });
+            #[cfg(feature = "behavior-trace")]
+            {
+                // The scenario file digest identifies the complete input
+                // program in the behavior projection. This event records
+                // when that program was observed/applied in virtual time.
+                let mut payload = Vec::with_capacity(25);
+                payload.extend_from_slice(&(e.results().len() as u64).to_be_bytes());
+                payload.push(u8::from(e.is_done()));
+                payload.extend_from_slice(&e.next_poll_ns().to_be_bytes());
+                payload.extend_from_slice(&(uart_bytes.len() as u64).to_be_bytes());
+                emu.record_behavior_event(BehaviorEventDomain::ScenarioInput, 1, &payload);
+            }
             if e.is_done() {
                 return finish(
                     emu,
@@ -1910,6 +1943,190 @@ fn build_report(
     s
 }
 
+#[cfg(feature = "behavior-trace")]
+const BEHAVIOR_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+/// Build the path- and provenance-free, explicitly allow-listed value
+/// whose canonical JSON bytes define `behavior_sha256`.
+///
+/// `serde_json` is built without `preserve_order`, so object keys are
+/// stored in sorted maps. Serialising this value is therefore a stable
+/// canonical encoding for this schema version; arrays retain event and
+/// scenario order, which is behaviorally significant.
+#[cfg(feature = "behavior-trace")]
+fn behavior_projection(
+    report: &str,
+    scenario_sha256: Option<&str>,
+    trace: &BehaviorTraceSnapshot,
+) -> Result<serde_json::Value, String> {
+    use serde_json::{Map, Value, json};
+
+    let source: Value = serde_json::from_str(report)
+        .map_err(|e| format!("parsing normal report for behavior projection: {e}"))?;
+    let source = source
+        .as_object()
+        .ok_or_else(|| "normal report root is not an object".to_string())?;
+    let mut out = Map::new();
+    out.insert("projection_schema_version".into(), json!(1));
+    for name in [
+        "execution_model",
+        "board",
+        "lcd_variant",
+        "boot",
+        "step_quantum",
+        "cycle_limit",
+        "stop_pc",
+        "stop_reason",
+        "cycles",
+        "elapsed_us",
+        "pc",
+        "exception",
+        "error",
+        "verdict",
+        "verdict_reasons",
+        "expectations",
+        "unsupported_mmio",
+        "unsupported_mmio_truncated",
+        "lcd",
+        "psram",
+        "sd",
+        "keyboard",
+        "pwm",
+        "pio",
+        "uart",
+    ] {
+        if let Some(value) = source.get(name) {
+            out.insert(name.into(), value.clone());
+        }
+    }
+    if let Some(value) = source.get("firmware").and_then(Value::as_object) {
+        out.insert("firmware".into(), json!({"sha256": value.get("sha256")}));
+    }
+    if let Some(value) = source.get("bootrom").and_then(Value::as_object) {
+        out.insert(
+            "bootrom".into(),
+            json!({
+                "sha256": value.get("sha256"),
+                "executed": value.get("executed"),
+            }),
+        );
+    }
+
+    // Basenames and output PNG paths are provenance, not behavior.
+    if let Some(value) = source.get("framebuffer").and_then(Value::as_object) {
+        let mut framebuffer = Map::new();
+        for name in ["width", "height", "rgb565_sha256", "non_black_pixels"] {
+            if let Some(item) = value.get(name) {
+                framebuffer.insert(name.into(), item.clone());
+            }
+        }
+        out.insert("framebuffer".into(), Value::Object(framebuffer));
+    }
+
+    if let Some(value) = source.get("scenario").and_then(Value::as_object) {
+        let mut scenario = Map::new();
+        for name in [
+            "name",
+            "description",
+            "status",
+            "poll_ms",
+            "steps_total",
+            "error",
+        ] {
+            if let Some(item) = value.get(name) {
+                scenario.insert(name.into(), item.clone());
+            }
+        }
+        let steps = value
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .map(|item| {
+                        let mut step = Map::new();
+                        for name in [
+                            "index",
+                            "op",
+                            "label",
+                            "status",
+                            "at_ms",
+                            "at_cycles",
+                            "detail",
+                            "rgb565_sha256",
+                        ] {
+                            if let Some(value) = item.get(name) {
+                                step.insert(name.into(), value.clone());
+                            }
+                        }
+                        Value::Object(step)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        scenario.insert("steps".into(), Value::Array(steps));
+        scenario.insert("input_sha256".into(), json!(scenario_sha256));
+        out.insert("scenario".into(), Value::Object(scenario));
+    } else {
+        out.insert("scenario_input_sha256".into(), json!(scenario_sha256));
+    }
+
+    out.insert("event_trace".into(), behavior_trace_json(trace));
+    Ok(Value::Object(out))
+}
+
+#[cfg(feature = "behavior-trace")]
+fn behavior_trace_json(trace: &BehaviorTraceSnapshot) -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "schema_version": trace.schema_version,
+        "canonical_encoding": "PICOEM-EVENT-v1",
+        "streaming": true,
+        "retains_event_array": false,
+        "total_events": trace.total_events,
+        "sha256": trace.sha256,
+        "domains": trace.domains.iter().map(|value| json!({
+            "name": value.domain.as_str(),
+            "events": value.events,
+            "sha256": value.sha256,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(feature = "behavior-trace")]
+fn build_behavior_artifact(
+    report: &str,
+    scenario_sha256: Option<&str>,
+    trace: &BehaviorTraceSnapshot,
+) -> Result<String, String> {
+    use serde_json::json;
+
+    let projection = behavior_projection(report, scenario_sha256, trace)?;
+    let canonical = serde_json::to_vec(&projection)
+        .map_err(|e| format!("serialising canonical behavior projection: {e}"))?;
+    let behavior_sha256 = sha256_hex(&canonical);
+    let artifact = json!({
+        "schema_version": BEHAVIOR_ARTIFACT_SCHEMA_VERSION,
+        "mode": "correctness_trace_on",
+        "valid_for_wall_time": false,
+        "backend_build": {
+            "commit": BUILT_BACKEND_COMMIT,
+            "dirty": built_backend_dirty(),
+        },
+        "normal_report_schema_version": SCHEMA_VERSION,
+        "behavior_projection_encoding": "sorted-json-v1",
+        "behavior_projection": projection,
+        "behavior_sha256": behavior_sha256,
+    });
+    serde_json::to_string_pretty(&artifact)
+        .map(|mut value| {
+            value.push('\n');
+            value
+        })
+        .map_err(|e| format!("serialising behavior artifact: {e}"))
+}
+
 /// Exit codes, matching `picocalc_emu`'s `tools/picocalc.py`: 0 pass,
 /// 1 the run was judged and failed, 2 it could not be judged at all.
 fn main() -> ExitCode {
@@ -1954,6 +2171,17 @@ fn run() -> Result<Verdict, String> {
     if let Some(expected) = &args.expected_backend_commit {
         validate_backend_identity(expected, BUILT_BACKEND_COMMIT, built_backend_dirty())?;
     }
+
+    #[cfg(feature = "behavior-trace")]
+    let scenario_sha256 = match &args.scenario {
+        Some(path) => Some(sha256_hex(&std::fs::read(path).map_err(|e| {
+            format!(
+                "reading scenario {} for behavior identity: {e}",
+                path.display()
+            )
+        })?)),
+        None => None,
+    };
 
     let scenario = match &args.scenario {
         Some(path) => Some(scenario::load(path)?),
@@ -2032,6 +2260,18 @@ fn run() -> Result<Verdict, String> {
         emu.enable_idle_profiler()
             .map_err(|e| format!("enabling idle profiler: {e}"))?;
     }
+    #[cfg(feature = "behavior-trace")]
+    if args.behavior_trace.is_some() {
+        emu.enable_behavior_trace()
+            .map_err(|e| format!("enabling behavior trace: {e}"))?;
+        if args.board == Board::PicoCalc && args.lcd_variant == LcdVariant::B {
+            emu.map_behavior_pio_domain(0, BehaviorEventDomain::Lcd);
+        }
+        if args.psram {
+            emu.map_behavior_pio_domain(1, BehaviorEventDomain::Psram);
+            emu.map_behavior_gpio_input_domain(BehaviorEventDomain::Psram);
+        }
+    }
 
     let handles = BoardHandles {
         lcd: lcd.clone(),
@@ -2087,6 +2327,23 @@ fn run() -> Result<Verdict, String> {
         None => (None, None),
     };
     let fb_report = build_framebuffer_report(fb.as_ref(), args.fb_png.as_deref())?;
+
+    #[cfg(feature = "behavior-trace")]
+    if args.behavior_trace.is_some() {
+        if let Some(engine) = engine.as_ref() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(engine.results().len() as u64).to_be_bytes());
+            payload.extend_from_slice(engine.status().as_bytes());
+            emu.record_behavior_event(BehaviorEventDomain::ScenarioInput, 2, &payload);
+        }
+        if let Some(lcd_report) = lcd_report.as_ref() {
+            let mut payload = lcd_report.to_json().into_bytes();
+            if let Some(framebuffer) = fb_report.as_ref() {
+                payload.extend_from_slice(framebuffer.rgb565_sha256.as_bytes());
+            }
+            emu.record_behavior_event(BehaviorEventDomain::Lcd, 1, &payload);
+        }
+    }
 
     let psram_report = if args.psram {
         let psram = emu
@@ -2223,6 +2480,16 @@ fn run() -> Result<Verdict, String> {
         &verdict,
     );
 
+    #[cfg(feature = "behavior-trace")]
+    if let Some(path) = &args.behavior_trace {
+        let snapshot = emu
+            .behavior_trace_snapshot()
+            .expect("--behavior-trace enabled the tracer before the run");
+        let artifact = build_behavior_artifact(&report, scenario_sha256.as_deref(), &snapshot)?;
+        std::fs::write(path, artifact.as_bytes())
+            .map_err(|e| format!("writing behavior trace {}: {e}", path.display()))?;
+    }
+
     match &args.json {
         Some(path) => std::fs::write(path, report.as_bytes())
             .map_err(|e| format!("writing report {}: {e}", path.display()))?,
@@ -2269,8 +2536,65 @@ mod tests {
     #[cfg(feature = "idle-profiler")]
     use rp2040_emu::IdleProfileSnapshot;
 
+    #[cfg(feature = "behavior-trace")]
+    use super::behavior_projection;
     #[cfg(feature = "idle-profiler")]
     use super::build_idle_profile_report;
+    #[cfg(feature = "behavior-trace")]
+    use rp2040_emu::{BehaviorEventDomain, BehaviorTraceDomainSnapshot, BehaviorTraceSnapshot};
+
+    #[cfg(feature = "behavior-trace")]
+    fn test_trace() -> BehaviorTraceSnapshot {
+        BehaviorTraceSnapshot {
+            schema_version: 1,
+            total_events: 1,
+            sha256: "11".repeat(32),
+            domains: vec![BehaviorTraceDomainSnapshot {
+                domain: BehaviorEventDomain::Clock,
+                events: 1,
+                sha256: "22".repeat(32),
+            }],
+        }
+    }
+
+    #[cfg(feature = "behavior-trace")]
+    #[test]
+    fn behavior_projection_excludes_provenance_paths_and_backend() {
+        let a = r#"{
+            "backend_commit":"aaa",
+            "backend_build":{"commit":"aaa","dirty":false},
+            "firmware":{"basename":"a.bin","sha256":"f"},
+            "bootrom":{"basename":"a.rom","sha256":"b","executed":false},
+            "cycles":10,
+            "framebuffer":{"width":1,"height":1,"rgb565_sha256":"c","non_black_pixels":1,"png":"a.png"},
+            "scenario":{"file":"a.json","name":"s","status":"pass","steps":[{"index":0,"status":"pass","png_basename":"a.png"}]}
+        }"#;
+        let b = a
+            .replace("\"aaa\"", "\"bbb\"")
+            .replace("a.bin", "elsewhere.bin")
+            .replace("a.rom", "elsewhere.rom")
+            .replace("a.png", "elsewhere.png")
+            .replace("a.json", "elsewhere.json");
+        assert_eq!(
+            behavior_projection(a, Some("input"), &test_trace()).unwrap(),
+            behavior_projection(&b, Some("input"), &test_trace()).unwrap()
+        );
+    }
+
+    #[cfg(feature = "behavior-trace")]
+    #[test]
+    fn behavior_projection_changes_with_behavior_and_scenario_identity() {
+        let a = r#"{"firmware":{"sha256":"f"},"cycles":10}"#;
+        let b = r#"{"firmware":{"sha256":"f"},"cycles":11}"#;
+        assert_ne!(
+            behavior_projection(a, Some("input-a"), &test_trace()).unwrap(),
+            behavior_projection(b, Some("input-a"), &test_trace()).unwrap()
+        );
+        assert_ne!(
+            behavior_projection(a, Some("input-a"), &test_trace()).unwrap(),
+            behavior_projection(a, Some("input-b"), &test_trace()).unwrap()
+        );
+    }
 
     #[test]
     fn stop_reason_strings_are_stable() {

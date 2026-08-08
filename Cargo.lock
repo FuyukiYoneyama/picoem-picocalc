@@ -2252,6 +2252,7 @@ version = "0.1.5"
 dependencies = [
  "picoem-common",
  "picoem-devices",
+ "sha2",
  "tracing",
 ]
 
