@@ -226,11 +226,10 @@ impl SpiRegs {
     }
 
     #[cfg(feature = "behavior-trace")]
-    pub(crate) fn behavior_trace_state(&self) -> [u64; 7] {
+    pub(crate) fn behavior_trace_state(&self) -> [u64; 6] {
         [
             self.tx_fifo.len() as u64,
             self.rx_fifo.len() as u64,
-            self.tx_cycle_accum,
             u64::from(self.ris),
             u64::from(self.cr0),
             u64::from(self.cr1),

@@ -80,7 +80,7 @@ pub(crate) struct BehaviorObservation {
     pub timer: [u64; 6],
     pub pwm: [PwmObservation; 8],
     pub psram: Option<PsramObservation>,
-    pub serial: [u64; 38],
+    pub serial: [u64; 34],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -363,7 +363,7 @@ mod tests {
             timer: [0; 6],
             pwm: [PwmObservation::default(); 8],
             psram: None,
-            serial: [0; 38],
+            serial: [0; 34],
         }
     }
 

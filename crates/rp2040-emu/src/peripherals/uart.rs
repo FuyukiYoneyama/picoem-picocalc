@@ -239,11 +239,10 @@ impl UartRegs {
     }
 
     #[cfg(feature = "behavior-trace")]
-    pub(crate) fn behavior_trace_state(&self) -> [u64; 5] {
+    pub(crate) fn behavior_trace_state(&self) -> [u64; 4] {
         [
             self.tx_fifo.len() as u64,
             self.rx_fifo.len() as u64,
-            self.tx_cycle_accum,
             u64::from(self.ris),
             u64::from(self.cr),
         ]

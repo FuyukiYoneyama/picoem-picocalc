@@ -864,14 +864,14 @@ impl Bus {
     }
 
     #[cfg(feature = "behavior-trace")]
-    pub(crate) fn behavior_serial_state(&self) -> [u64; 38] {
-        let mut state = [0u64; 38];
-        state[0..5].copy_from_slice(&self.uart0.behavior_trace_state());
-        state[5..10].copy_from_slice(&self.uart1.behavior_trace_state());
-        state[10..17].copy_from_slice(&self.spi0.behavior_trace_state());
-        state[17..24].copy_from_slice(&self.spi1.behavior_trace_state());
-        state[24..31].copy_from_slice(&self.i2c0.behavior_trace_state());
-        state[31..38].copy_from_slice(&self.i2c1.behavior_trace_state());
+    pub(crate) fn behavior_serial_state(&self) -> [u64; 34] {
+        let mut state = [0u64; 34];
+        state[0..4].copy_from_slice(&self.uart0.behavior_trace_state());
+        state[4..8].copy_from_slice(&self.uart1.behavior_trace_state());
+        state[8..14].copy_from_slice(&self.spi0.behavior_trace_state());
+        state[14..20].copy_from_slice(&self.spi1.behavior_trace_state());
+        state[20..27].copy_from_slice(&self.i2c0.behavior_trace_state());
+        state[27..34].copy_from_slice(&self.i2c1.behavior_trace_state());
         state
     }
 
