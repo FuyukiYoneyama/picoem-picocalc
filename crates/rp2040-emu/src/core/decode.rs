@@ -24,8 +24,6 @@
 
 use super::{CoreBus, CortexM0Plus};
 use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
-#[cfg(feature = "xip-decode-cursor-prototype")]
-use crate::core::{XIP_DECODE_CURSOR_MAX_ENTRIES, is_immutable_xip_entry};
 
 /// Direct-mapped index mask for the decode cache. Kept local to avoid
 /// crossing `pub(crate)` visibility boundaries for a one-liner.
@@ -173,24 +171,14 @@ impl CortexM0Plus {
         bus.set_active_pc(pc);
 
         // Cache lookup — `DecodedOp: Copy`, so no borrow on `bus`
-        // survives into dispatch.  The OPT3-B candidate may satisfy this
-        // lookup from a three-entry immutable-XIP cursor populated from
-        // the same cache.  It never batches execution: callers still
-        // enter this function once per architectural instruction.
-        #[cfg(feature = "xip-decode-cursor-prototype")]
-        let cursor_entry = self.take_short_decode_cursor_if_pc_matches(pc);
-        #[cfg(not(feature = "xip-decode-cursor-prototype"))]
-        let cursor_entry: Option<DecodedOp> = None;
-        let cache_entry = if cursor_entry.is_none() && is_cacheable_pc(pc) {
+        // survives into dispatch.
+        let entry = if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
             let e = self.decode_cache[slot];
             if e.tag == pc { Some(e) } else { None }
         } else {
             None
         };
-        #[cfg(feature = "xip-decode-cursor-prototype")]
-        let ordinary_cache_hit = cursor_entry.is_none() && cache_entry.is_some();
-        let entry = cursor_entry.or(cache_entry);
         #[cfg(feature = "event-horizon-profiler")]
         let hit = entry.is_some();
 
@@ -209,10 +197,7 @@ impl CortexM0Plus {
         let hw0 = entry.hw0;
         let hw1 = entry.hw1;
 
-        #[cfg(any(
-            feature = "event-horizon-profiler",
-            feature = "xip-decode-cursor-prototype"
-        ))]
+        #[cfg(feature = "event-horizon-profiler")]
         let expected_next_pc = pc.wrapping_add(if entry.is_wide() { 4 } else { 2 });
         let cycles = if entry.is_wide() {
             self.regs.set_pc(pc.wrapping_add(4));
@@ -229,43 +214,7 @@ impl CortexM0Plus {
                     crate::running_profile::ImmutableXipHitRunTerminationReason::PostExecuteNextPcRedirect,
                 );
         }
-        #[cfg(feature = "xip-decode-cursor-prototype")]
-        {
-            let sequential = self.regs.pc() == expected_next_pc;
-            let faulted = bus.bus_fault() || self.pending_fault.is_some();
-            if !sequential || faulted {
-                self.clear_xip_decode_cursor();
-            } else if ordinary_cache_hit || self.xip_decode_cursor_is_empty() {
-                self.refill_short_xip_decode_cursor(expected_next_pc);
-            }
-        }
         cycles
-    }
-
-    /// Copy at most three already-valid successor entries from the ordinary
-    /// decode cache into the OPT3-B cursor.  A miss, alias boundary, or wide
-    /// instruction crossing the immutable-XIP boundary stops the fill.  No
-    /// bus read and no decode-cache population is performed here.
-    #[cfg(feature = "xip-decode-cursor-prototype")]
-    #[inline(always)]
-    fn refill_short_xip_decode_cursor(&mut self, mut pc: u32) {
-        let mut entries = [DecodedOp::empty(); XIP_DECODE_CURSOR_MAX_ENTRIES];
-        let mut count = 0usize;
-        while count < entries.len() {
-            let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
-            let entry = self.decode_cache[slot];
-            if entry.tag != pc || !is_immutable_xip_entry(pc, entry) {
-                break;
-            }
-            entries[count] = entry;
-            count += 1;
-            pc = pc.wrapping_add(if entry.is_wide() { 4 } else { 2 });
-        }
-        if count == 0 {
-            self.clear_xip_decode_cursor();
-        } else {
-            self.install_short_decode_cursor_entries(&entries[..count]);
-        }
     }
 
     /// Populate path — runs on a cache miss. Fetches `hw0` (and `hw1`
@@ -770,107 +719,6 @@ mod classifier_tests {
     /// FNV-1a 64-bit hash of `classify_thumb16_misc_pure` over the
     /// 16 misc sub-ops (canonical prefix 1011_0).
     const MISC_PURE_FINGERPRINT: u64 = 0x08fb8e07b596aaac;
-}
-
-#[cfg(all(test, feature = "xip-decode-cursor-proof"))]
-mod decode_cursor_proof_tests {
-    use super::*;
-    use crate::bus::Bus;
-
-    fn run_decode_at(core: &mut CortexM0Plus, bus: &mut Bus, pc: u32) {
-        core.regs.set_pc(pc);
-        core.decode_execute(bus);
-    }
-
-    #[test]
-    fn xip_cursor_cursor_refill_after_cache_hit_stages_three_and_take_hit() {
-        let mut core = CortexM0Plus::new();
-        let mut bus = Bus::default();
-        const PC: u32 = 0x1000_0000;
-
-        let mut program = Vec::new();
-        program.extend_from_slice(&0xBF00u16.to_le_bytes());
-        program.extend_from_slice(&0xBF00u16.to_le_bytes());
-        program.extend_from_slice(&0xBF00u16.to_le_bytes());
-        program.extend_from_slice(&0xBF00u16.to_le_bytes());
-        bus.load_flash(&program);
-
-        core.populate_decode_cache(&mut bus, PC);
-        core.populate_decode_cache(&mut bus, PC + 2);
-        core.populate_decode_cache(&mut bus, PC + 4);
-        core.populate_decode_cache(&mut bus, PC + 6);
-
-        core.enable_xip_decode_cursor();
-        run_decode_at(&mut core, &mut bus, PC);
-
-        let after_first = core.xip_decode_cursor_proof_snapshot();
-        assert_eq!(after_first.buffered_entries, 3);
-        assert_eq!(after_first.installs, 1);
-        assert_eq!(after_first.staged_entries, 3);
-
-        run_decode_at(&mut core, &mut bus, PC + 2);
-        let after_second = core.xip_decode_cursor_proof_snapshot();
-        assert_eq!(after_second.take_hits, 1);
-        assert_eq!(after_second.take_misses, 1);
-        assert_eq!(after_second.buffered_entries, 2);
-    }
-
-    #[test]
-    fn xip_cursor_wide_then_narrow_buffered_entries_advance_with_width() {
-        let mut core = CortexM0Plus::new();
-        let mut bus = Bus::default();
-        const PC: u32 = 0x1000_0000;
-
-        let mut program = Vec::new();
-        program.extend_from_slice(&0xBF00u16.to_le_bytes()); // NOP
-        program.extend_from_slice(&0xF3BFu16.to_le_bytes()); // DMB #0xF
-        program.extend_from_slice(&0x8F5Fu16.to_le_bytes()); // DMB #0xF wide second half
-        program.extend_from_slice(&0xBF00u16.to_le_bytes()); // NOP at +6
-        bus.load_flash(&program);
-
-        core.populate_decode_cache(&mut bus, PC);
-        core.populate_decode_cache(&mut bus, PC + 2);
-        core.populate_decode_cache(&mut bus, PC + 6);
-
-        core.enable_xip_decode_cursor();
-        run_decode_at(&mut core, &mut bus, PC);
-        assert_eq!(core.xip_decode_cursor_proof_snapshot().buffered_entries, 2);
-
-        run_decode_at(&mut core, &mut bus, PC + 2);
-        assert_eq!(core.regs.pc(), PC + 6);
-        assert_eq!(core.xip_decode_cursor_proof_snapshot().buffered_entries, 1);
-
-        run_decode_at(&mut core, &mut bus, PC + 6);
-        let snapshot = core.xip_decode_cursor_proof_snapshot();
-        assert_eq!(snapshot.take_hits, 2);
-        assert_eq!(snapshot.take_misses, 1);
-        assert_eq!(snapshot.buffered_entries, 0);
-    }
-
-    #[test]
-    fn xip_cursor_branch_redirect_clears_buffered_entries() {
-        let mut core = CortexM0Plus::new();
-        let mut bus = Bus::default();
-        const PC: u32 = 0x1000_0000;
-
-        let mut program = Vec::new();
-        program.extend_from_slice(&0xBF00u16.to_le_bytes());
-        program.extend_from_slice(&0xE000u16.to_le_bytes());
-        program.extend_from_slice(&0xBF00u16.to_le_bytes());
-        bus.load_flash(&program);
-
-        core.populate_decode_cache(&mut bus, PC);
-        core.populate_decode_cache(&mut bus, PC + 2);
-        core.populate_decode_cache(&mut bus, PC + 4);
-
-        core.enable_xip_decode_cursor();
-        run_decode_at(&mut core, &mut bus, PC);
-        assert_eq!(core.xip_decode_cursor_proof_snapshot().buffered_entries, 2);
-
-        run_decode_at(&mut core, &mut bus, PC + 2);
-        assert_eq!(core.regs.pc(), PC + 6);
-        assert_eq!(core.xip_decode_cursor_proof_snapshot().buffered_entries, 0);
-    }
 }
 
 #[cfg(all(test, feature = "event-horizon-profiler"))]

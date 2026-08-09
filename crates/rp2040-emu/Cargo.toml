@@ -49,10 +49,6 @@ event-horizon-profiler = ["idle-profiler", "behavior-trace"]
 # builds so the performance path contains neither a disabled branch nor a
 # hash state. The optional dependency exists only in diagnostic binaries.
 behavior-trace = ["dep:sha2"]
-# Prototype short immutable-XIP decode cursor tracking (feature only).
-xip-decode-cursor-prototype = []
-# Proof build for short immutable-XIP decode cursor semantics.
-xip-decode-cursor-proof = ["xip-decode-cursor-prototype"]
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }
