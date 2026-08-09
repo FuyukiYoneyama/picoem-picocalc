@@ -11807,6 +11807,28 @@ mod stage4_core_residue_v2 {
         assert_eq!(cpu.regs.pc(), pc + 8);
     }
 
+    #[cfg(feature = "compact-dispatch-key-prototype")]
+    #[test]
+    fn cache_hit_narrow_special_data_dispatches_from_compact_key() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        let pc = 0x2000_0000u32;
+        let target = 0x2000_0020u32;
+
+        // BX r2 has the same top five bits as data-processing operations;
+        // bit 10 is the distinction the compact key must preserve.
+        bus.write16(pc, 0x4710);
+        bus.write16(target, 0xBF00);
+        cpu.regs.r[2] = target | 1;
+
+        cpu.regs.set_pc(pc);
+        cpu.decode_execute(&mut bus); // populate
+        cpu.regs.set_pc(pc);
+        cpu.decode_execute(&mut bus); // cache hit through compact key
+
+        assert_eq!(cpu.regs.pc(), target);
+    }
+
     /// L178 — cache slot lookup MISS path with cacheable PC. The slot
     /// already holds a different tag, so the `e.tag == pc` check fails
     /// and `populate_decode_cache` runs.
