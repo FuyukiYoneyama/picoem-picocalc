@@ -86,6 +86,10 @@ jobs:
         run: rustfmt --edition 2024 --check crates/rp2040-emu/src/idle_profile.rs
       - name: Check the OPT2-D RP2040 module
         run: rustfmt --edition 2024 --check crates/rp2040-emu/src/running_profile.rs
+      - name: Check the NEXT-2B DMA audio modules
+        run: |
+          rustfmt --edition 2024 --check crates/rp2040-emu/src/dma.rs
+          rustfmt --edition 2024 --check crates/rp2040-emu/src/audio_sink.rs
 
   clippy:
     runs-on: ubuntu-24.04

@@ -41,6 +41,10 @@
 use crate::bus::Bus;
 use crate::dreq::DREQ_FORCE;
 use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1};
+use crate::{
+    AudioSinkSnapshot,
+    audio_sink::{AudioSink, PICOCALC_AUDIO_TIMER_INDEX},
+};
 
 /// Total number of DMA channels on RP2040 (datasheet §2.5).
 pub const NUM_CHANNELS: usize = 12;
@@ -85,6 +89,11 @@ const REG_TIMER0: u32 = 0x420;
 const REG_TIMER1: u32 = 0x424;
 const REG_TIMER2: u32 = 0x428;
 const REG_TIMER3: u32 = 0x42C;
+// DREQ indices for DMA-internal fractional-rate timer sources.
+const DREQ_TIMER0: u8 = 59;
+const DREQ_TIMER1: u8 = 60;
+const DREQ_TIMER2: u8 = 61;
+const DREQ_TIMER3: u8 = 62;
 const REG_MULTI_CHAN_TRIGGER: u32 = 0x430;
 const REG_SNIFF_CTRL: u32 = 0x434;
 const REG_SNIFF_DATA: u32 = 0x438;
@@ -276,6 +285,25 @@ pub struct Dma {
     intf0: u32,
     intf1: u32,
     timer: [u32; 4],
+    /// Per-timer fractional accumulator for DMA-internal pacing DREQ
+    /// sources 59..62.
+    timer_accum: [u64; 4],
+    /// Cumulative count of timer pacing due events.
+    timer_event_count: [u64; 4],
+    /// Cumulative count of timer events missed by inactive channels or
+    /// arbitration loss.
+    timer_miss_count: [u64; 4],
+    /// Theoretical first due-cycle (absolute bus `master_cycle`) for each
+    /// timer in the active `tick()` window.
+    timer_due_cycle: [u64; 4],
+    /// Theoretical due-cycle for the most recently-selected timer event.
+    last_selected_timer_due_cycle: Option<u64>,
+    /// Per-window event count for timer pacing.
+    timer_window_events: [u64; 4],
+    /// Per-window miss count for timer pacing.
+    timer_window_misses: [u64; 4],
+    /// Streaming observation of DMA-origin writes to PicoCalc PWM5_CC.
+    audio_sink: AudioSink,
     sniff_ctrl: u32,
     sniff_data: u32,
 }
@@ -297,6 +325,14 @@ impl Dma {
             intf0: 0,
             intf1: 0,
             timer: [0; 4],
+            timer_accum: [0; 4],
+            timer_event_count: [0; 4],
+            timer_miss_count: [0; 4],
+            timer_due_cycle: [0; 4],
+            last_selected_timer_due_cycle: None,
+            timer_window_events: [0; 4],
+            timer_window_misses: [0; 4],
+            audio_sink: AudioSink::default(),
             sniff_ctrl: 0,
             sniff_data: 0,
         }
@@ -307,20 +343,137 @@ impl Dma {
         *self = Self::new();
     }
 
+    /// Last theoretical due-cycle for the most recently-selected timer event.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn last_selected_timer_due_cycle(&self) -> Option<u64> {
+        self.last_selected_timer_due_cycle
+    }
+
+    /// Cumulative timer source event count.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn timer_event_count(&self, idx: usize) -> u64 {
+        self.timer_event_count[idx]
+    }
+
+    /// Cumulative timer source miss count.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn timer_miss_count(&self, idx: usize) -> u64 {
+        self.timer_miss_count[idx]
+    }
+
+    /// Per-window timer source miss count.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn timer_window_misses(&self, idx: usize) -> u64 {
+        self.timer_window_misses[idx]
+    }
+
+    /// Per-window timer source event count.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn timer_window_events(&self, idx: usize) -> u64 {
+        self.timer_window_events[idx]
+    }
+
+    /// Snapshot the digital PicoCalc audio sample sink.
+    pub fn audio_sink_snapshot(&self) -> AudioSinkSnapshot {
+        let mut snapshot = self.audio_sink.snapshot();
+        snapshot.timer_event_count = self.timer_event_count[PICOCALC_AUDIO_TIMER_INDEX];
+        snapshot.timer_miss_count = self.timer_miss_count[PICOCALC_AUDIO_TIMER_INDEX];
+        snapshot
+    }
+
     /// True iff no channel is currently transferring (no `BUSY`) and no
     /// IRQ is latched. Consulted by the fast-path gate in
     /// [`crate::Emulator::step`] — when false, the slow path runs so
     /// `tick_dma` can issue transfers.
     #[inline]
     pub fn is_idle(&self) -> bool {
-        !self.channels.iter().any(|c| c.busy) && self.intr == 0
+        !self.channels.iter().any(|c| c.busy) && self.intr == 0 && !self.has_active_timing_sources()
+    }
+
+    #[inline]
+    fn has_active_timing_sources(&self) -> bool {
+        self.timer
+            .iter()
+            .any(|reg| ((reg >> 16) & 0xFFFF) != 0 && (reg & 0xFFFF) != 0)
+    }
+
+    #[inline]
+    fn timer_index_from_treq(treq: u8) -> Option<usize> {
+        match treq {
+            DREQ_TIMER0 => Some(0),
+            DREQ_TIMER1 => Some(1),
+            DREQ_TIMER2 => Some(2),
+            DREQ_TIMER3 => Some(3),
+            _ => None,
+        }
+    }
+
+    /// Reset one timer's pacing state after any register write.
+    /// Requirement: writes re-phase from that moment rather than
+    /// keeping stale carry into the first post-write pulse.
+    fn reset_timer_state(&mut self, idx: usize) {
+        self.timer_accum[idx] = 0;
+        self.timer_due_cycle[idx] = 0;
+        self.timer_window_events[idx] = 0;
+        self.timer_window_misses[idx] = 0;
+    }
+
+    /// Advance fractional accumulators for the configured duration and
+    /// compute timer due events for that window.
+    fn advance_timer_pacing(
+        &mut self,
+        window_start: u64,
+        window_end: u64,
+        window_events: &mut [u64; 4],
+    ) {
+        let cycles = window_end.saturating_sub(window_start);
+
+        for i in 0..4 {
+            window_events[i] = 0;
+            self.timer_due_cycle[i] = 0;
+            self.timer_window_events[i] = 0;
+            self.timer_window_misses[i] = 0;
+        }
+
+        for i in 0..4 {
+            let reg = self.timer[i];
+            let x = ((reg >> 16) & 0xFFFF) as u64;
+            let y = (reg & 0xFFFF) as u64;
+            if x == 0 || y == 0 {
+                self.reset_timer_state(i);
+                continue;
+            }
+
+            let acc = self.timer_accum[i];
+            let x_u128 = x as u128;
+            let y_u128 = y as u128;
+            let total = (acc as u128) + (cycles as u128) * x_u128;
+            let due = (total / y_u128) as u64;
+            let rem = (total % y_u128) as u64;
+            self.timer_accum[i] = rem;
+
+            if due > 0 {
+                // Keep the latest theoretical due-cycle for the last pulse
+                // generated in this quantum for deterministic probes.
+                let first_due = (y_u128 - (acc as u128)).div_ceil(x_u128) as u64;
+                self.timer_due_cycle[i] = window_start.saturating_add(first_due);
+                window_events[i] = due;
+                self.timer_window_events[i] = due;
+                self.timer_event_count[i] = self.timer_event_count[i].saturating_add(due);
+            }
+        }
     }
 
     /// OPT0 diagnostic classification. A latched but masked completion is
     /// static; only a BUSY channel advances transfer state with time.
     pub(crate) fn idle_profile_state(&self) -> crate::idle_profile::IdlePeripheralState {
         crate::idle_profile::IdlePeripheralState {
-            temporal_work: self.channels.iter().any(|c| c.busy),
+            temporal_work: self.channels.iter().any(|c| c.busy) || self.has_active_timing_sources(),
             routable_irq: ((self.intr | self.intf0) & self.inte0) != 0
                 || ((self.intr | self.intf1) & self.inte1) != 0,
             static_state: self.intr != 0 || self.intf0 != 0 || self.intf1 != 0,
@@ -421,10 +574,22 @@ impl Dma {
                 let bits = apply_alias(0, value, alias);
                 self.intr &= !bits;
             }
-            REG_TIMER0 => self.timer[0] = apply_alias(self.timer[0], value, alias),
-            REG_TIMER1 => self.timer[1] = apply_alias(self.timer[1], value, alias),
-            REG_TIMER2 => self.timer[2] = apply_alias(self.timer[2], value, alias),
-            REG_TIMER3 => self.timer[3] = apply_alias(self.timer[3], value, alias),
+            REG_TIMER0 => {
+                self.timer[0] = apply_alias(self.timer[0], value, alias);
+                self.reset_timer_state(0);
+            }
+            REG_TIMER1 => {
+                self.timer[1] = apply_alias(self.timer[1], value, alias);
+                self.reset_timer_state(1);
+            }
+            REG_TIMER2 => {
+                self.timer[2] = apply_alias(self.timer[2], value, alias);
+                self.reset_timer_state(2);
+            }
+            REG_TIMER3 => {
+                self.timer[3] = apply_alias(self.timer[3], value, alias);
+                self.reset_timer_state(3);
+            }
             REG_MULTI_CHAN_TRIGGER => {
                 // Write a bitmask of channels to trigger — sets BUSY on
                 // each bit, only if the channel is configured (`CTRL.EN`
@@ -568,17 +733,43 @@ impl Dma {
     /// Snapshots DREQ lines before issuing any bus access so peripheral
     /// state changes produced by the transfer don't feed back into
     /// same-cycle DREQ arbitration.
-    pub fn tick(&mut self, bus: &mut Bus) {
-        let dreqs = bus.collect_dreqs();
+    pub fn tick(&mut self, bus: &mut Bus, cycles: u32) {
+        let window_end = bus.master_cycle;
+        let window_start = window_end.saturating_sub(cycles as u64);
+        let mut window_events = [0u64; 4];
+        self.last_selected_timer_due_cycle = None;
+        self.advance_timer_pacing(window_start, window_end, &mut window_events);
+
+        // Timer DREQ is not buffered across windows: any event in this
+        // tick window must be consumed now or counted as missed.
+        self.timer_window_events.copy_from_slice(&window_events);
+
+        if self.channels.iter().all(|ch| !ch.busy) {
+            for i in 0..4 {
+                let missed = window_events[i];
+                self.timer_window_misses[i] = missed;
+                self.timer_miss_count[i] = self.timer_miss_count[i].saturating_add(missed);
+            }
+            return;
+        }
+
         // Lowest-index channel wins arbitration.
+        let dreqs = bus.collect_dreqs();
         let mut selected: Option<usize> = None;
+        let mut selected_timer_idx: Option<usize> = None;
         for i in 0..NUM_CHANNELS {
             let ch = &self.channels[i];
             if !ch.busy {
                 continue;
             }
             let treq = ch.treq_sel();
-            let ready = treq == DREQ_FORCE || (treq < 64 && (dreqs >> treq) & 1 != 0);
+            let ready = if treq == DREQ_FORCE {
+                true
+            } else if let Some(timer_idx) = Self::timer_index_from_treq(treq) {
+                window_events[timer_idx] > 0
+            } else {
+                treq < 64 && (dreqs >> treq) & 1 != 0
+            };
             if ready {
                 // Diagnostic: record that this channel's TREQ_SEL was
                 // satisfied at least once. Kept sticky so per-channel
@@ -587,12 +778,26 @@ impl Dma {
                 self.channels[i].dreq_observed_mask |= 1u64 << treq;
                 if selected.is_none() {
                     selected = Some(i);
+                    if let Some(timer_idx) = Self::timer_index_from_treq(treq) {
+                        selected_timer_idx = Some(timer_idx);
+                    }
                 }
             }
         }
+
+        for i in 0..4 {
+            let consumed = (selected_timer_idx == Some(i)) as u64;
+            let missed = window_events[i].saturating_sub(consumed);
+            self.timer_window_misses[i] = missed;
+            self.timer_miss_count[i] = self.timer_miss_count[i].saturating_add(missed);
+        }
+
         let Some(idx) = selected else {
             return;
         };
+        if let Some(timer_idx) = Self::timer_index_from_treq(self.channels[idx].treq_sel()) {
+            self.last_selected_timer_due_cycle = Some(self.timer_due_cycle[timer_idx]);
+        }
         self.issue_transfer(idx, bus);
     }
 
@@ -602,7 +807,7 @@ impl Dma {
         // observation; does not alter control flow.
         self.channels[ch_idx].transfers_issued =
             self.channels[ch_idx].transfers_issued.wrapping_add(1);
-        let (read_addr, write_addr, size, incr_read, incr_write, ring, ring_on_write) = {
+        let (read_addr, write_addr, size, incr_read, incr_write, ring, ring_on_write, treq) = {
             let ch = &self.channels[ch_idx];
             (
                 ch.read_addr,
@@ -612,8 +817,16 @@ impl Dma {
                 (ch.ctrl & CTRL_INCR_WRITE) != 0,
                 ch.ring_size(),
                 ch.ring_on_write(),
+                ch.treq_sel(),
             )
         };
+        let timer_fraction = Self::timer_index_from_treq(treq).map(|timer_idx| {
+            let value = self.timer[timer_idx];
+            (((value >> 16) & 0xffff) as u16, (value & 0xffff) as u16)
+        });
+        let timer_due_cycle =
+            Self::timer_index_from_treq(treq).and(self.last_selected_timer_due_cycle);
+        let service_cycle = bus.master_cycle;
 
         // Issue one transfer. Real AHB would split address / data
         // phases; emulator collapses into one cycle.
@@ -627,6 +840,15 @@ impl Dma {
             2 => bus.write16(write_addr, value as u16),
             _ => bus.write32(write_addr, value),
         }
+        self.audio_sink.observe_dma_write(
+            write_addr,
+            size,
+            value,
+            treq,
+            timer_fraction,
+            timer_due_cycle,
+            service_cycle,
+        );
 
         // Update addresses.
         let ch = &mut self.channels[ch_idx];
@@ -1238,5 +1460,192 @@ mod tests {
             DREQ_UART0_TX,
         );
         let _ = RESET_UART1;
+    }
+
+    #[test]
+    fn timer_dreq_disabled_when_x_or_y_zero() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src = 0x2000_0100;
+        let dst = 0x2000_0200;
+        bus.write32(src, 0x1234_5678);
+
+        let ctrl = make_ctrl(true, true, true, 2, 0, 59, 0, false, false);
+        bus.write32(DMA_BASE, src);
+        bus.write32(DMA_BASE + 0x04, dst);
+        bus.write32(DMA_BASE + 0x08, 1);
+        bus.write32(DMA_BASE + 0x0C, ctrl);
+
+        // x=0 disables; y=15625.
+        bus.write32(DMA_BASE + REG_TIMER0, 15625);
+        bus.tick_dma_with_cycles(40);
+        assert_eq!(bus.read32(dst), 0);
+        assert_eq!(bus.dma.channel(0).trans_count, 1);
+        assert!(bus.dma.channel(0).busy);
+
+        // y=0 also disables.
+        bus.write32(DMA_BASE + REG_TIMER0, 3u32 << 16);
+        bus.tick_dma_with_cycles(200);
+        assert_eq!(bus.read32(dst), 0);
+        assert_eq!(bus.dma.channel(0).trans_count, 1);
+        assert!(bus.dma.channel(0).busy);
+    }
+
+    #[test]
+    fn timer_pacing_3_over_15625_has_5208_5209_gaps_when_sampled_per_cycle() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src = 0x2000_0100;
+        let dst = 0x2000_0200;
+        for i in 0..16u32 {
+            bus.write32(src + i * 4, 0x2000_1000 + i);
+        }
+        // 3/15625 per CLK_SYS ~ 1/5208.333, so gaps are 5208/5209 cycles.
+        bus.write32(DMA_BASE + REG_TIMER0, (3u32 << 16) | 15625);
+        bus.write32(DMA_BASE, src);
+        bus.write32(DMA_BASE + 0x04, dst);
+        bus.write32(DMA_BASE + 0x08, 16);
+        let ctrl = make_ctrl(true, true, true, 2, 0, 59, 0, false, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl);
+
+        let mut gaps = Vec::<u32>::new();
+        let mut last_fire: Option<u32> = None;
+        let mut issued = 0u64;
+        for cycle in 0..90_000u32 {
+            bus.master_cycle = bus.master_cycle.saturating_add(1);
+            bus.tick_peripherals(1);
+            let now = bus.dma.channel(0).transfers_issued;
+            if now != issued {
+                let at = cycle + 1;
+                if let Some(prev) = last_fire {
+                    gaps.push(at - prev);
+                }
+                last_fire = Some(at);
+                issued = now;
+                if issued >= 10 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(issued, 10);
+        assert!(!gaps.is_empty());
+        assert!(
+            gaps.iter().all(|&gap| gap == 5208 || gap == 5209),
+            "unexpected gap values: {:?}",
+            gaps
+        );
+        assert!(gaps.contains(&5208));
+        assert!(gaps.contains(&5209));
+    }
+
+    #[test]
+    fn timer_write_resets_accumulator_and_rephases_due_cadence() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        bus.write32(DMA_BASE + REG_TIMER0, (1u32 << 16) | 4);
+        bus.master_cycle = bus.master_cycle.saturating_add(3);
+        bus.tick_dma_with_cycles(3);
+
+        // Rewrite mid-cycle should clear fractional carry and restart cadence
+        // from this point; if carry were preserved, this window would produce
+        // a due event.
+        bus.write32(DMA_BASE + REG_TIMER0, (1u32 << 16) | 4);
+        bus.master_cycle = bus.master_cycle.saturating_add(3);
+        bus.tick_dma_with_cycles(3);
+        assert_eq!(bus.dma.timer_window_events(0), 0);
+        assert_eq!(bus.dma.timer_event_count(0), 0);
+
+        bus.master_cycle = bus.master_cycle.saturating_add(1);
+        bus.tick_dma_with_cycles(1);
+        assert_eq!(bus.dma.timer_event_count(0), 1);
+    }
+
+    #[test]
+    fn timer0_treq_drives_transfer_according_to_programmed_rate() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        let src = 0x2000_0100;
+        let dst = 0x2000_0200;
+        for i in 0..4u32 {
+            bus.write32(src + i * 4, 0xA000_0000 + i);
+        }
+        // 3/15625 pacing: first pulse arrives after 5208..5209 sysclks.
+        bus.write32(DMA_BASE + REG_TIMER0, (3u32 << 16) | 15625);
+        bus.write32(DMA_BASE, src);
+        bus.write32(DMA_BASE + 0x04, dst);
+        bus.write32(DMA_BASE + 0x08, 4);
+        let ctrl = make_ctrl(true, true, true, 2, 0, 59, 0, false, false);
+        bus.write32(DMA_BASE + 0x0C, ctrl);
+
+        bus.master_cycle = bus.master_cycle.saturating_add(5208);
+        bus.tick_peripherals(5208);
+        // No transfer yet if we stop before the theoretical first due.
+        assert_eq!(bus.read32(dst), 0);
+
+        bus.master_cycle = bus.master_cycle.saturating_add(1);
+        bus.tick_peripherals(1);
+        assert_eq!(bus.dma.last_selected_timer_due_cycle(), Some(5209));
+        assert_eq!(bus.read32(dst), 0xA000_0000);
+        assert!(bus.dma.channel(0).busy);
+
+        // Next event should land after another 5208 cycles.
+        bus.master_cycle = bus.master_cycle.saturating_add(5208);
+        bus.tick_peripherals(5208);
+        assert_eq!(bus.dma.last_selected_timer_due_cycle(), Some(10417));
+        assert_eq!(bus.read32(dst + 4), 0xA000_0001);
+    }
+
+    #[test]
+    fn timer_miss_is_recorded_when_events_are_not_selected_and_not_replayed() {
+        let mut bus = Bus::new();
+        release_dma(&mut bus);
+
+        // Timer0: one pulse per 4 cycles.
+        bus.write32(DMA_BASE + REG_TIMER0, (1u32 << 16) | 4);
+
+        // Run long enough to accumulate two missed pulses while no channel
+        // can consume them.
+        bus.master_cycle = bus.master_cycle.saturating_add(8);
+        bus.tick_dma_with_cycles(8);
+        assert_eq!(bus.dma.timer_event_count(0), 2);
+        assert_eq!(bus.dma.timer_miss_count(0), 2);
+
+        // Arm a timer consumer only after misses are accumulated.
+        let src = 0x2000_0200;
+        let dst = 0x2000_0400;
+        for i in 0..4u32 {
+            bus.write32(src + i * 4, 0x2000_0000 + i);
+        }
+        bus.write32(DMA_BASE + 0x40, src);
+        bus.write32(DMA_BASE + 0x44, dst);
+        bus.write32(DMA_BASE + 0x48, 4);
+        bus.write32(
+            DMA_BASE + 0x4C,
+            make_ctrl(true, true, true, 2, 0, 59, 0, false, false),
+        );
+
+        // Three cycles with no new due in this window: no burst from stale
+        // pulses should occur.
+        for _ in 0..3 {
+            bus.master_cycle = bus.master_cycle.saturating_add(1);
+            bus.tick_dma_with_cycles(1);
+        }
+        assert_eq!(bus.dma.timer_window_events(0), 0);
+        assert_eq!(bus.read32(dst), 0);
+        assert_eq!(bus.dma.channel(1).trans_count, 4);
+        assert_eq!(bus.dma.timer_miss_count(0), 2);
+        assert_eq!(bus.dma.timer_window_misses(0), 0);
+
+        // First legal event should consume exactly one transfer.
+        bus.master_cycle = bus.master_cycle.saturating_add(1);
+        bus.tick_dma_with_cycles(1);
+        assert_eq!(bus.dma.channel(1).trans_count, 3);
+        assert_eq!(bus.dma.timer_window_events(0), 1);
+        assert_eq!(bus.dma.timer_event_count(0), 3);
+        assert_eq!(bus.dma.timer_miss_count(0), 2);
     }
 }

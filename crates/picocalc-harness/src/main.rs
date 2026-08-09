@@ -243,6 +243,8 @@ struct Args {
     snapshot_dir: PathBuf,
     expected_stop: Option<StopReason>,
     expected_uart: Vec<String>,
+    expected_audio_sink_count: Option<u64>,
+    expected_audio_sink_sha256: Option<String>,
     #[cfg(feature = "idle-profiler")]
     idle_profile: Option<PathBuf>,
     #[cfg(feature = "behavior-trace")]
@@ -330,6 +332,10 @@ fn print_usage() {
                                   Default: the current directory.\n\
          --expect-stop <reason>   Required stop: cycle_limit, pc_match, or scenario_done.\n\
          --expect-uart <text>     Required UART substring. Repeat for each marker.\n\
+         --expect-audio-sink-count <N>\n\
+                                  Require exactly N DMA-origin PWM5_CC writes.\n\
+         --expect-audio-sink-sha256 <hex>\n\
+                                  Require the little-endian PWM5_CC stream SHA-256.\n\
          -h, --help               This message."
     );
     #[cfg(feature = "idle-profiler")]
@@ -383,6 +389,8 @@ fn parse_args() -> Result<Args, String> {
     let mut snapshot_dir: Option<PathBuf> = None;
     let mut expected_stop: Option<StopReason> = None;
     let mut expected_uart: Vec<String> = Vec::new();
+    let mut expected_audio_sink_count: Option<u64> = None;
+    let mut expected_audio_sink_sha256: Option<String> = None;
     #[cfg(feature = "idle-profiler")]
     let mut idle_profile: Option<PathBuf> = None;
     #[cfg(feature = "behavior-trace")]
@@ -459,6 +467,29 @@ fn parse_args() -> Result<Args, String> {
                 }
                 expected_uart.push(marker);
             }
+            "--expect-audio-sink-count" => {
+                if expected_audio_sink_count.is_some() {
+                    return Err("--expect-audio-sink-count may be specified only once".to_string());
+                }
+                let raw = value("--expect-audio-sink-count")?;
+                let count = raw
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid --expect-audio-sink-count '{raw}': {e}"))?;
+                if count == 0 {
+                    return Err("--expect-audio-sink-count must be > 0".to_string());
+                }
+                expected_audio_sink_count = Some(count);
+            }
+            "--expect-audio-sink-sha256" => {
+                if expected_audio_sink_sha256.is_some() {
+                    return Err("--expect-audio-sink-sha256 may be specified only once".to_string());
+                }
+                let digest = value("--expect-audio-sink-sha256")?.to_ascii_lowercase();
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err("--expect-audio-sink-sha256 must be 64 hex characters".to_string());
+                }
+                expected_audio_sink_sha256 = Some(digest);
+            }
             #[cfg(feature = "idle-profiler")]
             "--idle-profile" => idle_profile = Some(PathBuf::from(value("--idle-profile")?)),
             #[cfg(feature = "behavior-trace")]
@@ -512,6 +543,15 @@ fn parse_args() -> Result<Args, String> {
     if stop_pc.is_some() && expected_stop.is_some() && expected_stop != Some(StopReason::PcMatch) {
         return Err("--stop-pc only permits --expect-stop pc_match".to_string());
     }
+    if expected_audio_sink_count.is_some() != expected_audio_sink_sha256.is_some() {
+        return Err(
+            "--expect-audio-sink-count and --expect-audio-sink-sha256 must be used together"
+                .to_string(),
+        );
+    }
+    if expected_audio_sink_count.is_some() && board != Board::PicoCalc {
+        return Err("audio sink expectations require --board picocalc".to_string());
+    }
     #[cfg(all(feature = "idle-profiler", feature = "behavior-trace"))]
     if idle_profile.is_some() && behavior_trace.is_some() {
         return Err(
@@ -548,6 +588,8 @@ fn parse_args() -> Result<Args, String> {
         snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
         expected_stop,
         expected_uart,
+        expected_audio_sink_count,
+        expected_audio_sink_sha256,
         #[cfg(feature = "idle-profiler")]
         idle_profile,
         #[cfg(feature = "behavior-trace")]
@@ -745,6 +787,13 @@ fn judge_run(
         expected_stop,
         required_uart_markers: expected_uart.to_vec(),
         missing_uart_markers,
+    }
+}
+
+fn apply_audio_sink_expectation(verdict: &mut VerdictReport, audio_sink: Option<&AudioSinkReport>) {
+    if audio_sink.is_some_and(|report| report.expectation_failed()) {
+        verdict.status = Verdict::Fail;
+        verdict.reasons.push("audio_sink_mismatch");
     }
 }
 
@@ -1800,6 +1849,129 @@ impl PwmReport {
     }
 }
 
+/// Digital sample stream observed at the DMA-to-PWM boundary.
+struct AudioSinkReport {
+    snapshot: rp2040_emu::AudioSinkSnapshot,
+    expected_count: Option<u64>,
+    expected_sha256: Option<String>,
+    status: &'static str,
+}
+
+impl AudioSinkReport {
+    fn status_for_expected(
+        snapshot: &rp2040_emu::AudioSinkSnapshot,
+        expected_count: Option<u64>,
+        expected_sha256: Option<&str>,
+    ) -> &'static str {
+        match (expected_count, expected_sha256) {
+            (Some(count), Some(digest)) => {
+                if snapshot.status == "pass"
+                    && snapshot.dma_write_count == count
+                    && snapshot.pcm_sha256 == digest
+                {
+                    "pass"
+                } else {
+                    "fail"
+                }
+            }
+            (None, None) => snapshot.status,
+            _ => "fail",
+        }
+    }
+
+    fn collect(
+        bus: &rp2040_emu::Bus,
+        expected_count: Option<u64>,
+        expected_sha256: Option<&str>,
+    ) -> Self {
+        let snapshot = bus.audio_sink_snapshot();
+        let status = Self::status_for_expected(&snapshot, expected_count, expected_sha256);
+        Self {
+            snapshot,
+            expected_count,
+            expected_sha256: expected_sha256.map(str::to_owned),
+            status,
+        }
+    }
+
+    fn expectation_failed(&self) -> bool {
+        self.expected_count.is_some() && self.status != "pass"
+    }
+
+    fn to_json(&self) -> String {
+        let words = |values: &[u32]| {
+            values
+                .iter()
+                .map(|value| json_string(&format!("0x{value:08x}")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let option_u64 = |value: Option<u64>| {
+            value
+                .map(|number| number.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        };
+        format!(
+            concat!(
+                "  \"audio_sink\": {{\n",
+                "    \"status\": {},\n",
+                "    \"dma_write_count\": {},\n",
+                "    \"target_write_attempt_count\": {},\n",
+                "    \"other_pwm_cc_write_count\": {},\n",
+                "    \"wrong_width_count\": {},\n",
+                "    \"wrong_treq_count\": {},\n",
+                "    \"missing_due_cycle_count\": {},\n",
+                "    \"pcm_sha256\": {},\n",
+                "    \"expected_count\": {},\n",
+                "    \"expected_sha256\": {},\n",
+                "    \"first_words\": [{}],\n",
+                "    \"last_words\": [{}],\n",
+                "    \"timer_index\": {},\n",
+                "    \"treq\": {},\n",
+                "    \"timer_fraction\": \"{}/{}\",\n",
+                "    \"timer_event_count\": {},\n",
+                "    \"timer_miss_count\": {},\n",
+                "    \"timer_due_cycle_sha256\": {},\n",
+                "    \"gap_5208_count\": {},\n",
+                "    \"gap_5209_count\": {},\n",
+                "    \"unexpected_gap_count\": {},\n",
+                "    \"service_latency_min_cycles\": {},\n",
+                "    \"service_latency_max_cycles\": {},\n",
+                "    \"service_latency_sha256\": {}\n",
+                "  }},\n"
+            ),
+            json_string(self.status),
+            self.snapshot.dma_write_count,
+            self.snapshot.target_write_attempt_count,
+            self.snapshot.other_pwm_cc_write_count,
+            self.snapshot.wrong_width_count,
+            self.snapshot.wrong_treq_count,
+            self.snapshot.missing_due_cycle_count,
+            json_string(&self.snapshot.pcm_sha256),
+            option_u64(self.expected_count),
+            self.expected_sha256
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".to_string()),
+            words(&self.snapshot.first_words),
+            words(&self.snapshot.last_words),
+            self.snapshot.timer_index,
+            self.snapshot.treq,
+            self.snapshot.timer_fraction_x,
+            self.snapshot.timer_fraction_y,
+            self.snapshot.timer_event_count,
+            self.snapshot.timer_miss_count,
+            json_string(&self.snapshot.timer_due_cycle_sha256),
+            self.snapshot.gap_5208_count,
+            self.snapshot.gap_5209_count,
+            self.snapshot.unexpected_gap_count,
+            option_u64(self.snapshot.service_latency_min_cycles),
+            option_u64(self.snapshot.service_latency_max_cycles),
+            json_string(&self.snapshot.service_latency_sha256),
+        )
+    }
+}
+
 /// TOP register reset value; a slice still holding it was never given a
 /// wrap point.
 const TOP_RESET_VALUE: u16 = 0xFFFF;
@@ -2012,6 +2184,7 @@ fn build_report(
     sd: Option<&SdReport>,
     keyboard: Option<&KeyboardReport>,
     pwm: Option<&PwmReport>,
+    audio_sink: Option<&AudioSinkReport>,
     pio: Option<&PioReport>,
     scenario: Option<(&scenario::Engine, String)>,
     verdict: &VerdictReport,
@@ -2131,6 +2304,9 @@ fn build_report(
     }
     if let Some(pwm) = pwm {
         s.push_str(&pwm.to_json());
+    }
+    if let Some(audio_sink) = audio_sink {
+        s.push_str(&audio_sink.to_json());
     }
     if let Some(pio) = pio {
         s.push_str(&pio.to_json());
@@ -2632,6 +2808,14 @@ fn run() -> Result<Verdict, String> {
     // observable.
     let pwm_report = (args.board == Board::PicoCalc).then(|| PwmReport::collect(&emu.bus));
 
+    let audio_sink_report = (args.board == Board::PicoCalc).then(|| {
+        AudioSinkReport::collect(
+            &emu.bus,
+            args.expected_audio_sink_count,
+            args.expected_audio_sink_sha256.as_deref(),
+        )
+    });
+
     let pio_report = (args.board == Board::PicoCalc).then(|| PioReport::collect(&mut emu.bus));
 
     let unsupported = emu.bus.unsupported_mmio_log();
@@ -2662,7 +2846,7 @@ fn run() -> Result<Verdict, String> {
     let keyboard_protocol_errors = keyboard_report.as_ref().map_or(0, |value| {
         value.unknown_reg_selects + value.unknown_reg_writes
     });
-    let verdict = judge_run(
+    let mut verdict = judge_run(
         &outcome,
         unsupported.len(),
         unsupported_truncated,
@@ -2673,6 +2857,7 @@ fn run() -> Result<Verdict, String> {
         effective_expected_stop,
         &args.expected_uart,
     );
+    apply_audio_sink_expectation(&mut verdict, audio_sink_report.as_ref());
 
     let report = build_report(
         backend_commit,
@@ -2697,6 +2882,7 @@ fn run() -> Result<Verdict, String> {
         sd_report.as_ref(),
         keyboard_report.as_ref(),
         pwm_report.as_ref(),
+        audio_sink_report.as_ref(),
         pio_report.as_ref(),
         engine.as_ref().map(|e| {
             (
@@ -2756,10 +2942,12 @@ fn run() -> Result<Verdict, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoardHandles, RunOutcome, SdReport, StopReason, Verdict, fatal_exception_name, json_escape,
-        judge_run, run_loop, validate_backend_identity, validate_sd_selection,
+        AudioSinkReport, BoardHandles, RunOutcome, SdReport, StopReason, Verdict,
+        apply_audio_sink_expectation, fatal_exception_name, json_escape, judge_run, run_loop,
+        validate_backend_identity, validate_sd_selection,
     };
     use picocalc_board::SdFormat;
+    use rp2040_emu::AudioSinkSnapshot;
     #[cfg(feature = "idle-profiler")]
     use rp2040_emu::IdleProfileSnapshot;
     use rp2040_emu::{Config, EmulatorBuilder};
@@ -3053,6 +3241,129 @@ mod tests {
         assert!(report.contains("\"format\": \"fat32\""));
         assert!(report.contains("\"block_size\": 512"));
         assert!(report.contains("\"blocks_written\": 1"));
+    }
+
+    #[test]
+    fn audio_sink_report_matches_only_on_exact_count_and_sha() {
+        let mut snapshot = AudioSinkSnapshot {
+            status: "pass",
+            dma_write_count: 3,
+            target_write_attempt_count: 3,
+            other_pwm_cc_write_count: 0,
+            wrong_width_count: 0,
+            wrong_treq_count: 0,
+            missing_due_cycle_count: 0,
+            pcm_sha256: "aabbccdd".repeat(8),
+            first_words: Vec::new(),
+            last_words: Vec::new(),
+            timer_index: 0,
+            treq: 59,
+            timer_fraction_x: 3,
+            timer_fraction_y: 15625,
+            timer_event_count: 0,
+            timer_miss_count: 0,
+            timer_due_cycle_sha256: String::new(),
+            gap_5208_count: 0,
+            gap_5209_count: 0,
+            unexpected_gap_count: 0,
+            service_latency_min_cycles: None,
+            service_latency_max_cycles: None,
+            service_latency_sha256: String::new(),
+        };
+
+        assert_eq!(
+            AudioSinkReport::status_for_expected(
+                &snapshot,
+                Some(3),
+                Some("aabbccdd".repeat(8).as_str())
+            ),
+            "pass"
+        );
+
+        snapshot.dma_write_count = 2;
+        assert_eq!(
+            AudioSinkReport::status_for_expected(
+                &snapshot,
+                Some(3),
+                Some("aabbccdd".repeat(8).as_str())
+            ),
+            "fail"
+        );
+
+        snapshot.dma_write_count = 3;
+        assert_eq!(
+            AudioSinkReport::status_for_expected(
+                &snapshot,
+                Some(3),
+                Some("00112233".repeat(8).as_str())
+            ),
+            "fail"
+        );
+
+        assert_eq!(
+            AudioSinkReport::status_for_expected(&snapshot, None, None),
+            "pass"
+        );
+
+        assert_eq!(
+            AudioSinkReport::status_for_expected(&snapshot, Some(3), None),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn audio_sink_expectation_failure_forces_verdict_fail() {
+        let mut verdict = super::VerdictReport {
+            status: Verdict::Pass,
+            reasons: Vec::new(),
+            expected_stop: Some(StopReason::CycleLimit),
+            required_uart_markers: Vec::new(),
+            missing_uart_markers: Vec::new(),
+        };
+
+        let report = AudioSinkReport {
+            snapshot: AudioSinkSnapshot {
+                status: "pass",
+                dma_write_count: 3,
+                target_write_attempt_count: 3,
+                other_pwm_cc_write_count: 0,
+                wrong_width_count: 0,
+                wrong_treq_count: 0,
+                missing_due_cycle_count: 0,
+                pcm_sha256: "aabbccdd".repeat(8),
+                first_words: Vec::new(),
+                last_words: Vec::new(),
+                timer_index: 0,
+                treq: 59,
+                timer_fraction_x: 3,
+                timer_fraction_y: 15625,
+                timer_event_count: 0,
+                timer_miss_count: 0,
+                timer_due_cycle_sha256: String::new(),
+                gap_5208_count: 0,
+                gap_5209_count: 0,
+                unexpected_gap_count: 0,
+                service_latency_min_cycles: None,
+                service_latency_max_cycles: None,
+                service_latency_sha256: String::new(),
+            },
+            expected_count: Some(3),
+            expected_sha256: Some("aabbccdd".repeat(8)),
+            status: "fail",
+        };
+
+        apply_audio_sink_expectation(&mut verdict, Some(&report));
+        assert!(verdict.status == Verdict::Fail);
+        assert_eq!(verdict.reasons, ["audio_sink_mismatch"]);
+
+        let mut pass_verdict = verdict;
+        let pass_report = AudioSinkReport {
+            status: "pass",
+            ..report
+        };
+        apply_audio_sink_expectation(&mut pass_verdict, Some(&pass_report));
+        assert!(pass_verdict.status == Verdict::Fail);
+        assert_eq!(pass_verdict.reasons, ["audio_sink_mismatch"]);
     }
 
     #[test]

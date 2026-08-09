@@ -48,13 +48,13 @@ event-horizon-profiler = ["idle-profiler", "behavior-trace"]
 # OPT0-B deterministic streaming event contract. Kept out of default
 # builds so the performance path contains neither a disabled branch nor a
 # hash state. The optional dependency exists only in diagnostic binaries.
-behavior-trace = ["dep:sha2"]
+behavior-trace = []
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }
 picoem-devices = { version = "0.1", path = "../picoem-devices" }
 tracing = { workspace = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = "0.10"
 
 [dev-dependencies]
 picoem-common = { path = "../picoem-common", features = ["test-hooks"] }

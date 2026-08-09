@@ -16,6 +16,7 @@
 
 use tracing::info;
 
+mod audio_sink;
 pub mod bus;
 pub mod core;
 pub mod dma;
@@ -23,6 +24,8 @@ pub mod dreq;
 pub mod irq;
 pub mod memory;
 pub mod peripherals;
+
+pub use audio_sink::AudioSinkSnapshot;
 
 mod idle_profile;
 

@@ -955,6 +955,11 @@ impl Bus {
         self.dma.channel(i)
     }
 
+    /// Snapshot DMA-origin writes to the PicoCalc PWM audio sink.
+    pub fn audio_sink_snapshot(&self) -> crate::AudioSinkSnapshot {
+        self.dma.audio_sink_snapshot()
+    }
+
     /// Base read latency for an address region (cycles).
     #[inline]
     fn read_latency(region: u32) -> u32 {
@@ -2236,7 +2241,15 @@ impl Bus {
     /// tail of [`Self::tick_peripherals`].
     pub fn tick_dma(&mut self) {
         let mut dma = std::mem::take(&mut self.dma);
-        dma.tick(self);
+        dma.tick(self, 1);
+        dma.route_irqs(&mut self.irq_pending);
+        self.dma = dma;
+    }
+
+    /// Drive DMA for an arbitrary number of sysclks.
+    pub fn tick_dma_with_cycles(&mut self, cycles: u32) {
+        let mut dma = std::mem::take(&mut self.dma);
+        dma.tick(self, cycles);
         dma.route_irqs(&mut self.irq_pending);
         self.dma = dma;
     }
@@ -2301,7 +2314,7 @@ impl Bus {
         // DMA ticks LAST per HLD V7 §5.6 ordering contract — peripherals
         // produce DREQ on this cycle, DMA snapshots + consumes. Stays
         // once per quantum; mirrors RP2350.
-        self.tick_dma();
+        self.tick_dma_with_cycles(cycles);
     }
 
     /// Fast-path lazy-schedule advance (HLD V7 §5.5).
