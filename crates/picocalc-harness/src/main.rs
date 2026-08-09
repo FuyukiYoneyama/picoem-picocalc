@@ -2675,6 +2675,18 @@ fn run() -> Result<Verdict, String> {
             eprintln!("scenario could not run: {fault}");
         }
     }
+    #[cfg(feature = "uart-deadline-prototype")]
+    {
+        let snapshot = emu.uart_deadline_prototype_snapshot();
+        eprintln!(
+            "uart-deadline-prototype snapshot: lane_calls={} lane_cycles={} temporal_tx_calls={} first_tx_deadline_cycles={} static_calls={}",
+            snapshot.lane_calls,
+            snapshot.lane_cycles,
+            snapshot.temporal_tx_calls,
+            snapshot.first_tx_deadline_cycles,
+            snapshot.static_calls,
+        );
+    }
     // Dropped keys change what the firmware saw without changing what
     // the scenario said, so every step after the first drop is measuring
     // something other than the scripted input. Worth saying out loud

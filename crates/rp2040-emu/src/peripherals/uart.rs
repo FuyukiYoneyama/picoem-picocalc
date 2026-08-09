@@ -411,6 +411,51 @@ impl UartRegs {
         (sys.saturating_mul(10) / baud).max(1)
     }
 
+    /// Return the number of system cycles until the next TX byte pop.
+    ///
+    /// Returns `None` if TX is disabled/empty. Returns `1` or greater
+    /// while TX is active, so callers can advance exactly to the next
+    /// guaranteed boundary.
+    #[inline]
+    #[cfg(feature = "uart-deadline-prototype")]
+    pub(crate) fn cycles_to_next_tx_pop(&self, clock_tree: &ClockTree) -> Option<u64> {
+        if !self.is_tx_enabled() || self.tx_fifo.is_empty() {
+            return None;
+        }
+        let sysclks_per_byte = self.sysclks_per_byte(clock_tree);
+        if self.tx_cycle_accum >= sysclks_per_byte {
+            Some(1)
+        } else {
+            Some(sysclks_per_byte - self.tx_cycle_accum)
+        }
+    }
+
+    /// Return the number of system cycles until either:
+    /// * the next TX byte pop, or
+    /// * TX interrupt latching occurs due TX FIFO already being at/below threshold.
+    ///
+    /// This is the minimum distance to an immediately observable UART TX event:
+    /// if TX IRQ latching is about to happen on a one-cycle tick, we return 1.
+    #[inline]
+    #[cfg(feature = "uart-deadline-prototype")]
+    pub(crate) fn cycles_to_next_tx_observable_event(&self, clock_tree: &ClockTree) -> Option<u64> {
+        let next_pop = self.cycles_to_next_tx_pop(clock_tree)?;
+        if (self.ris & UART_INT_TX) != 0 {
+            return Some(next_pop);
+        }
+        if self.tx_fifo.len() <= self.tx_fill_threshold() {
+            Some(1)
+        } else {
+            Some(next_pop)
+        }
+    }
+
+    #[cfg(feature = "uart-deadline-prototype")]
+    #[inline]
+    pub(crate) fn has_temporal_tx_work(&self) -> bool {
+        self.is_tx_enabled() && !self.tx_fifo.is_empty()
+    }
+
     // -------------------------------------------------------------------
     // Register dispatch
     // -------------------------------------------------------------------
@@ -631,6 +676,25 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "uart-deadline-prototype")]
+    fn equal_hz_tree(hz: u32) -> ClockTree {
+        ClockTree {
+            sys_clk_hz: hz,
+            peri_clk_hz: hz,
+            ref_clk_hz: hz,
+        }
+    }
+
+    #[cfg(feature = "uart-deadline-prototype")]
+    fn configure_uart_for_short_baud(u: &mut UartRegs, irqs: &mut u32, hz: u32) {
+        u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, irqs);
+        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, irqs);
+        // IBRD=2,FBRD=0,sys=peri=hz => 320 sys-clocks/byte exactly.
+        u.write32(UARTIBRD, 2, 0, irqs);
+        u.write32(UARTFBRD, 0, 0, irqs);
+        assert_eq!(u.sysclks_per_byte(&equal_hz_tree(hz)), 320);
+    }
+
     // --- reset / defaults ---------------------------------------------
 
     #[test]
@@ -775,6 +839,135 @@ mod tests {
             u.tx_fifo.is_empty(),
             "FIFO must drain after 4 × byte-time at configured baud"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "uart-deadline-prototype")]
+    fn tx_cycles_to_next_pop_is_none_when_inactive_or_empty() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let t = equal_hz_tree(16);
+        assert_eq!(u.cycles_to_next_tx_pop(&t), None);
+        let mut irqs = 0;
+        u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
+        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
+        assert_eq!(u.cycles_to_next_tx_pop(&t), None);
+        u.write32(UARTDR, 0xA5, 0, &mut irqs);
+        assert_eq!(u.cycles_to_next_tx_pop(&t), Some(1));
+        u.write32(UARTCR, UARTCR_UARTEN, 0, &mut irqs);
+        assert_eq!(u.cycles_to_next_tx_pop(&t), None);
+    }
+
+    #[test]
+    #[cfg(feature = "uart-deadline-prototype")]
+    fn tx_deadline_boundary_and_single_bulk_step_match_repeated_step() {
+        let mut irqs_boundary = 0;
+        let mut irqs_bulk = 0;
+        let mut irqs_step = 0;
+        let hz = 256;
+        let tree = equal_hz_tree(hz);
+
+        // Pre-boundary check: d-1 does not pop, d pops exactly one.
+        let mut boundary = UartRegs::new(UART0_IRQ);
+        configure_uart_for_short_baud(&mut boundary, &mut irqs_boundary, hz);
+        boundary.write32(UARTDR, 0x5A, 0, &mut irqs_boundary);
+        let d = boundary.cycles_to_next_tx_pop(&tree).unwrap();
+        assert_eq!(d, 320);
+        boundary.tick((d - 1) as u32, &tree, &mut irqs_boundary);
+        assert_eq!(boundary.tx_fifo.len(), 1);
+        assert_eq!(boundary.cycles_to_next_tx_pop(&tree), Some(1));
+        boundary.tick(1, &tree, &mut irqs_boundary);
+        assert_eq!(boundary.tx_fifo.len(), 0);
+
+        // Bulk boundary step equals repeated single-cycle stepping.
+        let mut bulk = UartRegs::new(UART0_IRQ);
+        let mut step = UartRegs::new(UART0_IRQ);
+        configure_uart_for_short_baud(&mut bulk, &mut irqs_bulk, hz);
+        configure_uart_for_short_baud(&mut step, &mut irqs_step, hz);
+        bulk.write32(UARTDR, 0x5A, 0, &mut irqs_bulk);
+        step.write32(UARTDR, 0x5A, 0, &mut irqs_step);
+        let bulk_d = bulk.cycles_to_next_tx_pop(&tree).unwrap();
+        for _ in 0..bulk_d {
+            step.tick(1, &tree, &mut irqs_step);
+        }
+        bulk.tick(bulk_d as u32, &tree, &mut irqs_bulk);
+        assert_eq!(bulk.tx_fifo.len(), step.tx_fifo.len());
+        assert_eq!(bulk.tx_cycle_accum, step.tx_cycle_accum);
+        assert_eq!(bulk.ris, step.ris);
+        assert_eq!(bulk.tx_dreq(), step.tx_dreq());
+        assert_eq!(irqs_bulk, irqs_step);
+    }
+
+    #[test]
+    #[cfg(feature = "uart-deadline-prototype")]
+    fn tx_cycles_to_next_pop_uses_overshoot_after_repush() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let mut irqs = 0;
+        configure_uart_for_short_baud(&mut u, &mut irqs, 256);
+        let tree = equal_hz_tree(256);
+
+        u.write32(UARTDR, 0xA5, 0, &mut irqs);
+        let d = u.cycles_to_next_tx_pop(&tree).unwrap();
+        assert_eq!(d, 320);
+        u.tick(1000, &tree, &mut irqs);
+        assert!(u.tx_fifo.is_empty());
+        // Overshoot leaves tx_cycle_accum>=320 after pop+empty.
+        assert_eq!(u.tx_cycle_accum, 680);
+        assert_eq!(u.cycles_to_next_tx_pop(&tree), None);
+
+        u.write32(UARTDR, 0x5A, 0, &mut irqs);
+        assert_eq!(u.cycles_to_next_tx_pop(&tree), Some(1));
+        u.tick(1, &tree, &mut irqs);
+        assert!(u.tx_fifo.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "uart-deadline-prototype")]
+    fn tx_cycles_to_next_pop_handles_multiple_bytes_and_unconfigured_baud() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let mut irqs = 0;
+        // Unconfigured baud uses fallback 1 cycle/byte, and must still
+        // advance one byte exactly when the deadline is consumed.
+        u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
+        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
+        for b in [0x01u8, 0x02u8] {
+            u.write32(UARTDR, b as u32, 0, &mut irqs);
+        }
+        let hz_tree = equal_hz_tree(16);
+        assert_eq!(u.cycles_to_next_tx_pop(&hz_tree), Some(1));
+        u.tick(1, &hz_tree, &mut irqs);
+        assert_eq!(u.tx_fifo.len(), 1, "one-byte deadline pop only once");
+        assert_eq!(u.cycles_to_next_tx_pop(&hz_tree), Some(1));
+    }
+
+    #[test]
+    #[cfg(feature = "uart-deadline-prototype")]
+    fn tx_cycles_to_next_observable_event_is_one_when_txis_would_assert() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let mut irqs = 0;
+        let hz = 256;
+        let tree = equal_hz_tree(hz);
+        configure_uart_for_short_baud(&mut u, &mut irqs, hz);
+        u.write32(UARTDR, 0xA5, 0, &mut irqs);
+        let pop_distance = u.cycles_to_next_tx_pop(&tree).unwrap();
+        assert_eq!(pop_distance, 320);
+
+        // FIFO is <= TX threshold, TXIS not yet latched -> next tick observes RIS.
+        assert_eq!(u.cycles_to_next_tx_observable_event(&tree), Some(1));
+        u.tick(1, &tree, &mut irqs);
+        assert_eq!(u.ris & UART_INT_TX, UART_INT_TX);
+        assert_eq!(
+            u.cycles_to_next_tx_observable_event(&tree),
+            Some(pop_distance - 1)
+        );
+
+        // Now TXIS is latched; observable event is governed by byte pop distance.
+        for _ in 0..319 {
+            u.tick(1, &tree, &mut irqs);
+        }
+        assert_eq!(u.tx_fifo.len(), 0);
+        assert_eq!(u.cycles_to_next_tx_observable_event(&tree), None);
+        u.tick(1, &equal_hz_tree(256), &mut irqs);
+        assert_eq!(u.tx_fifo.len(), 0);
     }
 
     #[test]

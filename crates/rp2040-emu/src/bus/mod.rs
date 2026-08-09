@@ -2089,6 +2089,55 @@ impl Bus {
             && self.dma.is_idle()
     }
 
+    /// OPT2-G gate: all per-cycle peripheral work except UART is idle.
+    ///
+    /// PIO, pending IRQ and SysTick are checked by the caller. Keeping this
+    /// predicate separate makes the prototype fail closed: the dedicated
+    /// lane is selected only when omitting SPI/I2C/ADC/PWM/DMA ticks cannot
+    /// change state or ordering.
+    #[cfg(feature = "uart-deadline-prototype")]
+    #[inline]
+    pub(crate) fn all_non_uart_peripherals_idle(&self) -> bool {
+        self.timer.is_idle()
+            && self.spi0.is_idle()
+            && self.spi1.is_idle()
+            && self.i2c0.is_idle()
+            && self.i2c1.is_idle()
+            && self.adc.is_idle()
+            && self.pwm.is_idle()
+            && self.dma.is_idle()
+    }
+
+    /// True when neither UART has observable per-cycle work or static RIS.
+    #[cfg(feature = "uart-deadline-prototype")]
+    #[inline]
+    pub(crate) fn uarts_idle(&self) -> bool {
+        self.uart0.is_idle() && self.uart1.is_idle()
+    }
+
+    /// Soonest exact UART TX boundary in relative system cycles.
+    ///
+    /// The boundary includes the model's one-cycle TXRIS assertion as well
+    /// as byte-pop/DREQ changes. `None` means that no TX state advances.
+    #[cfg(feature = "uart-deadline-prototype")]
+    pub(crate) fn next_uart_tx_event_distance(&self) -> Option<u64> {
+        [
+            self.uart0
+                .cycles_to_next_tx_observable_event(&self.clock_tree),
+            self.uart1
+                .cycles_to_next_tx_observable_event(&self.clock_tree),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    #[cfg(feature = "uart-deadline-prototype")]
+    #[inline]
+    pub(crate) fn uarts_have_temporal_tx_work(&self) -> bool {
+        self.uart0.has_temporal_tx_work() || self.uart1.has_temporal_tx_work()
+    }
+
     /// True iff at least one PIO SM is enabled in either block, or any
     /// IRQ flag is still asserted. Either condition means a per-cycle
     /// PIO step could mutate pin state or the IRQ-flags register — so
@@ -2287,6 +2336,21 @@ impl Bus {
         self.tick_dma();
     }
 
+    /// Advance only UART state, preserving UART0-before-UART1 ordering.
+    ///
+    /// Used solely by OPT2-G after the caller has proven every other
+    /// per-cycle source idle. DMA is deliberately not ticked here; the lane
+    /// requires DMA idle, so a UART DREQ transition cannot be consumed until
+    /// firmware later enables DMA and returns to the ordinary slow path.
+    #[cfg(feature = "uart-deadline-prototype")]
+    #[inline]
+    pub(crate) fn tick_uarts_only(&mut self, cycles: u32) {
+        self.uart0
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        self.uart1
+            .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+    }
+
     /// Fast-path lazy-schedule advance (HLD V7 §5.5).
     ///
     /// Called from [`crate::Emulator::step`]'s fast-path branch after
@@ -2441,6 +2505,55 @@ impl CoreBus for Bus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "uart-deadline-prototype")]
+    fn uart_deadline_test_bus() -> Bus {
+        use crate::peripherals::uart::{UARTCR, UARTDR, UARTFBRD, UARTIBRD, UARTLCR_H};
+
+        let mut bus = Bus::new();
+        bus.seed_sys_clk_hz(256);
+        let mut irqs = 0;
+        bus.uart0.write32(UARTLCR_H, 1 << 4, 0, &mut irqs);
+        bus.uart0.write32(UARTCR, (1 << 0) | (1 << 8), 0, &mut irqs);
+        bus.uart0.write32(UARTIBRD, 2, 0, &mut irqs);
+        bus.uart0.write32(UARTFBRD, 0, 0, &mut irqs);
+        for byte in 0..10u32 {
+            bus.uart0.write32(UARTDR, byte, 0, &mut irqs);
+        }
+        bus
+    }
+
+    #[cfg(feature = "uart-deadline-prototype")]
+    #[test]
+    fn uart_only_tick_matches_full_peripheral_tick_at_exact_boundaries() {
+        use crate::peripherals::uart::{UARTFR, UARTRIS};
+
+        for cycles in [1u32, 319, 320, 640] {
+            let mut reference = uart_deadline_test_bus();
+            let mut candidate = uart_deadline_test_bus();
+
+            reference.master_cycle = reference.master_cycle.wrapping_add(u64::from(cycles));
+            reference.tick_peripherals(cycles);
+            candidate.advance_lazy_scheduled(u64::from(cycles));
+            candidate.tick_uarts_only(cycles);
+
+            assert_eq!(candidate.master_cycle, reference.master_cycle);
+            assert_eq!(
+                candidate.uart0.read32(UARTFR),
+                reference.uart0.read32(UARTFR)
+            );
+            assert_eq!(
+                candidate.uart0.read32(UARTRIS),
+                reference.uart0.read32(UARTRIS)
+            );
+            assert_eq!(candidate.uart0.tx_dreq(), reference.uart0.tx_dreq());
+            assert_eq!(candidate.irq_pending, reference.irq_pending);
+            assert_eq!(
+                candidate.next_uart_tx_event_distance(),
+                reference.next_uart_tx_event_distance()
+            );
+        }
+    }
 
     #[cfg(feature = "event-horizon-profiler")]
     #[test]

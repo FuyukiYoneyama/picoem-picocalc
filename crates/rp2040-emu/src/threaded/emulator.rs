@@ -111,6 +111,8 @@ impl ThreadedEmulator {
             pio0_sm0_max_pc: _,
             pio0_sm0_pc_advances: _,
             pio0_sm0_last_pc: _,
+            #[cfg(feature = "uart-deadline-prototype")]
+                uart_deadline_prototype: _,
             #[cfg(feature = "idle-profiler")]
                 idle_profiler: _,
             execution_model: _,

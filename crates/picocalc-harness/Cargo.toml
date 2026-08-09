@@ -19,6 +19,8 @@ idle-profiler = ["rp2040-emu/idle-profiler"]
 # This deliberately includes the existing behavior observation machinery;
 # its output is not valid for wall-time measurement.
 event-horizon-profiler = ["idle-profiler", "behavior-trace", "rp2040-emu/event-horizon-profiler"]
+# OPT2-G feature-gated UART exact-boundary scheduler prototype.
+uart-deadline-prototype = ["rp2040-emu/uart-deadline-prototype"]
 # Diagnostic-only OPT0-B correctness build. Normal conformance and
 # performance runners do not compile the streaming hash path.
 behavior-trace = ["rp2040-emu/behavior-trace"]
