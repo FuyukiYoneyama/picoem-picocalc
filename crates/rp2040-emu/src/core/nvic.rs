@@ -37,6 +37,10 @@
 //! (`intr & (inte | intf)`) re-asserts into `bus.irq_pending` on every
 //! poll, not only on fresh match edges. Otherwise the emulator will
 //! drop the level re-assert and silently diverge from silicon.
+//! `Emulator::drain_pending_irqs_to_cores` suppresses that repeated level
+//! only on a core already executing the same exception. If the source is
+//! still asserted after exception return, the next poll pends it again;
+//! the shared wire continues to pend normally on the other core.
 //!
 //! The Phase 1 Wave 2 TIMER (`peripherals::timer::TimerRegs::poll_alarms`)
 //! satisfies this contract: after an alarm fires and auto-disarms, the

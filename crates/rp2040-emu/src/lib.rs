@@ -1217,8 +1217,17 @@ impl Emulator {
             let raised = std::mem::replace(&mut self.bus.irq_pending, 0);
             for irq in 0..crate::irq::IRQ_COUNT {
                 if raised & (1u32 << irq) != 0 {
-                    self.bus.nvics[0].set_pending(irq as u8);
-                    self.bus.nvics[1].set_pending(irq as u8);
+                    let exception = 16 + irq as u16;
+                    for core in 0..2 {
+                        // A still-asserted level belonging to the handler
+                        // that is already active is not a second event. If
+                        // the source remains asserted after exception
+                        // return, the next peripheral tick routes it again.
+                        // The other core still receives the shared wire.
+                        if !self.bus.ppb[core].is_active(exception) {
+                            self.bus.nvics[core].set_pending(irq as u8);
+                        }
+                    }
                 }
             }
         }
@@ -3237,6 +3246,28 @@ mod stage5_lib_residue {
         let _ = emu.step().unwrap();
         // After the slow path drains, both NVICs see line 0 pending.
         assert!(emu.bus.nvics[0].is_pending(0) || emu.bus.nvics[1].is_pending(0));
+    }
+
+    #[test]
+    fn active_level_irq_does_not_repend_same_core_but_remains_shared() {
+        let mut emu = Emulator::new(Config::default());
+        const IRQ: u8 = 11;
+        const EXCEPTION: u16 = 16 + IRQ as u16;
+
+        emu.bus.ppb[0].mark_active(EXCEPTION);
+        emu.bus.irq_pending = 1u32 << IRQ;
+        emu.drain_pending_irqs_to_cores();
+
+        assert!(!emu.bus.nvics[0].is_pending(IRQ));
+        assert!(emu.bus.nvics[1].is_pending(IRQ));
+
+        emu.bus.nvics[1].clear_pending(IRQ);
+        emu.bus.ppb[0].clear_active(EXCEPTION);
+        emu.bus.irq_pending = 1u32 << IRQ;
+        emu.drain_pending_irqs_to_cores();
+
+        assert!(emu.bus.nvics[0].is_pending(IRQ));
+        assert!(emu.bus.nvics[1].is_pending(IRQ));
     }
 
     // ------------------- tick_systick (lines 812, 817) -------------------

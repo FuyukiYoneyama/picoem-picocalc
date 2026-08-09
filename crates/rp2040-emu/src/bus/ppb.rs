@@ -106,6 +106,12 @@ impl Ppb {
         }
     }
 
+    /// True when `exc_num` is currently executing on this core.
+    #[inline]
+    pub fn is_active(&self, exc_num: u16) -> bool {
+        exc_num < 64 && (self.active & (1u64 << exc_num)) != 0
+    }
+
     /// True if any exception is currently active (for nested-exception
     /// return handling).
     #[inline]
