@@ -29,80 +29,12 @@ use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
 /// crossing `pub(crate)` visibility boundaries for a one-liner.
 const CACHE_INDEX_MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
 
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_NARROW_DATA_PROCESSING: u8 = 8;
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_NARROW_SPECIAL_DATA: u8 = 9;
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_NARROW_LDR_LITERAL: u8 = 10;
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_NARROW_LOAD_STORE_REG: u8 = 11;
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_NARROW_MISC: u8 = 22;
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_NARROW_COND_BRANCH: u8 = 26;
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_NARROW_BRANCH: u8 = 28;
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_WIDE_BL: u8 = 32;
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_WIDE_MISC: u8 = 33;
-#[cfg(feature = "compact-dispatch-key-prototype")]
-const DISPATCH_KEY_WIDE_UNDEFINED: u8 = 34;
-
 /// Returns true iff the first halfword is the Thumb-32 prefix defined
 /// for ARMv6-M (`0b11110xxx xxxxxxxx`). M0+ supports exactly one wide
 /// prefix — unlike M33 which also accepts `0b11101` and `0b11111`.
 #[inline(always)]
 pub(crate) fn is_wide(hw0: u16) -> bool {
     (hw0 >> 11) == 0b11110
-}
-
-#[cfg(feature = "compact-dispatch-key-prototype")]
-#[inline(always)]
-fn compact_dispatch_key_narrow(opcode: u16) -> u8 {
-    match opcode >> 11 {
-        0b00000 => 0,
-        0b00001 => 1,
-        0b00010 => 2,
-        0b00011 => 3,
-        0b00100 => 4,
-        0b00101 => 5,
-        0b00110 => 6,
-        0b00111 => 7,
-        0b01000 if opcode & (1 << 10) == 0 => DISPATCH_KEY_NARROW_DATA_PROCESSING,
-        0b01000 => DISPATCH_KEY_NARROW_SPECIAL_DATA,
-        0b01001 => DISPATCH_KEY_NARROW_LDR_LITERAL,
-        0b01010 | 0b01011 => DISPATCH_KEY_NARROW_LOAD_STORE_REG,
-        0b01100 => 12,
-        0b01101 => 13,
-        0b01110 => 14,
-        0b01111 => 15,
-        0b10000 => 16,
-        0b10001 => 17,
-        0b10010 => 18,
-        0b10011 => 19,
-        0b10100 => 20,
-        0b10101 => 21,
-        0b10110 | 0b10111 => DISPATCH_KEY_NARROW_MISC,
-        0b11000 => 24,
-        0b11001 => 25,
-        0b11010 | 0b11011 => DISPATCH_KEY_NARROW_COND_BRANCH,
-        0b11100 => DISPATCH_KEY_NARROW_BRANCH,
-        _ => 31,
-    }
-}
-
-#[cfg(feature = "compact-dispatch-key-prototype")]
-#[inline(always)]
-fn compact_dispatch_key_wide(_hw0: u16, hw1: u16) -> u8 {
-    if (hw1 & 0xD000) == 0xD000 {
-        DISPATCH_KEY_WIDE_BL
-    } else if (hw1 & 0xD000) == 0x8000 {
-        DISPATCH_KEY_WIDE_MISC
-    } else {
-        DISPATCH_KEY_WIDE_UNDEFINED
-    }
 }
 
 /// Conservative purity classifier. Returns `true` only for
@@ -267,48 +199,6 @@ impl CortexM0Plus {
 
         #[cfg(feature = "event-horizon-profiler")]
         let expected_next_pc = pc.wrapping_add(if entry.is_wide() { 4 } else { 2 });
-        #[cfg(feature = "compact-dispatch-key-prototype")]
-        let cycles = if entry.is_wide() {
-            self.regs.set_pc(pc.wrapping_add(4));
-            match entry.dispatch_key() {
-                DISPATCH_KEY_WIDE_BL => self.thumb32_bl(hw0, hw1),
-                DISPATCH_KEY_WIDE_MISC => self.thumb32_misc_control(hw0, hw1),
-                _ => self.thumb32_undefined(hw0, hw1),
-            }
-        } else {
-            self.regs.set_pc(pc.wrapping_add(2));
-            match entry.dispatch_key() {
-                0 => self.thumb16_lsl_imm(hw0),
-                1 => self.thumb16_lsr_imm(hw0),
-                2 => self.thumb16_asr_imm(hw0),
-                3 => self.thumb16_add_sub(hw0),
-                4 => self.thumb16_mov_imm(hw0),
-                5 => self.thumb16_cmp_imm(hw0),
-                6 => self.thumb16_add_imm8(hw0),
-                7 => self.thumb16_sub_imm8(hw0),
-                DISPATCH_KEY_NARROW_DATA_PROCESSING => self.thumb16_data_processing(hw0),
-                DISPATCH_KEY_NARROW_SPECIAL_DATA => self.thumb16_special_data_bx(hw0, bus),
-                DISPATCH_KEY_NARROW_LDR_LITERAL => self.thumb16_ldr_literal(hw0, bus),
-                DISPATCH_KEY_NARROW_LOAD_STORE_REG => self.thumb16_load_store_reg(hw0, bus),
-                12 => self.thumb16_str_imm(hw0, bus),
-                13 => self.thumb16_ldr_imm(hw0, bus),
-                14 => self.thumb16_strb_imm(hw0, bus),
-                15 => self.thumb16_ldrb_imm(hw0, bus),
-                16 => self.thumb16_strh_imm(hw0, bus),
-                17 => self.thumb16_ldrh_imm(hw0, bus),
-                18 => self.thumb16_str_sp(hw0, bus),
-                19 => self.thumb16_ldr_sp(hw0, bus),
-                20 => self.thumb16_adr(hw0),
-                21 => self.thumb16_add_sp_imm(hw0),
-                DISPATCH_KEY_NARROW_MISC => self.thumb16_misc(hw0, bus),
-                24 => self.thumb16_stm(hw0, bus),
-                25 => self.thumb16_ldm(hw0, bus),
-                DISPATCH_KEY_NARROW_COND_BRANCH => self.thumb16_cond_branch_svc(hw0),
-                DISPATCH_KEY_NARROW_BRANCH => self.thumb16_branch(hw0),
-                _ => self.thumb16_undefined(hw0),
-            }
-        };
-        #[cfg(not(feature = "compact-dispatch-key-prototype"))]
         let cycles = if entry.is_wide() {
             self.regs.set_pc(pc.wrapping_add(4));
             self.execute_thumb32(hw0, hw1, bus)
@@ -343,20 +233,6 @@ impl CortexM0Plus {
             // Fetch fault — return a non-cacheable sentinel entry so
             // the caller can dispatch and the post-step fault delivery
             // runs.
-            #[cfg(feature = "compact-dispatch-key-prototype")]
-            {
-                // The existing first-fetch-fault path always dispatches as
-                // narrow, even when the returned bus value resembles a wide
-                // prefix. Preserve that behavior in the predecoded key.
-                return DecodedOp {
-                    tag: u32::MAX,
-                    hw0,
-                    hw1: 0,
-                    flags: 0,
-                }
-                .with_dispatch_key(false, compact_dispatch_key_narrow(hw0));
-            }
-            #[cfg(not(feature = "compact-dispatch-key-prototype"))]
             return DecodedOp {
                 tag: u32::MAX,
                 hw0,
@@ -371,18 +247,6 @@ impl CortexM0Plus {
         } else {
             0
         };
-        #[cfg(feature = "compact-dispatch-key-prototype")]
-        if wide && bus.bus_fault() {
-            return DecodedOp {
-                tag: u32::MAX,
-                hw0,
-                hw1,
-                flags: DecodedOp::empty()
-                    .with_dispatch_key(true, compact_dispatch_key_wide(hw0, hw1))
-                    .flags,
-            };
-        }
-        #[cfg(not(feature = "compact-dispatch-key-prototype"))]
         if wide && bus.bus_fault() {
             return DecodedOp {
                 tag: u32::MAX,
@@ -392,26 +256,17 @@ impl CortexM0Plus {
             };
         }
 
-        let mut entry = DecodedOp {
+        let mut flags = 0u8;
+        if wide {
+            flags |= DecodedOp::FLAG_WIDE;
+        }
+
+        let entry = DecodedOp {
             tag: pc,
             hw0,
             hw1,
-            flags: DecodedOp::empty().flags,
+            flags,
         };
-        #[cfg(feature = "compact-dispatch-key-prototype")]
-        {
-            entry = if wide {
-                entry.with_dispatch_key(true, compact_dispatch_key_wide(hw0, hw1))
-            } else {
-                entry.with_dispatch_key(false, compact_dispatch_key_narrow(hw0))
-            };
-        }
-        #[cfg(not(feature = "compact-dispatch-key-prototype"))]
-        {
-            if wide {
-                entry.flags |= DecodedOp::FLAG_WIDE;
-            }
-        }
 
         if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
@@ -864,120 +719,6 @@ mod classifier_tests {
     /// FNV-1a 64-bit hash of `classify_thumb16_misc_pure` over the
     /// 16 misc sub-ops (canonical prefix 1011_0).
     const MISC_PURE_FINGERPRINT: u64 = 0x08fb8e07b596aaac;
-}
-
-#[cfg(all(test, feature = "compact-dispatch-key-prototype"))]
-mod compact_dispatch_key_tests {
-    use std::mem::size_of;
-
-    use crate::bus::DecodedOp;
-
-    use super::{
-        DISPATCH_KEY_NARROW_BRANCH, DISPATCH_KEY_NARROW_COND_BRANCH,
-        DISPATCH_KEY_NARROW_DATA_PROCESSING, DISPATCH_KEY_NARROW_LDR_LITERAL,
-        DISPATCH_KEY_NARROW_LOAD_STORE_REG, DISPATCH_KEY_NARROW_MISC,
-        DISPATCH_KEY_NARROW_SPECIAL_DATA, DISPATCH_KEY_WIDE_BL, DISPATCH_KEY_WIDE_MISC,
-        DISPATCH_KEY_WIDE_UNDEFINED, compact_dispatch_key_narrow, compact_dispatch_key_wide,
-    };
-
-    const BL_HW0: u16 = 0xF000;
-    const BL_HW1: u16 = 0xF800;
-    const MISC_HW0: u16 = 0xF3BF;
-    const MISC_HW1: u16 = 0x8F50;
-
-    #[test]
-    fn compact_key_uses_existing_decoded_op_padding() {
-        assert_eq!(size_of::<DecodedOp>(), 12);
-    }
-
-    #[test]
-    fn compact_keys_keep_narrow_prefixes_and_pairs() {
-        assert_eq!(compact_dispatch_key_narrow(0b00000u16 << 11), 0);
-        assert_eq!(compact_dispatch_key_narrow(0b00001u16 << 11), 1);
-        assert_eq!(compact_dispatch_key_narrow(0b00010u16 << 11), 2);
-        assert_eq!(compact_dispatch_key_narrow(0b00011u16 << 11), 3);
-        assert_eq!(compact_dispatch_key_narrow(0b00100u16 << 11), 4);
-        assert_eq!(compact_dispatch_key_narrow(0b00101u16 << 11), 5);
-        assert_eq!(compact_dispatch_key_narrow(0b00110u16 << 11), 6);
-        assert_eq!(compact_dispatch_key_narrow(0b00111u16 << 11), 7);
-        assert_eq!(
-            compact_dispatch_key_narrow(0b01001u16 << 11),
-            DISPATCH_KEY_NARROW_LDR_LITERAL
-        );
-
-        let data_processing = (0b01000u16 << 11) | 0b0_0000_0000_0000;
-        let special_data = (0b01000u16 << 11) | (1 << 10);
-        assert_eq!(
-            compact_dispatch_key_narrow(data_processing),
-            DISPATCH_KEY_NARROW_DATA_PROCESSING
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(special_data),
-            DISPATCH_KEY_NARROW_SPECIAL_DATA
-        );
-        assert_ne!(
-            compact_dispatch_key_narrow(data_processing),
-            compact_dispatch_key_narrow(special_data)
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b01010u16 << 11),
-            compact_dispatch_key_narrow(0b01011u16 << 11),
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b01010u16 << 11),
-            DISPATCH_KEY_NARROW_LOAD_STORE_REG,
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b10110u16 << 11),
-            compact_dispatch_key_narrow(0b10111u16 << 11),
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b11010u16 << 11),
-            compact_dispatch_key_narrow(0b11011u16 << 11),
-        );
-
-        assert_eq!(compact_dispatch_key_narrow(0b10101u16 << 11), 21);
-        assert_eq!(
-            compact_dispatch_key_narrow(0b10110u16 << 11),
-            DISPATCH_KEY_NARROW_MISC
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b11010u16 << 11),
-            DISPATCH_KEY_NARROW_COND_BRANCH
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b11100u16 << 11),
-            DISPATCH_KEY_NARROW_BRANCH
-        );
-        assert_eq!(compact_dispatch_key_narrow(0b11101u16 << 11), 31);
-    }
-
-    #[test]
-    fn compact_wide_keys_cover_bl_misc_and_default() {
-        assert_eq!(
-            compact_dispatch_key_wide(BL_HW0, BL_HW1),
-            DISPATCH_KEY_WIDE_BL
-        );
-        assert_eq!(
-            compact_dispatch_key_wide(MISC_HW0, MISC_HW1),
-            DISPATCH_KEY_WIDE_MISC
-        );
-        assert_eq!(
-            compact_dispatch_key_wide(0xF000, 0xE000),
-            DISPATCH_KEY_WIDE_UNDEFINED
-        );
-
-        for hw1 in 0u16..=u16::MAX {
-            let expected = if (hw1 & 0xD000) == 0xD000 {
-                DISPATCH_KEY_WIDE_BL
-            } else if (hw1 & 0xD000) == 0x8000 {
-                DISPATCH_KEY_WIDE_MISC
-            } else {
-                DISPATCH_KEY_WIDE_UNDEFINED
-            };
-            assert_eq!(compact_dispatch_key_wide(0xF000, hw1), expected);
-        }
-    }
 }
 
 #[cfg(all(test, feature = "event-horizon-profiler"))]

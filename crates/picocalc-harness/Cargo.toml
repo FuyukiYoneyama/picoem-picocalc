@@ -22,10 +22,6 @@ event-horizon-profiler = ["idle-profiler", "behavior-trace", "rp2040-emu/event-h
 # Diagnostic-only OPT0-B correctness build. Normal conformance and
 # performance runners do not compile the streaming hash path.
 behavior-trace = ["rp2040-emu/behavior-trace"]
-# OPT3-C trial. Stores a compact handler class in existing decode-cache
-# padding; kept out of normal runners until the exactness/performance gates
-# make an explicit promotion decision.
-compact-dispatch-key-prototype = ["rp2040-emu/compact-dispatch-key-prototype"]
 
 [lints]
 workspace = true

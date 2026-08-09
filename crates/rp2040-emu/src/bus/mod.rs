@@ -244,18 +244,12 @@ pub(crate) struct DecodedOp {
     pub hw1: u16,
     /// Packed flags.
     ///   bit 0 — `is_wide`
-    ///   bits 1..6 — dispatch key when `compact-dispatch-key-prototype`
-    ///   is enabled; otherwise reserved
-    ///   bit 7 — reserved
+    ///   bits 1..7 — reserved
     pub flags: u8,
 }
 
 impl DecodedOp {
     pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
-    #[cfg(feature = "compact-dispatch-key-prototype")]
-    pub(crate) const FLAG_DISPATCH_KEY_MASK: u8 = 0b0111_1110;
-    #[cfg(feature = "compact-dispatch-key-prototype")]
-    pub(crate) const FLAG_DISPATCH_KEY_SHIFT: u8 = 1;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
@@ -270,22 +264,6 @@ impl DecodedOp {
     #[inline(always)]
     pub(crate) fn is_wide(&self) -> bool {
         self.flags & Self::FLAG_WIDE != 0
-    }
-
-    #[cfg(feature = "compact-dispatch-key-prototype")]
-    #[inline(always)]
-    pub(crate) fn dispatch_key(&self) -> u8 {
-        (self.flags & Self::FLAG_DISPATCH_KEY_MASK) >> Self::FLAG_DISPATCH_KEY_SHIFT
-    }
-
-    #[cfg(feature = "compact-dispatch-key-prototype")]
-    #[inline(always)]
-    pub(crate) fn with_dispatch_key(mut self, wide: bool, key: u8) -> Self {
-        debug_assert!(key <= (Self::FLAG_DISPATCH_KEY_MASK >> Self::FLAG_DISPATCH_KEY_SHIFT));
-        self.flags = (self.flags & !(Self::FLAG_WIDE | Self::FLAG_DISPATCH_KEY_MASK))
-            | (if wide { Self::FLAG_WIDE } else { 0 })
-            | ((key << Self::FLAG_DISPATCH_KEY_SHIFT) & Self::FLAG_DISPATCH_KEY_MASK);
-        self
     }
 }
 
