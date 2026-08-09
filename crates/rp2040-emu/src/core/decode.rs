@@ -197,13 +197,24 @@ impl CortexM0Plus {
         let hw0 = entry.hw0;
         let hw1 = entry.hw1;
 
-        if entry.is_wide() {
+        #[cfg(feature = "event-horizon-profiler")]
+        let expected_next_pc = pc.wrapping_add(if entry.is_wide() { 4 } else { 2 });
+        let cycles = if entry.is_wide() {
             self.regs.set_pc(pc.wrapping_add(4));
             self.execute_thumb32(hw0, hw1, bus)
         } else {
             self.regs.set_pc(pc.wrapping_add(2));
             self.execute_thumb16(hw0, bus)
+        };
+
+        #[cfg(feature = "event-horizon-profiler")]
+        if self.regs.pc() != expected_next_pc {
+            self.decode_profile
+                .record_immutable_xip_hit_run_termination(
+                    crate::running_profile::ImmutableXipHitRunTerminationReason::PostExecuteNextPcRedirect,
+                );
         }
+        cycles
     }
 
     /// Populate path — runs on a cache miss. Fetches `hw0` (and `hw1`
@@ -797,5 +808,97 @@ mod decode_profile_tests {
         assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[2], 0);
         assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[0], 3);
         assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[1], 2);
+    }
+
+    #[test]
+    fn immutable_xip_hit_run_closes_on_post_execute_branch() {
+        let mut core = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        const PC: u32 = 0x1000_0000;
+
+        // `B +0` targets PC+4, rather than the sequential PC+2.
+        bus.load_flash(&0xE000u16.to_le_bytes());
+        core.populate_decode_cache(&mut bus, PC);
+        core.regs.set_pc(PC);
+        core.decode_execute(&mut bus);
+
+        let profile = core.decode_profile_snapshot();
+        assert_eq!(profile.cacheable_hits, 1);
+        assert_eq!(profile.immutable_xip_hit_runs.episodes_ge[0], 1);
+        assert_eq!(
+            profile
+                .immutable_xip_hit_run_termination_counters
+                .post_execute_next_pc_redirect,
+            1
+        );
+    }
+
+    #[test]
+    fn immutable_xip_hit_run_closes_before_pending_exception_fetch() {
+        let mut core = CortexM0Plus::new();
+        let mut bus = Bus::default();
+
+        core.decode_profile
+            .record_decode_lookup(0x1000_0000, 2, true, true);
+        core.regs.msp = 0x2000_8000;
+        core.regs.set_sp(0x2000_8000);
+        bus.ppb[0].vtor = 0x2000_0000;
+        bus.write32(0x2000_0000 + 14 * 4, 0x2000_1001);
+        bus.ppb[0].icsr |= 1 << 28;
+
+        assert!(core.step(&mut bus) > 0);
+
+        let profile = core.decode_profile_snapshot();
+        assert_eq!(
+            profile
+                .immutable_xip_hit_run_termination_counters
+                .prefetch_exception,
+            1
+        );
+    }
+
+    #[test]
+    fn immutable_xip_hit_run_closes_once_on_instruction_fault() {
+        let mut core = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        const PC: u32 = 0x1000_0000;
+
+        // BKPT raises the synchronous HardFault used by the RP2040 model.
+        bus.load_flash(&0xBE00u16.to_le_bytes());
+        core.populate_decode_cache(&mut bus, PC);
+        core.regs.msp = 0x2000_8000;
+        core.regs.set_sp(0x2000_8000);
+        bus.ppb[0].vtor = 0x2000_0000;
+        bus.write32(0x2000_0000 + 3 * 4, 0x2000_1001);
+        core.regs.set_pc(PC);
+
+        assert!(core.step(&mut bus) > 0);
+
+        let profile = core.decode_profile_snapshot();
+        assert_eq!(profile.immutable_xip_hit_run_termination_counters.fault, 1);
+        assert_eq!(profile.immutable_xip_hit_runs.episodes_ge[0], 1);
+    }
+
+    #[test]
+    fn decode_profile_observes_entry_region_and_all_invalidations() {
+        let mut core = CortexM0Plus::new();
+        core.invalidate_decode_cache_entries(&[0x0000_1000, 0x1000_0000, 0x1500_0000, 0x2000_0000]);
+        core.invalidate_decode_cache_regions(
+            crate::bus::invalidation_regions::ROM
+                | crate::bus::invalidation_regions::XIP
+                | crate::bus::invalidation_regions::SRAM,
+        );
+        core.invalidate_decode_cache_regions(crate::bus::invalidation_regions::BULK);
+        core.invalidate_decode_cache_all();
+
+        let observed = core
+            .decode_profile_snapshot()
+            .decode_cache_invalidation_observations;
+        assert_eq!(observed.entry_address_count, 4);
+        assert_eq!(observed.rom, 2);
+        assert_eq!(observed.xip, 3);
+        assert_eq!(observed.sram, 2);
+        assert_eq!(observed.bulk, 1);
+        assert_eq!(observed.all, 1);
     }
 }

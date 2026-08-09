@@ -210,7 +210,7 @@ impl CortexM0Plus {
         self.pending_fault.is_some()
     }
 
-    /// Snapshot decode-cache reuse counters for OPT2-D profiling.
+    /// Snapshot decode-cache reuse and immutable-XIP cursor counters.
     #[cfg(feature = "event-horizon-profiler")]
     pub fn decode_profile_snapshot(&self) -> crate::running_profile::DecodeProfileSnapshot {
         self.decode_profile.snapshot()
@@ -290,11 +290,16 @@ impl CortexM0Plus {
         // exception entry if one was taken; `0` otherwise.
         let exc_cycles = self.try_take_any_pending_exception(bus);
         if exc_cycles != 0 {
+            #[cfg(feature = "event-horizon-profiler")]
+            self.decode_profile
+                .record_immutable_xip_hit_run_prefetch_exception();
             self.cycles = self.cycles.wrapping_add(exc_cycles as u64);
             return exc_cycles;
         }
 
         let mut cycles = self.decode_execute(bus);
+        #[cfg(feature = "event-horizon-profiler")]
+        let profile_fault = bus.bus_fault() || self.pending_fault.is_some();
 
         // Synchronous bus fault — unmapped loads/stores or XIP-before-
         // flash-loaded accesses set bus.bus_fault. On ARMv6-M (M0+) every
@@ -313,6 +318,10 @@ impl CortexM0Plus {
         }
 
         if let Some(fault) = self.pending_fault.take() {
+            #[cfg(feature = "event-horizon-profiler")]
+            if profile_fault {
+                self.decode_profile.record_immutable_xip_hit_run_fault();
+            }
             cycles = cycles.wrapping_add(self.deliver_fault(fault, bus));
         }
 
@@ -442,6 +451,9 @@ impl CortexM0Plus {
         const MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
         let empty = DecodedOp::empty();
         for &addr in addrs {
+            #[cfg(feature = "event-horizon-profiler")]
+            self.decode_profile
+                .record_decode_cache_entry_invalidation(addr);
             let aligned = addr & !1;
             let prev = aligned.wrapping_sub(2);
             if is_cacheable_pc(prev) {
@@ -471,6 +483,9 @@ impl CortexM0Plus {
         if regions == 0 {
             return;
         }
+        #[cfg(feature = "event-horizon-profiler")]
+        self.decode_profile
+            .record_decode_cache_region_invalidation(regions);
         let empty = DecodedOp::empty();
         if regions & BULK != 0 {
             for slot in self.decode_cache.iter_mut() {
@@ -495,6 +510,8 @@ impl CortexM0Plus {
     /// and any path that globally invalidates the instruction pipeline.
     pub fn invalidate_decode_cache_all(&mut self) {
         use crate::bus::DecodedOp;
+        #[cfg(feature = "event-horizon-profiler")]
+        self.decode_profile.record_decode_cache_all_invalidation();
         let empty = DecodedOp::empty();
         for slot in self.decode_cache.iter_mut() {
             *slot = empty;

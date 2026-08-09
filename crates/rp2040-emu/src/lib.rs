@@ -2010,8 +2010,9 @@ impl Emulator {
         bits
     }
 
-    /// Enable and reset the OPT2-D running event-horizon/decode opportunity
-    /// profiler. This diagnostic is Serial-only and is intentionally
+    /// Enable and reset the running event-horizon/decode opportunity
+    /// profiler, including OPT3-A immutable-XIP cursor metrics. This
+    /// diagnostic is Serial-only and is intentionally
     /// separate from the wall-time measurement binary.
     #[cfg(feature = "event-horizon-profiler")]
     pub fn enable_running_event_profiler(&mut self) -> Result<(), EmulatorError> {
@@ -2025,7 +2026,7 @@ impl Emulator {
         Ok(())
     }
 
-    /// Snapshot OPT2-D aggregate counters without mutating open intervals.
+    /// Snapshot aggregate counters without mutating open intervals.
     #[cfg(feature = "event-horizon-profiler")]
     pub fn running_event_profile_snapshot(&self) -> Option<RunningEventProfileSnapshot> {
         self.running_profiler

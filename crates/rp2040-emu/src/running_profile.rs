@@ -1,4 +1,5 @@
-//! OPT2-B running-path horizon profiler, extended by OPT2-D lever metrics.
+//! Running-path horizon profiler, extended by OPT3-A immutable-XIP decode
+//! cursor opportunity metrics.
 //!
 //! Snapshot fields are aggregated from observed *running* intervals and
 //! recorded boundaries in serial execution. These are observed boundary gaps,
@@ -8,8 +9,35 @@ use crate::idle_profile::{
     CumulativeHistogramSnapshot, IdleEventHorizonProbe, IdleEventSourceMask, IdleHorizonEvents,
 };
 
-pub const RUNNING_EVENT_PROFILE_SCHEMA_VERSION: u32 = 2;
+pub const RUNNING_EVENT_PROFILE_SCHEMA_VERSION: u32 = 3;
 pub const ONE_CYCLE_FALLBACK_SIGNATURE_BUCKETS: usize = 16;
+const XIP_SRAM_BASE: u32 = 0x1500_0000;
+const XIP_SRAM_END: u32 = 0x1500_4000;
+const XIP_IMMUTABLE_BASE: u32 = 0x1000_0000;
+const XIP_IMMUTABLE_END: u32 = 0x1400_0000;
+const INVALIDATION_REGION_ROM: u8 = 1 << 0;
+const INVALIDATION_REGION_XIP: u8 = 1 << 1;
+const INVALIDATION_REGION_SRAM: u8 = 1 << 2;
+const INVALIDATION_REGION_BULK: u8 = 1 << 7;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DecodeLookupRegion {
+    #[default]
+    Rom,
+    ImmutableXip,
+    XipSram,
+    Sram,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImmutableXipHitRunTerminationReason {
+    PostExecuteNextPcRedirect,
+    XipMiss,
+    RegionExit,
+    PrefetchException,
+    Fault,
+}
 
 /// Signature buckets for one-cycle fallback-source overlap recording.
 ///
@@ -21,6 +49,39 @@ pub struct OneCycleFallbackSignatureHistogram {
     pub steps: [u64; ONE_CYCLE_FALLBACK_SIGNATURE_BUCKETS],
     /// Total cycles charged to those one-cycle fallback events by signature.
     pub cycle_mass: [u64; ONE_CYCLE_FALLBACK_SIGNATURE_BUCKETS],
+}
+
+/// Counts of decode-cache lookup hits and misses by executable region.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecodeLookupRegionCounters {
+    pub rom: u64,
+    pub immutable_xip_flash_aliases: u64,
+    pub xip_sram: u64,
+    pub sram: u64,
+    pub other: u64,
+}
+
+/// Counts of how immutable XIP hit-only run tracking terminates by cause.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImmutableXipHitRunTerminationCounters {
+    pub post_execute_next_pc_redirect: u64,
+    pub xip_miss: u64,
+    pub region_exit: u64,
+    pub prefetch_exception: u64,
+    pub fault: u64,
+}
+
+/// Decode-cache invalidation observations from region or entry tracking.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecodeCacheInvalidationObservations {
+    /// Number of invalidation addresses supplied to the per-entry API. This
+    /// is not the number of direct-mapped slots that the API clears.
+    pub entry_address_count: u64,
+    pub rom: u64,
+    pub xip: u64,
+    pub sram: u64,
+    pub bulk: u64,
+    pub all: u64,
 }
 
 /// Bitset describing what terminated the current observed running interval.
@@ -153,9 +214,18 @@ struct DecodeProfileState {
     cacheable_hits: u64,
     cacheable_misses: u64,
     noncacheable_fetches: u64,
+    cacheable_hits_narrow: u64,
+    cacheable_hits_wide: u64,
+    lookup_hits_by_region: DecodeLookupRegionCounters,
+    lookup_misses_by_region: DecodeLookupRegionCounters,
     sequential_cache_hit_runs: CumulativeHistogramSnapshot,
+    immutable_xip_hit_runs: CumulativeHistogramSnapshot,
+    open_immutable_xip_hit_run_instructions: u64,
+    open_immutable_xip_hit_run_next_pc: Option<u32>,
+    immutable_xip_hit_run_termination_counters: ImmutableXipHitRunTerminationCounters,
     open_hit_run_instructions: u64,
     open_hit_run_next_pc: Option<u32>,
+    invalidation_observations: DecodeCacheInvalidationObservations,
 }
 
 /// Snapshot of decode-cache reuse behavior.
@@ -164,10 +234,17 @@ pub struct DecodeProfileSnapshot {
     pub cacheable_hits: u64,
     pub cacheable_misses: u64,
     pub noncacheable_fetches: u64,
+    pub cacheable_hits_narrow: u64,
+    pub cacheable_hits_wide: u64,
+    pub lookup_hits_by_region: DecodeLookupRegionCounters,
+    pub lookup_misses_by_region: DecodeLookupRegionCounters,
     pub sequential_cache_hit_runs: CumulativeHistogramSnapshot,
+    pub immutable_xip_hit_runs: CumulativeHistogramSnapshot,
+    pub immutable_xip_hit_run_termination_counters: ImmutableXipHitRunTerminationCounters,
+    pub decode_cache_invalidation_observations: DecodeCacheInvalidationObservations,
 }
 
-/// Complete OPT2-D opportunity snapshot.
+/// Complete running-path and OPT3-A decode opportunity snapshot.
 ///
 /// Peripheral fallback occupancy and CPU decode reuse are deliberately kept
 /// side by side: both are diagnostic upper-bound inputs, not proofs that the
@@ -478,8 +555,17 @@ impl DecodeProfile {
         cacheable: bool,
         hit: bool,
     ) {
+        let region = Self::decode_lookup_region(pc);
         if cacheable && hit {
             self.state.cacheable_hits = self.state.cacheable_hits.saturating_add(1);
+            self.increment_lookup_region_hit(region);
+            if entry_width_bytes == 2 {
+                self.state.cacheable_hits_narrow =
+                    self.state.cacheable_hits_narrow.saturating_add(1);
+            } else if entry_width_bytes == 4 {
+                self.state.cacheable_hits_wide = self.state.cacheable_hits_wide.saturating_add(1);
+            }
+
             if self.state.open_hit_run_instructions == 0 {
                 self.state.open_hit_run_instructions = 1;
             } else if self.state.open_hit_run_next_pc == Some(pc) {
@@ -490,16 +576,102 @@ impl DecodeProfile {
                 self.state.open_hit_run_instructions = 1;
             }
             self.state.open_hit_run_next_pc = Some(pc.wrapping_add(entry_width_bytes));
+
+            self.track_immutable_xip_hit_run_on_lookup(pc, entry_width_bytes);
             return;
         }
 
+        self.increment_lookup_region_miss(region);
         if cacheable {
             self.state.cacheable_misses = self.state.cacheable_misses.saturating_add(1);
+            self.track_immutable_xip_hit_run_on_miss(region);
         } else {
             self.state.noncacheable_fetches = self.state.noncacheable_fetches.saturating_add(1);
+            self.track_immutable_xip_hit_run_on_miss(DecodeLookupRegion::Other);
         }
+
         self.close_hit_run();
         self.state.open_hit_run_next_pc = None;
+    }
+
+    /// Record observation of an explicit per-entry decode-cache invalidation.
+    ///
+    /// The region counters follow the same split used in the lookup accounting:
+    /// ROM, immutable XIP flash aliases, XIP SRAM, SRAM, and `other`.
+    pub fn record_decode_cache_entry_invalidation(&mut self, addr: u32) {
+        self.state.invalidation_observations.entry_address_count = self
+            .state
+            .invalidation_observations
+            .entry_address_count
+            .saturating_add(1);
+
+        match Self::decode_lookup_region(addr) {
+            DecodeLookupRegion::Rom => {
+                self.state.invalidation_observations.rom =
+                    self.state.invalidation_observations.rom.saturating_add(1)
+            }
+            DecodeLookupRegion::ImmutableXip | DecodeLookupRegion::XipSram => {
+                self.state.invalidation_observations.xip =
+                    self.state.invalidation_observations.xip.saturating_add(1)
+            }
+            DecodeLookupRegion::Sram => {
+                self.state.invalidation_observations.sram =
+                    self.state.invalidation_observations.sram.saturating_add(1)
+            }
+            DecodeLookupRegion::Other => {}
+        }
+    }
+
+    /// Record a bulk or region-scoped invalidation.
+    ///
+    /// Region bits mirror the `bus::invalidation_regions` bit layout:
+    /// `ROM|XIP|SRAM|BULK`. `BULK` increments only the bulk counter.
+    pub fn record_decode_cache_region_invalidation(&mut self, region_bits: u8) {
+        if region_bits & INVALIDATION_REGION_ROM != 0 {
+            self.state.invalidation_observations.rom =
+                self.state.invalidation_observations.rom.saturating_add(1);
+        }
+        if region_bits & INVALIDATION_REGION_XIP != 0 {
+            self.state.invalidation_observations.xip =
+                self.state.invalidation_observations.xip.saturating_add(1);
+        }
+        if region_bits & INVALIDATION_REGION_SRAM != 0 {
+            self.state.invalidation_observations.sram =
+                self.state.invalidation_observations.sram.saturating_add(1);
+        }
+        if region_bits & INVALIDATION_REGION_BULK != 0 {
+            self.state.invalidation_observations.bulk =
+                self.state.invalidation_observations.bulk.saturating_add(1);
+        }
+    }
+
+    /// Record a full decode-cache invalidation observation.
+    pub fn record_decode_cache_all_invalidation(&mut self) {
+        self.state.invalidation_observations.all =
+            self.state.invalidation_observations.all.saturating_add(1);
+    }
+
+    /// Manually close the current immutable-XIP hit run with an explicit cause.
+    ///
+    /// This is used when a non-sequential event is observed outside the
+    /// lookup stream (for example, a prefetch exception or decode fault).
+    pub fn record_immutable_xip_hit_run_termination(
+        &mut self,
+        reason: ImmutableXipHitRunTerminationReason,
+    ) {
+        self.close_immutable_xip_hit_run(Some(reason));
+    }
+
+    /// Convenience wrapper for prefetch-exception-driven termination.
+    pub fn record_immutable_xip_hit_run_prefetch_exception(&mut self) {
+        self.record_immutable_xip_hit_run_termination(
+            ImmutableXipHitRunTerminationReason::PrefetchException,
+        );
+    }
+
+    /// Convenience wrapper for fault-driven termination.
+    pub fn record_immutable_xip_hit_run_fault(&mut self) {
+        self.record_immutable_xip_hit_run_termination(ImmutableXipHitRunTerminationReason::Fault);
     }
 
     /// Flush decode-profile counters into a snapshot.
@@ -509,12 +681,198 @@ impl DecodeProfile {
     pub fn snapshot(&self) -> DecodeProfileSnapshot {
         let mut copy = self.clone();
         copy.close_hit_run();
+        copy.close_immutable_xip_hit_run(None);
         DecodeProfileSnapshot {
             cacheable_hits: copy.state.cacheable_hits,
             cacheable_misses: copy.state.cacheable_misses,
             noncacheable_fetches: copy.state.noncacheable_fetches,
+            cacheable_hits_narrow: copy.state.cacheable_hits_narrow,
+            cacheable_hits_wide: copy.state.cacheable_hits_wide,
+            lookup_hits_by_region: copy.state.lookup_hits_by_region,
+            lookup_misses_by_region: copy.state.lookup_misses_by_region,
             sequential_cache_hit_runs: copy.state.sequential_cache_hit_runs,
+            immutable_xip_hit_runs: copy.state.immutable_xip_hit_runs,
+            immutable_xip_hit_run_termination_counters: copy
+                .state
+                .immutable_xip_hit_run_termination_counters,
+            decode_cache_invalidation_observations: copy.state.invalidation_observations,
         }
+    }
+
+    fn track_immutable_xip_hit_run_on_lookup(&mut self, pc: u32, entry_width_bytes: u32) {
+        if Self::decode_lookup_region(pc) != DecodeLookupRegion::ImmutableXip {
+            self.close_immutable_xip_hit_run(Some(ImmutableXipHitRunTerminationReason::RegionExit));
+            return;
+        }
+
+        if self.state.open_immutable_xip_hit_run_instructions == 0 {
+            self.state.open_immutable_xip_hit_run_instructions = 1;
+            self.state.open_immutable_xip_hit_run_next_pc =
+                Some(pc.wrapping_add(entry_width_bytes));
+            return;
+        }
+
+        if self.state.open_immutable_xip_hit_run_next_pc == Some(pc) {
+            self.state.open_immutable_xip_hit_run_instructions = self
+                .state
+                .open_immutable_xip_hit_run_instructions
+                .saturating_add(1);
+            self.state.open_immutable_xip_hit_run_next_pc =
+                Some(pc.wrapping_add(entry_width_bytes));
+            return;
+        }
+
+        self.close_immutable_xip_hit_run(Some(
+            ImmutableXipHitRunTerminationReason::PostExecuteNextPcRedirect,
+        ));
+        self.state.open_immutable_xip_hit_run_instructions = 1;
+        self.state.open_immutable_xip_hit_run_next_pc = Some(pc.wrapping_add(entry_width_bytes));
+    }
+
+    fn track_immutable_xip_hit_run_on_miss(&mut self, region: DecodeLookupRegion) {
+        if self.state.open_immutable_xip_hit_run_instructions == 0 {
+            return;
+        }
+        if region == DecodeLookupRegion::ImmutableXip {
+            self.close_immutable_xip_hit_run(Some(ImmutableXipHitRunTerminationReason::XipMiss));
+        } else {
+            self.close_immutable_xip_hit_run(Some(ImmutableXipHitRunTerminationReason::RegionExit));
+        }
+    }
+
+    fn increment_lookup_region_hit(&mut self, region: DecodeLookupRegion) {
+        match region {
+            DecodeLookupRegion::Rom => {
+                self.state.lookup_hits_by_region.rom =
+                    self.state.lookup_hits_by_region.rom.saturating_add(1)
+            }
+            DecodeLookupRegion::ImmutableXip => {
+                self.state.lookup_hits_by_region.immutable_xip_flash_aliases = self
+                    .state
+                    .lookup_hits_by_region
+                    .immutable_xip_flash_aliases
+                    .saturating_add(1)
+            }
+            DecodeLookupRegion::XipSram => {
+                self.state.lookup_hits_by_region.xip_sram =
+                    self.state.lookup_hits_by_region.xip_sram.saturating_add(1)
+            }
+            DecodeLookupRegion::Sram => {
+                self.state.lookup_hits_by_region.sram =
+                    self.state.lookup_hits_by_region.sram.saturating_add(1)
+            }
+            DecodeLookupRegion::Other => {
+                self.state.lookup_hits_by_region.other =
+                    self.state.lookup_hits_by_region.other.saturating_add(1)
+            }
+        }
+    }
+
+    fn increment_lookup_region_miss(&mut self, region: DecodeLookupRegion) {
+        match region {
+            DecodeLookupRegion::Rom => {
+                self.state.lookup_misses_by_region.rom =
+                    self.state.lookup_misses_by_region.rom.saturating_add(1)
+            }
+            DecodeLookupRegion::ImmutableXip => {
+                self.state
+                    .lookup_misses_by_region
+                    .immutable_xip_flash_aliases = self
+                    .state
+                    .lookup_misses_by_region
+                    .immutable_xip_flash_aliases
+                    .saturating_add(1)
+            }
+            DecodeLookupRegion::XipSram => {
+                self.state.lookup_misses_by_region.xip_sram = self
+                    .state
+                    .lookup_misses_by_region
+                    .xip_sram
+                    .saturating_add(1)
+            }
+            DecodeLookupRegion::Sram => {
+                self.state.lookup_misses_by_region.sram =
+                    self.state.lookup_misses_by_region.sram.saturating_add(1)
+            }
+            DecodeLookupRegion::Other => {
+                self.state.lookup_misses_by_region.other =
+                    self.state.lookup_misses_by_region.other.saturating_add(1)
+            }
+        }
+    }
+
+    fn close_immutable_xip_hit_run(&mut self, reason: Option<ImmutableXipHitRunTerminationReason>) {
+        if self.state.open_immutable_xip_hit_run_instructions == 0 {
+            return;
+        }
+        self.state
+            .immutable_xip_hit_runs
+            .record(self.state.open_immutable_xip_hit_run_instructions);
+        if let Some(reason) = reason {
+            match reason {
+                ImmutableXipHitRunTerminationReason::PostExecuteNextPcRedirect => {
+                    self.state
+                        .immutable_xip_hit_run_termination_counters
+                        .post_execute_next_pc_redirect = self
+                        .state
+                        .immutable_xip_hit_run_termination_counters
+                        .post_execute_next_pc_redirect
+                        .saturating_add(1);
+                }
+                ImmutableXipHitRunTerminationReason::XipMiss => {
+                    self.state
+                        .immutable_xip_hit_run_termination_counters
+                        .xip_miss = self
+                        .state
+                        .immutable_xip_hit_run_termination_counters
+                        .xip_miss
+                        .saturating_add(1);
+                }
+                ImmutableXipHitRunTerminationReason::RegionExit => {
+                    self.state
+                        .immutable_xip_hit_run_termination_counters
+                        .region_exit = self
+                        .state
+                        .immutable_xip_hit_run_termination_counters
+                        .region_exit
+                        .saturating_add(1);
+                }
+                ImmutableXipHitRunTerminationReason::PrefetchException => {
+                    self.state
+                        .immutable_xip_hit_run_termination_counters
+                        .prefetch_exception = self
+                        .state
+                        .immutable_xip_hit_run_termination_counters
+                        .prefetch_exception
+                        .saturating_add(1);
+                }
+                ImmutableXipHitRunTerminationReason::Fault => {
+                    self.state.immutable_xip_hit_run_termination_counters.fault = self
+                        .state
+                        .immutable_xip_hit_run_termination_counters
+                        .fault
+                        .saturating_add(1);
+                }
+            }
+        }
+        self.state.open_immutable_xip_hit_run_instructions = 0;
+        self.state.open_immutable_xip_hit_run_next_pc = None;
+    }
+
+    fn decode_lookup_region(pc: u32) -> DecodeLookupRegion {
+        if (pc >> 28) == 0 {
+            return DecodeLookupRegion::Rom;
+        }
+        if (XIP_IMMUTABLE_BASE..XIP_IMMUTABLE_END).contains(&pc) {
+            return DecodeLookupRegion::ImmutableXip;
+        }
+        if (XIP_SRAM_BASE..XIP_SRAM_END).contains(&pc) {
+            return DecodeLookupRegion::XipSram;
+        }
+        if (pc >> 28) == 0x2 {
+            return DecodeLookupRegion::Sram;
+        }
+        DecodeLookupRegion::Other
     }
 
     fn close_hit_run(&mut self) {
@@ -661,5 +1019,167 @@ mod tests {
         assert_eq!(second.total_running_cycles, 7);
         assert_eq!(second.observed_inter_boundary_cycles.episodes_ge[0], 1);
         assert_eq!(second.observed_inter_boundary_cycles.cycle_mass_ge[0], 7);
+    }
+
+    #[test]
+    fn decode_lookup_region_counters_and_widths_track_narrow_wide_hits() {
+        let mut p = DecodeProfile::default();
+        p.record_decode_lookup(0x0000_1000, 2, true, true);
+        p.record_decode_lookup(0x1000_0020, 4, true, true);
+        p.record_decode_lookup(0x1500_0040, 2, true, true);
+        p.record_decode_lookup(0x2000_3000, 4, true, true);
+        p.record_decode_lookup(0x4000_0000, 2, true, true);
+        p.record_decode_lookup(0x1000_0040, 2, true, false);
+        p.record_decode_lookup(0x4000_1000, 4, false, false);
+
+        let snap = p.snapshot();
+        assert_eq!(snap.cacheable_hits, 5);
+        assert_eq!(snap.cacheable_misses, 1);
+        assert_eq!(snap.noncacheable_fetches, 1);
+        assert_eq!(snap.cacheable_hits_narrow, 3);
+        assert_eq!(snap.cacheable_hits_wide, 2);
+        assert_eq!(snap.lookup_hits_by_region.rom, 1);
+        assert_eq!(snap.lookup_hits_by_region.immutable_xip_flash_aliases, 1);
+        assert_eq!(snap.lookup_hits_by_region.xip_sram, 1);
+        assert_eq!(snap.lookup_hits_by_region.sram, 1);
+        assert_eq!(snap.lookup_hits_by_region.other, 1);
+        assert_eq!(snap.lookup_misses_by_region.immutable_xip_flash_aliases, 1);
+        assert_eq!(snap.lookup_misses_by_region.other, 1);
+    }
+
+    #[test]
+    fn immutable_xip_hit_runs_track_termination_reasons() {
+        let mut p = DecodeProfile::default();
+        let xip0 = 0x1000_0000;
+        let xip1 = 0x1000_0010;
+        let xip2 = 0x1000_0034;
+
+        p.record_decode_lookup(xip0, 2, true, true);
+        p.record_decode_lookup(xip0 + 4, 2, true, true);
+        p.record_decode_lookup(0x2000_0000, 2, true, true);
+        p.record_decode_lookup(xip1, 2, true, true);
+        p.record_decode_lookup(xip1, 4, true, false);
+        p.record_decode_lookup(xip2, 2, true, true);
+        p.record_immutable_xip_hit_run_prefetch_exception();
+        p.record_decode_lookup(xip2 + 0x40, 2, true, true);
+        p.record_immutable_xip_hit_run_fault();
+
+        let snap = p.snapshot();
+        assert_eq!(snap.immutable_xip_hit_runs.episodes_ge[0], 5);
+        assert_eq!(
+            snap.immutable_xip_hit_run_termination_counters
+                .post_execute_next_pc_redirect,
+            1
+        );
+        assert_eq!(
+            snap.immutable_xip_hit_run_termination_counters.region_exit,
+            1
+        );
+        assert_eq!(snap.immutable_xip_hit_run_termination_counters.xip_miss, 1);
+        assert_eq!(
+            snap.immutable_xip_hit_run_termination_counters
+                .prefetch_exception,
+            1
+        );
+        assert_eq!(snap.immutable_xip_hit_run_termination_counters.fault, 1);
+    }
+
+    #[test]
+    fn snapshot_flushes_open_immutable_xip_run_without_termination_counts() {
+        let mut p = DecodeProfile::default();
+        p.record_decode_lookup(0x1000_0000, 2, true, true);
+
+        let first = p.snapshot();
+        let second = p.snapshot();
+
+        assert_eq!(first.immutable_xip_hit_runs.episodes_ge[0], 1);
+        assert_eq!(
+            first
+                .immutable_xip_hit_run_termination_counters
+                .post_execute_next_pc_redirect,
+            0
+        );
+        assert_eq!(
+            first.immutable_xip_hit_run_termination_counters.region_exit,
+            0
+        );
+        assert_eq!(first.immutable_xip_hit_run_termination_counters.xip_miss, 0);
+        assert_eq!(
+            first
+                .immutable_xip_hit_run_termination_counters
+                .prefetch_exception,
+            0
+        );
+        assert_eq!(first.immutable_xip_hit_run_termination_counters.fault, 0);
+
+        assert_eq!(second.immutable_xip_hit_runs.episodes_ge[0], 1);
+        assert_eq!(
+            second
+                .immutable_xip_hit_run_termination_counters
+                .post_execute_next_pc_redirect,
+            0
+        );
+        assert_eq!(
+            second
+                .immutable_xip_hit_run_termination_counters
+                .region_exit,
+            0
+        );
+        assert_eq!(
+            second.immutable_xip_hit_run_termination_counters.xip_miss,
+            0
+        );
+        assert_eq!(
+            second
+                .immutable_xip_hit_run_termination_counters
+                .prefetch_exception,
+            0
+        );
+        assert_eq!(second.immutable_xip_hit_run_termination_counters.fault, 0);
+    }
+
+    #[test]
+    fn decode_cache_invalidation_observations_are_counted_by_region() {
+        let mut p = DecodeProfile::default();
+        p.record_decode_cache_entry_invalidation(0x0000_1000);
+        p.record_decode_cache_entry_invalidation(0x1000_0200);
+        p.record_decode_cache_entry_invalidation(0x1500_0004);
+        p.record_decode_cache_entry_invalidation(0x2000_0010);
+        p.record_decode_cache_region_invalidation(
+            INVALIDATION_REGION_ROM | INVALIDATION_REGION_BULK,
+        );
+        p.record_decode_cache_region_invalidation(
+            INVALIDATION_REGION_XIP | INVALIDATION_REGION_SRAM,
+        );
+        p.record_decode_cache_all_invalidation();
+        p.record_decode_cache_all_invalidation();
+
+        let obs = p.snapshot().decode_cache_invalidation_observations;
+        assert_eq!(obs.entry_address_count, 4);
+        assert_eq!(obs.rom, 2);
+        assert_eq!(obs.xip, 3);
+        assert_eq!(obs.sram, 2);
+        assert_eq!(obs.bulk, 1);
+        assert_eq!(obs.all, 2);
+    }
+
+    #[test]
+    fn immutable_xip_region_boundaries_are_half_open_and_exclude_xip_sram() {
+        let mut p = DecodeProfile::default();
+        for pc in [0x1000_0000, 0x13ff_fffe, 0x13ff_ffff] {
+            p.record_decode_lookup(pc, 2, true, true);
+        }
+        for pc in [0x1400_0000, 0x14ff_ffff] {
+            p.record_decode_lookup(pc, 2, true, false);
+        }
+        for pc in [0x1500_0000, 0x1500_3fff] {
+            p.record_decode_lookup(pc, 2, true, false);
+        }
+        p.record_decode_lookup(0x1500_4000, 2, true, false);
+
+        let snap = p.snapshot();
+        assert_eq!(snap.lookup_hits_by_region.immutable_xip_flash_aliases, 3);
+        assert_eq!(snap.lookup_misses_by_region.other, 3);
+        assert_eq!(snap.lookup_misses_by_region.xip_sram, 2);
     }
 }

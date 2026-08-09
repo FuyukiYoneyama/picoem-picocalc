@@ -1367,15 +1367,69 @@ fn running_boundary_events_json(value: &RunningBoundaryEvents) -> String {
 
 #[cfg(feature = "event-horizon-profiler")]
 fn decode_profile_json(value: &DecodeProfileSnapshot) -> String {
+    let lookup_hits_by_region = format!(
+        "{{\"rom\": {}, \"immutable_xip_flash_aliases\": {}, \"xip_sram\": {}, \"sram\": {}, \"other\": {}}}",
+        value.lookup_hits_by_region.rom,
+        value.lookup_hits_by_region.immutable_xip_flash_aliases,
+        value.lookup_hits_by_region.xip_sram,
+        value.lookup_hits_by_region.sram,
+        value.lookup_hits_by_region.other,
+    );
+    let lookup_misses_by_region = format!(
+        "{{\"rom\": {}, \"immutable_xip_flash_aliases\": {}, \"xip_sram\": {}, \"sram\": {}, \"other\": {}}}",
+        value.lookup_misses_by_region.rom,
+        value.lookup_misses_by_region.immutable_xip_flash_aliases,
+        value.lookup_misses_by_region.xip_sram,
+        value.lookup_misses_by_region.sram,
+        value.lookup_misses_by_region.other,
+    );
+    let immutable_xip_hit_run_termination_counters = format!(
+        "{{\"post_execute_next_pc_redirect\": {}, \"xip_miss\": {}, \"region_exit\": {}, \"prefetch_exception\": {}, \"fault\": {}}}",
+        value
+            .immutable_xip_hit_run_termination_counters
+            .post_execute_next_pc_redirect,
+        value.immutable_xip_hit_run_termination_counters.xip_miss,
+        value.immutable_xip_hit_run_termination_counters.region_exit,
+        value
+            .immutable_xip_hit_run_termination_counters
+            .prefetch_exception,
+        value.immutable_xip_hit_run_termination_counters.fault,
+    );
+    let decode_cache_invalidation_observations = format!(
+        "{{\"entry_address_count\": {}, \"rom\": {}, \"xip\": {}, \"sram\": {}, \"bulk\": {}, \"all\": {}}}",
+        value
+            .decode_cache_invalidation_observations
+            .entry_address_count,
+        value.decode_cache_invalidation_observations.rom,
+        value.decode_cache_invalidation_observations.xip,
+        value.decode_cache_invalidation_observations.sram,
+        value.decode_cache_invalidation_observations.bulk,
+        value.decode_cache_invalidation_observations.all,
+    );
+
     format!(
         concat!(
             "{{\"cacheable_hits\": {}, \"cacheable_misses\": {}, ",
-            "\"noncacheable_fetches\": {}, \"sequential_cache_hit_runs\": {}}}"
+            "\"noncacheable_fetches\": {}, ",
+            "\"cacheable_hits_narrow\": {}, \"cacheable_hits_wide\": {}, ",
+            "\"lookup_hits_by_region\": {}, ",
+            "\"lookup_misses_by_region\": {}, ",
+            "\"sequential_cache_hit_runs\": {}, ",
+            "\"immutable_xip_hit_runs\": {}, ",
+            "\"immutable_xip_hit_run_termination_counters\": {}, ",
+            "\"decode_cache_invalidation_observations\": {}}}"
         ),
         value.cacheable_hits,
         value.cacheable_misses,
         value.noncacheable_fetches,
+        value.cacheable_hits_narrow,
+        value.cacheable_hits_wide,
+        lookup_hits_by_region,
+        lookup_misses_by_region,
         histogram_json(&value.sequential_cache_hit_runs),
+        histogram_json(&value.immutable_xip_hit_runs),
+        immutable_xip_hit_run_termination_counters,
+        decode_cache_invalidation_observations,
     )
 }
 
@@ -1405,6 +1459,7 @@ fn build_running_event_profile_report(
             "  \"observed_gaps_are_safe_windows\": false,\n",
             "  \"fallback_occupancy_is_safe_window\": false,\n",
             "  \"decode_hit_runs_are_speedup_prediction\": false,\n",
+            "  \"immutable_xip_hit_runs_are_speedup_prediction\": false,\n",
             "  \"conservative_horizon_complete_for_current_model\": true,\n",
             "  \"step_quantum\": {},\n",
             "  \"stop_reason\": {},\n",
@@ -3065,9 +3120,60 @@ mod tests {
         profile.boundary.observed_candidate_dispatches.cycle_mass_ge[1] = 5;
         profile.decode_by_core[0].cacheable_hits = 11;
         profile.decode_by_core[0].cacheable_misses = 2;
+        profile.decode_by_core[0].noncacheable_fetches = 3;
+        profile.decode_by_core[0].cacheable_hits_narrow = 4;
+        profile.decode_by_core[0].cacheable_hits_wide = 5;
+        profile.decode_by_core[0].lookup_hits_by_region.rom = 6;
+        profile.decode_by_core[0]
+            .lookup_hits_by_region
+            .immutable_xip_flash_aliases = 7;
+        profile.decode_by_core[0].lookup_hits_by_region.xip_sram = 8;
+        profile.decode_by_core[0].lookup_hits_by_region.sram = 9;
+        profile.decode_by_core[0].lookup_hits_by_region.other = 10;
+        profile.decode_by_core[0].lookup_misses_by_region.rom = 1;
+        profile.decode_by_core[0]
+            .lookup_misses_by_region
+            .immutable_xip_flash_aliases = 2;
+        profile.decode_by_core[0].lookup_misses_by_region.xip_sram = 3;
+        profile.decode_by_core[0].lookup_misses_by_region.sram = 4;
+        profile.decode_by_core[0].lookup_misses_by_region.other = 5;
         profile.decode_by_core[0]
             .sequential_cache_hit_runs
             .episodes_ge[2] = 3;
+        profile.decode_by_core[0].immutable_xip_hit_runs.episodes_ge[1] = 2;
+        profile.decode_by_core[0]
+            .immutable_xip_hit_run_termination_counters
+            .post_execute_next_pc_redirect = 11;
+        profile.decode_by_core[0]
+            .immutable_xip_hit_run_termination_counters
+            .xip_miss = 12;
+        profile.decode_by_core[0]
+            .immutable_xip_hit_run_termination_counters
+            .region_exit = 13;
+        profile.decode_by_core[0]
+            .immutable_xip_hit_run_termination_counters
+            .prefetch_exception = 14;
+        profile.decode_by_core[0]
+            .immutable_xip_hit_run_termination_counters
+            .fault = 15;
+        profile.decode_by_core[0]
+            .decode_cache_invalidation_observations
+            .entry_address_count = 16;
+        profile.decode_by_core[0]
+            .decode_cache_invalidation_observations
+            .rom = 17;
+        profile.decode_by_core[0]
+            .decode_cache_invalidation_observations
+            .xip = 18;
+        profile.decode_by_core[0]
+            .decode_cache_invalidation_observations
+            .sram = 19;
+        profile.decode_by_core[0]
+            .decode_cache_invalidation_observations
+            .bulk = 20;
+        profile.decode_by_core[0]
+            .decode_cache_invalidation_observations
+            .all = 21;
         let run = outcome(StopReason::ScenarioDone, b"");
         let report = build_running_event_profile_report(
             "0123456789012345678901234567890123456789",
@@ -3083,9 +3189,14 @@ mod tests {
             parsed["kind"],
             "rp2040_serial_running_event_horizon_profile"
         );
+        assert_eq!(parsed["schema_version"], 3);
         assert_eq!(parsed["observed_gaps_are_safe_windows"], false);
         assert_eq!(parsed["fallback_occupancy_is_safe_window"], false);
         assert_eq!(parsed["decode_hit_runs_are_speedup_prediction"], false);
+        assert_eq!(
+            parsed["immutable_xip_hit_runs_are_speedup_prediction"],
+            false
+        );
         assert_eq!(parsed["counters"]["running_steps"], 7);
         assert_eq!(parsed["counters"]["candidate_dispatches"], 5);
         assert_eq!(parsed["counters"]["candidate_cycles"], 9);
@@ -3098,8 +3209,112 @@ mod tests {
             11
         );
         assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["cacheable_misses"],
+            2
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["noncacheable_fetches"],
+            3
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["cacheable_hits_narrow"],
+            4
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["cacheable_hits_wide"],
+            5
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["rom"],
+            6
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["immutable_xip_flash_aliases"],
+            7
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["xip_sram"],
+            8
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["sram"],
+            9
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["other"],
+            10
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["rom"],
+            1
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["immutable_xip_flash_aliases"],
+            2
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["xip_sram"],
+            3
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["sram"],
+            4
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["other"],
+            5
+        );
+        assert_eq!(
             parsed["decode_opportunity_by_core"][0]["sequential_cache_hit_runs"]["episodes_ge"][2],
             3
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_runs"]["episodes_ge"][1],
+            2
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["post_execute_next_pc_redirect"],
+            11
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["xip_miss"],
+            12
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["region_exit"],
+            13
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["prefetch_exception"],
+            14
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["fault"],
+            15
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["entry_address_count"],
+            16
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["rom"],
+            17
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["xip"],
+            18
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["sram"],
+            19
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["bulk"],
+            20
+        );
+        assert_eq!(
+            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["all"],
+            21
         );
         assert_eq!(
             parsed["observed_candidate_dispatches"]["cycle_mass_ge"][1],
@@ -3117,5 +3332,15 @@ mod tests {
                 &profile,
             )
         );
+        let report2 = build_running_event_profile_report(
+            "0123456789012345678901234567890123456789",
+            false,
+            "firmware.bin",
+            "abcdef",
+            1,
+            &run,
+            &profile,
+        );
+        assert_eq!(report.as_bytes(), report2.as_bytes());
     }
 }
