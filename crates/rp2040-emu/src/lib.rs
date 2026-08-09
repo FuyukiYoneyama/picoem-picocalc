@@ -211,22 +211,6 @@ pub use picoem_common::{Clock, PacerSnapshot, PacerStats};
 /// firmware.
 pub use picoem_common::ROSC_FREQ_HZ;
 
-/// OPT2-G proof-of-use counters. Absent from normal builds.
-#[cfg(feature = "uart-deadline-prototype")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct UartDeadlinePrototypeSnapshot {
-    /// Scheduler calls handled by the UART-only exact lane.
-    pub lane_calls: u64,
-    /// Master cycles advanced by those calls.
-    pub lane_cycles: u64,
-    /// Lane calls with an active UART TX FIFO.
-    pub temporal_tx_calls: u64,
-    /// First exact TX event distance observed on the lane; zero means none.
-    pub first_tx_deadline_cycles: u64,
-    /// Calls with static UART state but no advancing TX event.
-    pub static_calls: u64,
-}
-
 /// Emulator configuration.
 pub struct Config {
     /// System clock frequency in Hz. Default: ROSC (~6.5 MHz).
@@ -287,8 +271,6 @@ pub struct Emulator {
     /// PC moved this tick. Initialised to a sentinel `0xFF` so the
     /// very first observation always counts as an advance.
     pub(crate) pio0_sm0_last_pc: u8,
-    #[cfg(feature = "uart-deadline-prototype")]
-    uart_deadline_prototype: UartDeadlinePrototypeSnapshot,
     /// OPT0-A Serial idle profiler. Entirely absent from normal builds;
     /// diagnostic harnesses opt in through the `idle-profiler` feature.
     #[cfg(feature = "idle-profiler")]
@@ -478,10 +460,6 @@ impl Emulator {
         self.pio0_sm0_max_pc = 0;
         self.pio0_sm0_pc_advances = 0;
         self.pio0_sm0_last_pc = 0xFF;
-        #[cfg(feature = "uart-deadline-prototype")]
-        {
-            self.uart_deadline_prototype = UartDeadlinePrototypeSnapshot::default();
-        }
         #[cfg(feature = "idle-profiler")]
         if let Some(profiler) = self.idle_profiler.as_mut() {
             *profiler = idle_profile::IdleProfiler::default();
@@ -1016,18 +994,10 @@ impl Emulator {
         // while it is active the slow path is already mandatory, so
         // repeatedly inspecting every peripheral cannot change the
         // decision. `all_peripherals_idle()` includes DMA.
-        #[cfg(not(feature = "uart-deadline-prototype"))]
         let fast_path = pio_idle
             && self.bus.irq_pending == 0
             && !self.bus.systicks[self.bus.active_core()].is_enabled()
             && self.bus.all_peripherals_idle();
-        #[cfg(feature = "uart-deadline-prototype")]
-        let fast_path = pio_idle
-            && self.bus.irq_pending == 0
-            && !self.bus.systicks[self.bus.active_core()].is_enabled()
-            && self.bus.all_non_uart_peripherals_idle();
-        #[cfg(feature = "uart-deadline-prototype")]
-        let uart_deadline_lane = fast_path && !self.bus.uarts_idle();
         if fast_path {
             self.tick_pio(consumed as u32);
             // Advance lazy-scheduled peripherals (TIMER alarms) by the
@@ -1037,32 +1007,6 @@ impl Emulator {
             // in one quantum sees the IRQ land by the start of the
             // next.
             self.bus.advance_lazy_scheduled(consumed);
-            #[cfg(feature = "uart-deadline-prototype")]
-            if uart_deadline_lane {
-                self.uart_deadline_prototype.lane_calls =
-                    self.uart_deadline_prototype.lane_calls.wrapping_add(1);
-                self.uart_deadline_prototype.lane_cycles = self
-                    .uart_deadline_prototype
-                    .lane_cycles
-                    .wrapping_add(consumed);
-                if self.bus.uarts_have_temporal_tx_work() {
-                    if self.uart_deadline_prototype.first_tx_deadline_cycles == 0 {
-                        self.uart_deadline_prototype.first_tx_deadline_cycles =
-                            self.bus.next_uart_tx_event_distance().unwrap_or_default();
-                    }
-                    self.uart_deadline_prototype.temporal_tx_calls = self
-                        .uart_deadline_prototype
-                        .temporal_tx_calls
-                        .wrapping_add(1);
-                } else {
-                    self.uart_deadline_prototype.static_calls =
-                        self.uart_deadline_prototype.static_calls.wrapping_add(1);
-                }
-                // Preserve the ordinary slow-path UART0→UART1 ordering and
-                // exact per-quantum event semantics. The gate above proved
-                // DMA and every other per-cycle source idle.
-                self.bus.tick_uarts_only(consumed as u32);
-            }
             self.drain_pending_irqs_to_cores();
             self.update_gpio();
         } else {
@@ -1524,8 +1468,6 @@ impl Emulator {
             pio0_sm0_max_pc: self.pio0_sm0_max_pc,
             pio0_sm0_pc_advances: self.pio0_sm0_pc_advances,
             pio0_sm0_last_pc: self.pio0_sm0_last_pc,
-            #[cfg(feature = "uart-deadline-prototype")]
-            uart_deadline_prototype: self.uart_deadline_prototype,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
             #[cfg(feature = "event-horizon-profiler")]
@@ -2097,13 +2039,6 @@ impl Emulator {
             })
     }
 
-    /// Return OPT2-G proof-of-use counters for the feature-gated UART lane.
-    #[cfg(feature = "uart-deadline-prototype")]
-    pub fn uart_deadline_prototype_snapshot(&self) -> UartDeadlinePrototypeSnapshot {
-        self.assert_not_placeholder();
-        self.uart_deadline_prototype
-    }
-
     /// Enable and reset the diagnostic Serial idle profiler.
     ///
     /// Available only in builds with the `idle-profiler` feature. The
@@ -2341,8 +2276,6 @@ impl EmulatorBuilder {
             pio0_sm0_max_pc: 0,
             pio0_sm0_pc_advances: 0,
             pio0_sm0_last_pc: 0xFF,
-            #[cfg(feature = "uart-deadline-prototype")]
-            uart_deadline_prototype: UartDeadlinePrototypeSnapshot::default(),
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
             #[cfg(feature = "event-horizon-profiler")]
