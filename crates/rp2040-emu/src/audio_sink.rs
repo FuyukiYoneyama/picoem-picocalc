@@ -13,6 +13,7 @@ pub(crate) const PICOCALC_AUDIO_PWM_CC: u32 =
     PWM_BASE + PICOCALC_AUDIO_PWM_SLICE as u32 * 0x14 + 0x0c;
 pub(crate) const PICOCALC_AUDIO_TIMER_INDEX: usize = 0;
 pub(crate) const PICOCALC_AUDIO_TIMER_TREQ: u8 = 59;
+pub(crate) const PICOCALC_AUDIO_HALF_FRAMES: u64 = 128;
 
 const EDGE_WORDS: usize = 8;
 
@@ -36,6 +37,12 @@ pub struct AudioSinkSnapshot {
     pub timer_event_count: u64,
     pub timer_miss_count: u64,
     pub timer_due_cycle_sha256: String,
+    pub block_start_count: u64,
+    pub malformed_block_count: u64,
+    pub block_boundary_gap_count: u64,
+    pub block_boundary_gap_min_cycles: Option<u64>,
+    pub block_boundary_gap_max_cycles: Option<u64>,
+    pub block_boundary_gap_sha256: String,
     pub gap_5208_count: u64,
     pub gap_5209_count: u64,
     pub unexpected_gap_count: u64,
@@ -53,12 +60,19 @@ pub(crate) struct AudioSink {
     missing_due_cycle_count: u64,
     pcm: Sha256,
     due_cycles: Sha256,
+    block_boundary_gaps: Sha256,
     service_latencies: Sha256,
     first_words: Vec<u32>,
     last_words: [u32; EDGE_WORDS],
     last_words_count: usize,
     last_words_cursor: usize,
     last_due_cycle: Option<u64>,
+    block_start_count: u64,
+    block_word_count: u64,
+    malformed_block_count: u64,
+    block_boundary_gap_count: u64,
+    block_boundary_gap_min_cycles: Option<u64>,
+    block_boundary_gap_max_cycles: Option<u64>,
     gap_5208_count: u64,
     gap_5209_count: u64,
     unexpected_gap_count: u64,
@@ -79,12 +93,19 @@ impl Default for AudioSink {
             missing_due_cycle_count: 0,
             pcm: Sha256::new(),
             due_cycles: Sha256::new(),
+            block_boundary_gaps: Sha256::new(),
             service_latencies: Sha256::new(),
             first_words: Vec::with_capacity(EDGE_WORDS),
             last_words: [0; EDGE_WORDS],
             last_words_count: 0,
             last_words_cursor: 0,
             last_due_cycle: None,
+            block_start_count: 0,
+            block_word_count: 0,
+            malformed_block_count: 0,
+            block_boundary_gap_count: 0,
+            block_boundary_gap_min_cycles: None,
+            block_boundary_gap_max_cycles: None,
             gap_5208_count: 0,
             gap_5209_count: 0,
             unexpected_gap_count: 0,
@@ -112,6 +133,7 @@ impl AudioSink {
         timer_fraction: Option<(u16, u16)>,
         timer_due_cycle: Option<u64>,
         service_cycle: u64,
+        block_start: bool,
     ) {
         if address != PICOCALC_AUDIO_PWM_CC {
             if Self::is_pwm_cc_address(address) {
@@ -127,6 +149,19 @@ impl AudioSink {
         }
 
         self.dma_write_count = self.dma_write_count.saturating_add(1);
+        if block_start {
+            if self.block_start_count != 0 && self.block_word_count != PICOCALC_AUDIO_HALF_FRAMES {
+                self.malformed_block_count = self.malformed_block_count.saturating_add(1);
+            }
+            self.block_start_count = self.block_start_count.saturating_add(1);
+            self.block_word_count = 0;
+        } else if self.block_word_count == 0 {
+            self.malformed_block_count = self.malformed_block_count.saturating_add(1);
+        }
+        self.block_word_count = self.block_word_count.saturating_add(1);
+        if self.block_word_count == PICOCALC_AUDIO_HALF_FRAMES + 1 {
+            self.malformed_block_count = self.malformed_block_count.saturating_add(1);
+        }
         self.pcm.update(value.to_le_bytes());
         if self.first_words.len() < EDGE_WORDS {
             self.first_words.push(value);
@@ -150,11 +185,25 @@ impl AudioSink {
 
         self.due_cycles.update(due_cycle.to_le_bytes());
         if let Some(previous) = self.last_due_cycle {
-            match due_cycle.saturating_sub(previous) {
-                5208 => self.gap_5208_count = self.gap_5208_count.saturating_add(1),
-                5209 => self.gap_5209_count = self.gap_5209_count.saturating_add(1),
-                _ => {
-                    self.unexpected_gap_count = self.unexpected_gap_count.saturating_add(1);
+            let gap = due_cycle.saturating_sub(previous);
+            if block_start {
+                self.block_boundary_gap_count = self.block_boundary_gap_count.saturating_add(1);
+                self.block_boundary_gaps.update(gap.to_le_bytes());
+                self.block_boundary_gap_min_cycles = Some(
+                    self.block_boundary_gap_min_cycles
+                        .map_or(gap, |current| current.min(gap)),
+                );
+                self.block_boundary_gap_max_cycles = Some(
+                    self.block_boundary_gap_max_cycles
+                        .map_or(gap, |current| current.max(gap)),
+                );
+            } else {
+                match gap {
+                    5208 => self.gap_5208_count = self.gap_5208_count.saturating_add(1),
+                    5209 => self.gap_5209_count = self.gap_5209_count.saturating_add(1),
+                    _ => {
+                        self.unexpected_gap_count = self.unexpected_gap_count.saturating_add(1);
+                    }
                 }
             }
         }
@@ -179,6 +228,13 @@ impl AudioSink {
             && self.wrong_treq_count == 0
             && self.missing_due_cycle_count == 0
             && self.unexpected_gap_count == 0
+            && self.malformed_block_count == 0
+            && self.block_word_count == PICOCALC_AUDIO_HALF_FRAMES
+            && self
+                .block_start_count
+                .saturating_mul(PICOCALC_AUDIO_HALF_FRAMES)
+                == self.dma_write_count
+            && self.block_boundary_gap_count == self.block_start_count.saturating_sub(1)
             && self.timer_fraction_x == 3
             && self.timer_fraction_y == 15625;
         let status = if self.target_write_attempt_count == 0 {
@@ -217,6 +273,12 @@ impl AudioSink {
             timer_event_count: 0,
             timer_miss_count: 0,
             timer_due_cycle_sha256: hex(self.due_cycles.clone().finalize().as_slice()),
+            block_start_count: self.block_start_count,
+            malformed_block_count: self.malformed_block_count,
+            block_boundary_gap_count: self.block_boundary_gap_count,
+            block_boundary_gap_min_cycles: self.block_boundary_gap_min_cycles,
+            block_boundary_gap_max_cycles: self.block_boundary_gap_max_cycles,
+            block_boundary_gap_sha256: hex(self.block_boundary_gaps.clone().finalize().as_slice()),
             gap_5208_count: self.gap_5208_count,
             gap_5209_count: self.gap_5209_count,
             unexpected_gap_count: self.unexpected_gap_count,
@@ -243,24 +305,24 @@ mod tests {
     #[test]
     fn hashes_only_dma_writes_to_the_picocalc_audio_cc_register() {
         let mut sink = AudioSink::default();
-        sink.observe_dma_write(
-            PICOCALC_AUDIO_PWM_CC,
-            4,
-            0x00f8_0003,
-            59,
-            Some((3, 15625)),
-            Some(5209),
-            5211,
-        );
-        sink.observe_dma_write(
-            PICOCALC_AUDIO_PWM_CC,
-            4,
-            0x00db_0014,
-            59,
-            Some((3, 15625)),
-            Some(10417),
-            10418,
-        );
+        for index in 0..PICOCALC_AUDIO_HALF_FRAMES {
+            let value = match index {
+                0 => 0x00f8_0003,
+                1 => 0x00db_0014,
+                _ => index as u32,
+            };
+            let due = 5209 + index * 5208;
+            sink.observe_dma_write(
+                PICOCALC_AUDIO_PWM_CC,
+                4,
+                value,
+                59,
+                Some((3, 15625)),
+                Some(due),
+                due + if index == 0 { 2 } else { 1 },
+                index == 0,
+            );
+        }
         sink.observe_dma_write(
             PWM_BASE + 0x0c,
             4,
@@ -269,14 +331,17 @@ mod tests {
             Some((3, 15625)),
             Some(15625),
             15625,
+            true,
         );
         let snapshot = sink.snapshot();
         assert_eq!(snapshot.status, "pass");
-        assert_eq!(snapshot.dma_write_count, 2);
+        assert_eq!(snapshot.dma_write_count, PICOCALC_AUDIO_HALF_FRAMES);
         assert_eq!(snapshot.other_pwm_cc_write_count, 1);
-        assert_eq!(snapshot.first_words, vec![0x00f8_0003, 0x00db_0014]);
-        assert_eq!(snapshot.last_words, snapshot.first_words);
-        assert_eq!(snapshot.gap_5208_count, 1);
+        assert_eq!(&snapshot.first_words[..2], &[0x00f8_0003, 0x00db_0014]);
+        assert_eq!(snapshot.last_words.len(), EDGE_WORDS);
+        assert_eq!(snapshot.block_start_count, 1);
+        assert_eq!(snapshot.block_boundary_gap_count, 0);
+        assert_eq!(snapshot.gap_5208_count, PICOCALC_AUDIO_HALF_FRAMES - 1);
         assert_eq!(snapshot.gap_5209_count, 0);
         assert_eq!(snapshot.service_latency_min_cycles, Some(1));
         assert_eq!(snapshot.service_latency_max_cycles, Some(2));
@@ -293,8 +358,9 @@ mod tests {
             Some((3, 15625)),
             Some(1),
             1,
+            true,
         );
-        sink.observe_dma_write(PICOCALC_AUDIO_PWM_CC, 4, 0x34, 58, None, None, 2);
+        sink.observe_dma_write(PICOCALC_AUDIO_PWM_CC, 4, 0x34, 58, None, None, 2, false);
         sink.observe_dma_write(
             PICOCALC_AUDIO_PWM_CC,
             4,
@@ -303,6 +369,7 @@ mod tests {
             Some((3, 15625)),
             Some(10),
             10,
+            false,
         );
         sink.observe_dma_write(
             PICOCALC_AUDIO_PWM_CC,
@@ -312,6 +379,7 @@ mod tests {
             Some((3, 15625)),
             Some(20),
             20,
+            false,
         );
         let snapshot = sink.snapshot();
         assert_eq!(snapshot.status, "fail");

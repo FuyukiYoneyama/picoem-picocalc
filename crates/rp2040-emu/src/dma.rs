@@ -807,7 +807,17 @@ impl Dma {
         // observation; does not alter control flow.
         self.channels[ch_idx].transfers_issued =
             self.channels[ch_idx].transfers_issued.wrapping_add(1);
-        let (read_addr, write_addr, size, incr_read, incr_write, ring, ring_on_write, treq) = {
+        let (
+            read_addr,
+            write_addr,
+            size,
+            incr_read,
+            incr_write,
+            ring,
+            ring_on_write,
+            treq,
+            block_start,
+        ) = {
             let ch = &self.channels[ch_idx];
             (
                 ch.read_addr,
@@ -818,6 +828,7 @@ impl Dma {
                 ch.ring_size(),
                 ch.ring_on_write(),
                 ch.treq_sel(),
+                ch.trans_count == ch.trans_count_reload,
             )
         };
         let timer_fraction = Self::timer_index_from_treq(treq).map(|timer_idx| {
@@ -848,6 +859,7 @@ impl Dma {
             timer_fraction,
             timer_due_cycle,
             service_cycle,
+            block_start,
         );
 
         // Update addresses.
