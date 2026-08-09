@@ -355,23 +355,6 @@ impl Psram {
         }
     }
 
-    /// Observe `repetitions` identical consecutive pin samples exactly.
-    ///
-    /// All protocol transitions are edge driven, so the first normal
-    /// sample performs the only possible transition and establishes the
-    /// final MISO drive. Later identical samples change only `tick_count`.
-    /// A zero-length interval is an exact no-op.
-    pub fn tick_constant_pins(&mut self, pins: u32, repetitions: u32) -> Option<bool> {
-        if repetitions == 0 {
-            return None;
-        }
-        let driven = self.tick(pins);
-        self.tick_count = self
-            .tick_count
-            .wrapping_add(u64::from(repetitions.saturating_sub(1)));
-        driven
-    }
-
     // --- Frame-boundary handlers ---------------------------------------------
 
     fn begin_frame(&mut self) {
@@ -711,71 +694,6 @@ mod tests {
         (psram, pins)
     }
 
-    fn assert_same_state(reference: &Psram, bulk: &Psram) {
-        assert_eq!(reference.buffer.as_slice(), bulk.buffer.as_slice());
-        assert_eq!(reference.phase, bulk.phase);
-        assert_eq!(reference.shift_in, bulk.shift_in);
-        assert_eq!(reference.shift_in_bits, bulk.shift_in_bits);
-        assert_eq!(reference.shift_out, bulk.shift_out);
-        assert_eq!(reference.shift_out_bits, bulk.shift_out_bits);
-        assert_eq!(reference.addr_bytes_seen, bulk.addr_bytes_seen);
-        assert_eq!(reference.addr, bulk.addr);
-        assert_eq!(reference.reset_armed, bulk.reset_armed);
-        assert_eq!(reference.prev_sck, bulk.prev_sck);
-        assert_eq!(reference.prev_cs, bulk.prev_cs);
-        assert_eq!(reference.latched_mosi, bulk.latched_mosi);
-        assert_eq!(reference.miso_bit, bulk.miso_bit);
-        assert_eq!(reference.driving_miso, bulk.driving_miso);
-        assert_eq!(reference.bytes_written, bulk.bytes_written);
-        assert_eq!(reference.bytes_read, bulk.bytes_read);
-        assert_eq!(reference.tick_count, bulk.tick_count);
-        assert_eq!(reference.cs_falling_count, bulk.cs_falling_count);
-        assert_eq!(reference.cmd_write_count, bulk.cmd_write_count);
-        assert_eq!(reference.cmd_fast_read_count, bulk.cmd_fast_read_count);
-        assert_eq!(
-            reference.cmd_reset_enable_count,
-            bulk.cmd_reset_enable_count
-        );
-        assert_eq!(reference.cmd_reset_count, bulk.cmd_reset_count);
-        assert_eq!(reference.cmd_read_id_count, bulk.cmd_read_id_count);
-        assert_eq!(reference.cmd_unknown_count, bulk.cmd_unknown_count);
-        assert_eq!(reference.id_index, bulk.id_index);
-        assert_eq!(reference.read_delay_remaining, bulk.read_delay_remaining);
-    }
-
-    #[test]
-    fn constant_pin_bulk_matches_idle_reference_and_zero_is_noop() {
-        let (mut reference, pins) = fresh();
-        let (mut bulk, _) = fresh();
-        assert_eq!(bulk.tick_constant_pins(pins, 0), None);
-        let mut expected = None;
-        for _ in 0..1_000 {
-            expected = reference.tick(pins);
-        }
-        assert_eq!(bulk.tick_constant_pins(pins, 1_000), expected);
-        assert_same_state(&reference, &bulk);
-    }
-
-    #[test]
-    fn constant_pin_bulk_matches_reference_when_first_sample_is_an_edge() {
-        let (mut reference, mut pins) = fresh();
-        let (mut bulk, _) = fresh();
-        pins &= !(1 << PIN_CS);
-        let mut expected = None;
-        for _ in 0..17 {
-            expected = reference.tick(pins);
-        }
-        assert_eq!(bulk.tick_constant_pins(pins, 17), expected);
-        assert_same_state(&reference, &bulk);
-
-        pins |= 1 << PIN_SCK;
-        for _ in 0..9 {
-            expected = reference.tick(pins);
-        }
-        assert_eq!(bulk.tick_constant_pins(pins, 9), expected);
-        assert_same_state(&reference, &bulk);
-    }
-
     #[test]
     fn reset_enable_then_reset_clears_state() {
         let (mut psram, mut pins) = fresh();
@@ -900,10 +818,7 @@ mod tests {
         clock_byte(&mut psram, &mut pins, 0xAB);
         cs_rise(&mut psram, &mut pins);
         assert_eq!(psram.cmd_write_count, 1);
-        assert_eq!(
-            psram.buffer[0x00], 0xAB,
-            "counters must not change behaviour"
-        );
+        assert_eq!(psram.buffer[0x00], 0xAB, "counters must not change behaviour");
 
         cs_fall(&mut psram, &mut pins);
         clock_byte(&mut psram, &mut pins, 0x0B); // Fast Read

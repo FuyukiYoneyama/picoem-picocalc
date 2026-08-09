@@ -9,11 +9,6 @@ rust-version.workspace = true
 # framebuffer extraction. `rp2040-emu` stays board-agnostic.
 publish = false
 
-[features]
-default = []
-# Board-device opt-ins for the OPT2-F prototype. Kept out of normal builds.
-stationary-pin-bulk-prototype = ["rp2040-emu/stationary-pin-bulk-prototype"]
-
 [lints]
 workspace = true
 

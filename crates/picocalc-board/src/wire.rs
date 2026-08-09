@@ -52,19 +52,6 @@ impl SpiExternalDevice for St7365pWire {
             .expect("LCD mutex")
             .set_control_lines(cs, dc, reset);
     }
-
-    #[cfg(feature = "stationary-pin-bulk-prototype")]
-    fn supports_constant_pin_bulk(&self) -> bool {
-        true
-    }
-
-    #[cfg(feature = "stationary-pin-bulk-prototype")]
-    fn observe_constant_pins(&mut self, gpio_out_levels: u32, repetitions: u32) {
-        if repetitions == 0 {
-            return;
-        }
-        self.observe_pins(gpio_out_levels);
-    }
 }
 
 #[cfg(test)]
@@ -112,56 +99,5 @@ mod tests {
         wire.observe_pins(levels(false, false, true));
         assert_eq!(wire.transfer(0xFF00 | CMD_DISPON as u16, 16), 0);
         assert!(lcd.lock().unwrap().display_on);
-    }
-
-    #[test]
-    #[cfg(feature = "stationary-pin-bulk-prototype")]
-    fn observe_constant_pins_is_one_observe_when_supported() {
-        let lcd = Arc::new(Mutex::new(St7365p::new()));
-        let mut wire = St7365pWire::new(lcd.clone());
-        wire.observe_pins(levels(true, false, false));
-        {
-            let wire_ref = &mut wire as &mut dyn SpiExternalDevice;
-            assert!(wire_ref.supports_constant_pin_bulk());
-            wire_ref.observe_constant_pins(levels(false, false, true), 3);
-            wire_ref.observe_constant_pins(levels(false, false, true), 0);
-        }
-        assert_eq!(lcd.lock().unwrap().reset_pulses, 1);
-    }
-
-    #[test]
-    #[cfg(feature = "stationary-pin-bulk-prototype")]
-    fn observe_constant_pins_matches_repeated_observe_control_edges() {
-        let lcd_ref = Arc::new(Mutex::new(St7365p::new()));
-        let lcd_bulk = Arc::new(Mutex::new(St7365p::new()));
-        let mut wire_ref = St7365pWire::new(lcd_ref.clone());
-        let mut wire_bulk = St7365pWire::new(lcd_bulk.clone());
-
-        let cs_select = levels(false, false, true);
-        wire_ref.observe_pins(cs_select);
-        wire_bulk.observe_pins(cs_select);
-
-        // Repeated rising-edge equivalent: one observe for the reference,
-        // one bulk observe that should do the same amount of control work.
-        for _ in 0..2 {
-            wire_ref.observe_pins(levels(false, false, true));
-        }
-        {
-            let wire_bulk = &mut wire_bulk as &mut dyn SpiExternalDevice;
-            wire_bulk.observe_constant_pins(levels(false, false, true), 2);
-        }
-
-        wire_ref.observe_pins(levels(false, true, true));
-        wire_bulk.observe_pins(levels(false, true, true));
-        wire_ref.transfer(CMD_MADCTL as u16, 8);
-        wire_bulk.transfer(CMD_MADCTL as u16, 8);
-        assert_eq!(
-            lcd_ref.lock().unwrap().madctl,
-            lcd_bulk.lock().unwrap().madctl
-        );
-        assert_eq!(
-            lcd_ref.lock().unwrap().reset_pulses,
-            lcd_bulk.lock().unwrap().reset_pulses
-        );
     }
 }

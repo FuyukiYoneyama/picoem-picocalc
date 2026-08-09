@@ -21,12 +21,6 @@ idle-profiler = ["rp2040-emu/idle-profiler"]
 event-horizon-profiler = ["idle-profiler", "behavior-trace", "rp2040-emu/event-horizon-profiler"]
 # Prototype bulk-advance diagnostics from the PIO pull-stall fast-path.
 pio-exact-bulk-prototype = ["rp2040-emu/pio-exact-bulk-prototype"]
-# OPT2-F end-to-end prototype, including the PicoCalc device opt-ins.
-stationary-pin-bulk-prototype = [
-    "pio-exact-bulk-prototype",
-    "rp2040-emu/stationary-pin-bulk-prototype",
-    "picocalc-board/stationary-pin-bulk-prototype",
-]
 # Diagnostic-only OPT0-B correctness build. Normal conformance and
 # performance runners do not compile the streaming hash path.
 behavior-trace = ["rp2040-emu/behavior-trace"]
