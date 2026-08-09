@@ -751,10 +751,12 @@ fn judge_run(
 /// ARMv6-M IPSR exception numbers that mean "the firmware has fallen
 /// over". Ordinary IRQs (>= 16), SVCall, PendSV and SysTick are normal
 /// operation and must not stop the run.
-fn fatal_exception_name(ipsr: u32) -> Option<&'static str> {
-    match ipsr {
-        2 => Some("NMI"),
-        3 => Some("HardFault"),
+fn fatal_exception_name(core: usize, ipsr: u32) -> Option<&'static str> {
+    match (core, ipsr) {
+        (0, 2) => Some("NMI"),
+        (0, 3) => Some("HardFault"),
+        (1, 2) => Some("core1 NMI"),
+        (1, 3) => Some("core1 HardFault"),
         _ => None,
     }
 }
@@ -1074,15 +1076,17 @@ fn run_loop(
                 None,
             );
         }
-        if let Some(name) = fatal_exception_name(emu.cores[0].regs.xpsr & 0x1FF) {
-            return finish(
-                emu,
-                &vclock,
-                &mut uart_bytes,
-                StopReason::Exception,
-                Some(name),
-                None,
-            );
+        for (core, state) in emu.cores.iter().enumerate() {
+            if let Some(name) = fatal_exception_name(core, state.regs.xpsr & 0x1FF) {
+                return finish(
+                    emu,
+                    &vclock,
+                    &mut uart_bytes,
+                    StopReason::Exception,
+                    Some(name),
+                    None,
+                );
+            }
         }
         if emu.clock.cycles >= cycle_limit {
             return finish(
@@ -2752,12 +2756,13 @@ fn run() -> Result<Verdict, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RunOutcome, SdReport, StopReason, Verdict, fatal_exception_name, json_escape, judge_run,
-        validate_backend_identity, validate_sd_selection,
+        BoardHandles, RunOutcome, SdReport, StopReason, Verdict, fatal_exception_name, json_escape,
+        judge_run, run_loop, validate_backend_identity, validate_sd_selection,
     };
     use picocalc_board::SdFormat;
     #[cfg(feature = "idle-profiler")]
     use rp2040_emu::IdleProfileSnapshot;
+    use rp2040_emu::{Config, EmulatorBuilder};
 
     #[cfg(feature = "behavior-trace")]
     use super::behavior_projection;
@@ -2979,12 +2984,40 @@ mod tests {
 
     #[test]
     fn only_nmi_and_hardfault_are_fatal() {
-        assert_eq!(fatal_exception_name(0), None); // thread mode
-        assert_eq!(fatal_exception_name(2), Some("NMI"));
-        assert_eq!(fatal_exception_name(3), Some("HardFault"));
-        assert_eq!(fatal_exception_name(11), None); // SVCall
-        assert_eq!(fatal_exception_name(15), None); // SysTick
-        assert_eq!(fatal_exception_name(16), None); // IRQ0
+        assert_eq!(fatal_exception_name(0, 0), None); // thread mode
+        assert_eq!(fatal_exception_name(0, 2), Some("NMI"));
+        assert_eq!(fatal_exception_name(0, 3), Some("HardFault"));
+        assert_eq!(fatal_exception_name(1, 2), Some("core1 NMI"));
+        assert_eq!(fatal_exception_name(1, 3), Some("core1 HardFault"));
+        assert_eq!(fatal_exception_name(0, 11), None); // SVCall
+        assert_eq!(fatal_exception_name(0, 15), None); // SysTick
+        assert_eq!(fatal_exception_name(0, 16), None); // IRQ0
+    }
+
+    #[test]
+    fn a_core1_hardfault_stops_the_run_fail_closed() {
+        let mut emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("serial emulator build");
+        emu.cores[1].regs.xpsr = (emu.cores[1].regs.xpsr & !0x1ff) | 3;
+
+        let run = run_loop(&mut emu, 100, None, None, &BoardHandles::default());
+
+        assert!(run.stop_reason == StopReason::Exception);
+        assert_eq!(run.exception, Some("core1 HardFault"));
+        let verdict = judge_run(
+            &run,
+            0,
+            false,
+            0,
+            0,
+            None,
+            false,
+            Some(StopReason::CycleLimit),
+            &[],
+        );
+        assert!(verdict.status == Verdict::Fail);
+        assert_eq!(verdict.reasons, ["exception", "stop_reason_mismatch"]);
     }
 
     #[test]

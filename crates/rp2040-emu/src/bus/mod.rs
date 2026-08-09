@@ -38,8 +38,8 @@ use picoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 use crate::core::Nvic;
 use crate::dma::Dma;
 use crate::irq::{
-    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ,
-    IRQ_UART0_IRQ, IRQ_UART1_IRQ,
+    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP, IRQ_SIO_IRQ_PROC0,
+    IRQ_SIO_IRQ_PROC1, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_UART0_IRQ, IRQ_UART1_IRQ,
 };
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::AdcRegs;
@@ -1908,13 +1908,15 @@ impl Bus {
 
     fn sio_read32(&mut self, addr: u32) -> u32 {
         let offset = addr & 0xFFF;
-        match offset {
+        let value = match offset {
             0x004 => self.gpio_in,
             _ => {
                 let core = self.active_core;
                 self.sio.read32(offset, core)
             }
-        }
+        };
+        self.refresh_sio_fifo_irqs();
+        value
     }
 
     fn sio_write32(&mut self, addr: u32, val: u32) {
@@ -1923,6 +1925,21 @@ impl Bus {
         self.sio.write32(offset, val, core);
         if let Some(receiver) = self.sio.pending_fifo_event.take() {
             self.event_flag[receiver] = true;
+        }
+        self.refresh_sio_fifo_irqs();
+    }
+
+    /// Project the two core-local, level-sensitive SIO FIFO interrupt lines
+    /// into their matching NVICs. These lines must not use `irq_pending`,
+    /// because that shared-peripheral path broadcasts every bit to both
+    /// cores; `SIO_IRQ_PROC0` belongs only to core 0 and `SIO_IRQ_PROC1`
+    /// only to core 1.
+    pub(crate) fn refresh_sio_fifo_irqs(&mut self) {
+        if self.sio.fifo_irq_asserted(0) {
+            self.nvics[0].set_pending(IRQ_SIO_IRQ_PROC0 as u8);
+        }
+        if self.sio.fifo_irq_asserted(1) {
+            self.nvics[1].set_pending(IRQ_SIO_IRQ_PROC1 as u8);
         }
     }
 
@@ -2555,6 +2572,31 @@ mod tests {
         assert_eq!(bus.read32(SIO_BASE), 1);
         bus.set_active_core(0);
         assert_eq!(bus.read32(SIO_BASE), 0);
+    }
+
+    #[test]
+    fn sio_fifo_irq_routes_only_to_receiving_core_and_reasserts() {
+        let mut bus = Bus::new();
+        bus.sio.set_handshake_armed(false);
+
+        bus.set_active_core(0);
+        bus.write32(SIO_BASE + 0x054, 0xCAFE_BABE);
+        assert!(!bus.nvics[0].is_pending(IRQ_SIO_IRQ_PROC0 as u8));
+        assert!(!bus.nvics[0].is_pending(IRQ_SIO_IRQ_PROC1 as u8));
+        assert!(bus.nvics[1].is_pending(IRQ_SIO_IRQ_PROC1 as u8));
+
+        bus.nvics[1].clear_pending(IRQ_SIO_IRQ_PROC1 as u8);
+        bus.refresh_sio_fifo_irqs();
+        assert!(
+            bus.nvics[1].is_pending(IRQ_SIO_IRQ_PROC1 as u8),
+            "a still-readable FIFO must reassert its level IRQ"
+        );
+
+        bus.set_active_core(1);
+        assert_eq!(bus.read32(SIO_BASE + 0x058), 0xCAFE_BABE);
+        bus.nvics[1].clear_pending(IRQ_SIO_IRQ_PROC1 as u8);
+        bus.refresh_sio_fifo_irqs();
+        assert!(!bus.nvics[1].is_pending(IRQ_SIO_IRQ_PROC1 as u8));
     }
 
     #[test]

@@ -447,6 +447,18 @@ impl Sio {
         (vld as u32) | ((rdy as u32) << 1) | ((wof as u32) << 2) | ((roe as u32) << 3)
     }
 
+    /// Whether this core's level-sensitive SIO FIFO IRQ line is asserted.
+    ///
+    /// RP2040 raises `SIO_IRQ_PROC0/1` while the local receive FIFO has a
+    /// word or either local error sticky (`WOF`/`ROE`) is set. `RDY` is not
+    /// an interrupt source. Keep this query non-consuming so the bus can
+    /// re-project a still-high line after firmware clears the NVIC latch.
+    #[inline]
+    pub fn fifo_irq_asserted(&self, core: usize) -> bool {
+        debug_assert!(core < 2);
+        self.fifo_st_read(core) & 0x0d != 0
+    }
+
     fn fifo_st_write(&mut self, val: u32, core: usize) {
         if val & 0x4 != 0 {
             self.fifo_wof[core] = false;
@@ -735,6 +747,25 @@ mod tests {
         assert_eq!(sio.pending_fifo_event, Some(1));
         let _ = sio.pending_fifo_event.take();
         assert_eq!(sio.read32(0x058, 1), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn fifo_irq_is_level_from_vld_and_error_stickies() {
+        let mut sio = Sio::new();
+        sio.set_handshake_armed(false);
+        assert!(!sio.fifo_irq_asserted(0));
+        assert!(!sio.fifo_irq_asserted(1));
+
+        sio.write32(0x054, 0x1234_5678, 0);
+        assert!(!sio.fifo_irq_asserted(0));
+        assert!(sio.fifo_irq_asserted(1));
+        assert_eq!(sio.read32(0x058, 1), 0x1234_5678);
+        assert!(!sio.fifo_irq_asserted(1));
+
+        let _ = sio.read32(0x058, 1);
+        assert!(sio.fifo_irq_asserted(1), "ROE must assert the local IRQ");
+        sio.write32(0x050, 1 << 3, 1);
+        assert!(!sio.fifo_irq_asserted(1));
     }
 
     #[test]

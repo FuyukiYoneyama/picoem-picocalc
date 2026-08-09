@@ -853,6 +853,12 @@ impl Emulator {
             self.clock.cycles = self.clock.cycles.wrapping_add(c0.max(c1));
         }
 
+        // SIO FIFO IRQs are core-local level signals, unlike the shared
+        // peripheral bits drained through `bus.irq_pending`. Refresh after
+        // both core steps so FIFO push/pop and WOF/ROE changes from this
+        // quantum are visible before blocked-core and wake decisions.
+        self.bus.refresh_sio_fifo_irqs();
+
         let consumed = self.clock.cycles.wrapping_sub(start);
         let both_cores_blocked = (self.cores[0].is_halted() || self.bus.wfe_waiting[0])
             && (self.cores[1].is_halted() || self.bus.wfe_waiting[1]);
