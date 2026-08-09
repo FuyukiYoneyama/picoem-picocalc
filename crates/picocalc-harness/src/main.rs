@@ -38,6 +38,8 @@ use picocalc_board::{
     Framebuffer, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire, SdFormat, St7365p,
     St7365pWire, pins,
 };
+#[cfg(feature = "xip-decode-cursor-proof")]
+use rp2040_emu::XipDecodeCursorProofSnapshot;
 #[cfg(feature = "behavior-trace")]
 use rp2040_emu::{BehaviorEventDomain, BehaviorTraceSnapshot};
 use rp2040_emu::{Config, Emulator, EmulatorBuilder};
@@ -2010,6 +2012,8 @@ fn build_report(
     pwm: Option<&PwmReport>,
     pio: Option<&PioReport>,
     scenario: Option<(&scenario::Engine, String)>,
+    #[cfg(feature = "xip-decode-cursor-proof")] xip_decode_cursor_proof: &[XipDecodeCursorProofSnapshot;
+         2],
     verdict: &VerdictReport,
 ) -> String {
     let mut s = String::new();
@@ -2133,6 +2137,34 @@ fn build_report(
     }
     if let Some((engine, file)) = scenario {
         s.push_str(&engine.to_json(&file, json_string));
+    }
+
+    #[cfg(feature = "xip-decode-cursor-proof")]
+    {
+        fn snapshot_json(value: &XipDecodeCursorProofSnapshot) -> String {
+            format!(
+                concat!(
+                    "{{\"enabled\": {}, \"buffered_entries\": {}, ",
+                    "\"take_hits\": {}, \"take_misses\": {}, ",
+                    "\"installs\": {}, \"staged_entries\": {}, ",
+                    "\"clears\": {}, \"enables\": {}, \"disables\": {}}}"
+                ),
+                value.enabled,
+                value.buffered_entries,
+                value.take_hits,
+                value.take_misses,
+                value.installs,
+                value.staged_entries,
+                value.clears,
+                value.enables,
+                value.disables,
+            )
+        }
+        s.push_str(&format!(
+            "  \"xip_decode_cursor_proof\": {{\"core0\": {}, \"core1\": {}}},\n",
+            snapshot_json(&xip_decode_cursor_proof[0]),
+            snapshot_json(&xip_decode_cursor_proof[1]),
+        ));
     }
 
     s.push_str(&format!(
@@ -2670,6 +2702,12 @@ fn run() -> Result<Verdict, String> {
         &args.expected_uart,
     );
 
+    #[cfg(feature = "xip-decode-cursor-proof")]
+    let xip_decode_cursor_proof = [
+        emu.core(0).xip_decode_cursor_proof_snapshot(),
+        emu.core(1).xip_decode_cursor_proof_snapshot(),
+    ];
+
     let report = build_report(
         backend_commit,
         built_backend_dirty(),
@@ -2700,6 +2738,8 @@ fn run() -> Result<Verdict, String> {
                 args.scenario.as_deref().map(basename).unwrap_or_default(),
             )
         }),
+        #[cfg(feature = "xip-decode-cursor-proof")]
+        &xip_decode_cursor_proof,
         &verdict,
     );
 

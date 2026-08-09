@@ -50,6 +50,161 @@ pub(crate) enum Fault {
     InvalidEpsr,
 }
 
+#[cfg(feature = "xip-decode-cursor-prototype")]
+const XIP_DECODE_CURSOR_MAX_ENTRIES: usize = 3;
+
+#[cfg(feature = "xip-decode-cursor-prototype")]
+const IMMUTABLE_XIP_START: u32 = 0x1000_0000;
+
+#[cfg(feature = "xip-decode-cursor-prototype")]
+const IMMUTABLE_XIP_END: u32 = 0x1400_0000;
+
+#[cfg(feature = "xip-decode-cursor-prototype")]
+#[inline(always)]
+pub(crate) fn is_immutable_xip_entry(pc: u32, entry: crate::bus::DecodedOp) -> bool {
+    let width = if entry.is_wide() { 4 } else { 2 };
+    pc >= IMMUTABLE_XIP_START
+        && pc
+            .checked_add(width)
+            .is_some_and(|end| end <= IMMUTABLE_XIP_END)
+}
+
+#[cfg(feature = "xip-decode-cursor-prototype")]
+#[derive(Clone, Copy, Debug)]
+struct ShortDecodeCursor {
+    /// Cursor enabled flag.
+    enabled: bool,
+    /// Next expected PC to consume.
+    position: u32,
+    /// Number of currently buffered entries.
+    length: u8,
+    /// Current read index.
+    position_in_run: u8,
+    /// Buffered decoded-ops.
+    entries: [crate::bus::DecodedOp; XIP_DECODE_CURSOR_MAX_ENTRIES],
+}
+
+#[cfg(feature = "xip-decode-cursor-prototype")]
+impl Default for ShortDecodeCursor {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            position: 0,
+            length: 0,
+            position_in_run: 0,
+            entries: [crate::bus::DecodedOp::empty(); XIP_DECODE_CURSOR_MAX_ENTRIES],
+        }
+    }
+}
+
+#[cfg(feature = "xip-decode-cursor-prototype")]
+impl ShortDecodeCursor {
+    fn clear(&mut self) -> bool {
+        let was_buffered = self.length != 0;
+        self.length = 0;
+        self.position = 0;
+        self.position_in_run = 0;
+        was_buffered
+    }
+
+    fn install(&mut self, entries: &[crate::bus::DecodedOp]) -> usize {
+        if !self.enabled || entries.is_empty() {
+            return 0;
+        }
+
+        let mut expected_pc = entries[0].tag;
+        if !is_immutable_xip_entry(expected_pc, entries[0]) {
+            self.clear();
+            return 0;
+        }
+
+        let mut accepted = 0usize;
+        for &entry in entries.iter().take(XIP_DECODE_CURSOR_MAX_ENTRIES) {
+            if entry.tag != expected_pc || !is_immutable_xip_entry(expected_pc, entry) {
+                break;
+            }
+            self.entries[accepted] = entry;
+            accepted += 1;
+            expected_pc = Self::step_position(expected_pc, entry);
+        }
+        if accepted == 0 {
+            self.clear();
+            return 0;
+        }
+
+        self.position = entries[0].tag;
+        self.position_in_run = 0;
+        self.length = accepted as u8;
+        accepted
+    }
+
+    fn step_position(position: u32, entry: crate::bus::DecodedOp) -> u32 {
+        if entry.is_wide() {
+            position.wrapping_add(4)
+        } else {
+            position.wrapping_add(2)
+        }
+    }
+
+    fn take_if_pc_matches(&mut self, pc: u32) -> Option<crate::bus::DecodedOp> {
+        if !self.enabled {
+            return None;
+        }
+
+        if self.length == 0 || self.position_in_run >= self.length {
+            self.clear();
+            return None;
+        }
+
+        if pc != self.position {
+            self.clear();
+            return None;
+        }
+
+        let idx = self.position_in_run as usize;
+        let entry = self.entries[idx];
+        self.position = Self::step_position(self.position, entry);
+        self.position_in_run = self.position_in_run.saturating_add(1);
+
+        if self.position_in_run >= self.length {
+            self.clear();
+        }
+
+        Some(entry)
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+}
+
+#[cfg(feature = "xip-decode-cursor-proof")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XipDecodeCursorProofSnapshot {
+    pub enabled: bool,
+    pub buffered_entries: u8,
+    pub take_hits: u64,
+    pub take_misses: u64,
+    pub installs: u64,
+    pub staged_entries: u64,
+    pub clears: u64,
+    pub enables: u64,
+    pub disables: u64,
+}
+
+#[cfg(feature = "xip-decode-cursor-proof")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct XipDecodeCursorProofCounters {
+    take_hits: u64,
+    take_misses: u64,
+    installs: u64,
+    staged_entries: u64,
+    clears: u64,
+    enables: u64,
+    disables: u64,
+}
+
 /// Cortex-M0+ CPU core.
 pub struct CortexM0Plus {
     pub regs: Registers,
@@ -83,6 +238,10 @@ pub struct CortexM0Plus {
     /// Decode-cache hit/miss profiler state (feature gated).
     #[cfg(feature = "event-horizon-profiler")]
     pub(crate) decode_profile: crate::running_profile::DecodeProfile,
+    #[cfg(feature = "xip-decode-cursor-prototype")]
+    short_decode_cursor: ShortDecodeCursor,
+    #[cfg(feature = "xip-decode-cursor-proof")]
+    xip_decode_cursor_proof: XipDecodeCursorProofCounters,
 }
 
 impl CortexM0Plus {
@@ -110,6 +269,10 @@ impl CortexM0Plus {
             decode_cache,
             #[cfg(feature = "event-horizon-profiler")]
             decode_profile: crate::running_profile::DecodeProfile::default(),
+            #[cfg(feature = "xip-decode-cursor-prototype")]
+            short_decode_cursor: ShortDecodeCursor::default(),
+            #[cfg(feature = "xip-decode-cursor-proof")]
+            xip_decode_cursor_proof: XipDecodeCursorProofCounters::default(),
         }
     }
 
@@ -132,6 +295,8 @@ impl CortexM0Plus {
     pub fn halt(&mut self) {
         self.halted = true;
         self.pending_fault = None;
+        #[cfg(feature = "xip-decode-cursor-prototype")]
+        self.clear_xip_decode_cursor();
     }
 
     /// Resume a halted core.
@@ -176,6 +341,102 @@ impl CortexM0Plus {
         self.regs.psp = 0;
         self.regs.xpsr = 1 << 24;
         self.regs.primask = 0;
+    }
+
+    #[cfg(feature = "xip-decode-cursor-prototype")]
+    pub(crate) fn enable_xip_decode_cursor(&mut self) {
+        self.short_decode_cursor.enabled = true;
+        #[cfg(feature = "xip-decode-cursor-proof")]
+        {
+            self.xip_decode_cursor_proof.enables =
+                self.xip_decode_cursor_proof.enables.saturating_add(1);
+        }
+    }
+
+    #[cfg(feature = "xip-decode-cursor-prototype")]
+    #[allow(dead_code)] // Called only when the optional Threaded runtime is compiled.
+    pub(crate) fn disable_xip_decode_cursor(&mut self) {
+        self.clear_xip_decode_cursor();
+        self.short_decode_cursor.enabled = false;
+        #[cfg(feature = "xip-decode-cursor-proof")]
+        {
+            self.xip_decode_cursor_proof.disables =
+                self.xip_decode_cursor_proof.disables.saturating_add(1);
+        }
+    }
+
+    #[cfg(feature = "xip-decode-cursor-prototype")]
+    pub(crate) fn clear_xip_decode_cursor(&mut self) {
+        let cleared = self.short_decode_cursor.clear();
+        #[cfg(not(feature = "xip-decode-cursor-proof"))]
+        let _ = cleared;
+        #[cfg(feature = "xip-decode-cursor-proof")]
+        if cleared {
+            self.xip_decode_cursor_proof.clears =
+                self.xip_decode_cursor_proof.clears.saturating_add(1);
+        }
+    }
+
+    #[cfg(feature = "xip-decode-cursor-prototype")]
+    pub(crate) fn install_short_decode_cursor_entries(
+        &mut self,
+        entries: &[crate::bus::DecodedOp],
+    ) {
+        let installed = self.short_decode_cursor.install(entries);
+        #[cfg(not(feature = "xip-decode-cursor-proof"))]
+        let _ = installed;
+        #[cfg(feature = "xip-decode-cursor-proof")]
+        if installed != 0 {
+            self.xip_decode_cursor_proof.installs =
+                self.xip_decode_cursor_proof.installs.saturating_add(1);
+            self.xip_decode_cursor_proof.staged_entries = self
+                .xip_decode_cursor_proof
+                .staged_entries
+                .saturating_add(installed as u64);
+        }
+    }
+
+    #[cfg(feature = "xip-decode-cursor-prototype")]
+    pub(crate) fn take_short_decode_cursor_if_pc_matches(
+        &mut self,
+        pc: u32,
+    ) -> Option<crate::bus::DecodedOp> {
+        let result = self.short_decode_cursor.take_if_pc_matches(pc);
+        #[cfg(feature = "xip-decode-cursor-proof")]
+        {
+            if result.is_some() {
+                self.xip_decode_cursor_proof.take_hits =
+                    self.xip_decode_cursor_proof.take_hits.saturating_add(1);
+            } else {
+                self.xip_decode_cursor_proof.take_misses =
+                    self.xip_decode_cursor_proof.take_misses.saturating_add(1);
+            }
+        }
+        result
+    }
+
+    #[cfg(feature = "xip-decode-cursor-prototype")]
+    #[inline(always)]
+    pub(crate) fn xip_decode_cursor_is_empty(&self) -> bool {
+        self.short_decode_cursor.is_empty()
+    }
+
+    #[cfg(feature = "xip-decode-cursor-proof")]
+    pub fn xip_decode_cursor_proof_snapshot(&self) -> XipDecodeCursorProofSnapshot {
+        XipDecodeCursorProofSnapshot {
+            enabled: self.short_decode_cursor.enabled,
+            buffered_entries: self
+                .short_decode_cursor
+                .length
+                .saturating_sub(self.short_decode_cursor.position_in_run),
+            take_hits: self.xip_decode_cursor_proof.take_hits,
+            take_misses: self.xip_decode_cursor_proof.take_misses,
+            installs: self.xip_decode_cursor_proof.installs,
+            staged_entries: self.xip_decode_cursor_proof.staged_entries,
+            clears: self.xip_decode_cursor_proof.clears,
+            enables: self.xip_decode_cursor_proof.enables,
+            disables: self.xip_decode_cursor_proof.disables,
+        }
     }
 
     // --- Test / debug accessors ---
@@ -290,6 +551,8 @@ impl CortexM0Plus {
         // exception entry if one was taken; `0` otherwise.
         let exc_cycles = self.try_take_any_pending_exception(bus);
         if exc_cycles != 0 {
+            #[cfg(feature = "xip-decode-cursor-prototype")]
+            self.clear_xip_decode_cursor();
             #[cfg(feature = "event-horizon-profiler")]
             self.decode_profile
                 .record_immutable_xip_hit_run_prefetch_exception();
@@ -318,6 +581,8 @@ impl CortexM0Plus {
         }
 
         if let Some(fault) = self.pending_fault.take() {
+            #[cfg(feature = "xip-decode-cursor-prototype")]
+            self.clear_xip_decode_cursor();
             #[cfg(feature = "event-horizon-profiler")]
             if profile_fault {
                 self.decode_profile.record_immutable_xip_hit_run_fault();
@@ -450,6 +715,14 @@ impl CortexM0Plus {
         use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
         const MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
         let empty = DecodedOp::empty();
+        #[cfg(feature = "xip-decode-cursor-prototype")]
+        if addrs.iter().any(|&addr| {
+            let aligned = addr & !1;
+            (IMMUTABLE_XIP_START..IMMUTABLE_XIP_END).contains(&aligned)
+                || (IMMUTABLE_XIP_START..IMMUTABLE_XIP_END).contains(&aligned.wrapping_sub(2))
+        }) {
+            self.clear_xip_decode_cursor();
+        }
         for &addr in addrs {
             #[cfg(feature = "event-horizon-profiler")]
             self.decode_profile
@@ -483,6 +756,10 @@ impl CortexM0Plus {
         if regions == 0 {
             return;
         }
+        #[cfg(feature = "xip-decode-cursor-prototype")]
+        if regions & (crate::bus::invalidation_regions::XIP | BULK) != 0 {
+            self.clear_xip_decode_cursor();
+        }
         #[cfg(feature = "event-horizon-profiler")]
         self.decode_profile
             .record_decode_cache_region_invalidation(regions);
@@ -510,6 +787,8 @@ impl CortexM0Plus {
     /// and any path that globally invalidates the instruction pipeline.
     pub fn invalidate_decode_cache_all(&mut self) {
         use crate::bus::DecodedOp;
+        #[cfg(feature = "xip-decode-cursor-prototype")]
+        self.clear_xip_decode_cursor();
         #[cfg(feature = "event-horizon-profiler")]
         self.decode_profile.record_decode_cache_all_invalidation();
         let empty = DecodedOp::empty();
@@ -522,5 +801,129 @@ impl CortexM0Plus {
 impl Default for CortexM0Plus {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, feature = "xip-decode-cursor-prototype"))]
+mod xip_decode_cursor_tests {
+    use crate::bus::DecodedOp;
+    use crate::core::CortexM0Plus;
+
+    fn op(tag: u32, hw0: u16, hw1: u16, is_wide: bool) -> DecodedOp {
+        let mut out = DecodedOp::empty();
+        out.tag = tag;
+        out.hw0 = hw0;
+        out.hw1 = hw1;
+        if is_wide {
+            out.flags |= DecodedOp::FLAG_WIDE;
+        }
+        out
+    }
+
+    #[test]
+    fn xip_decode_cursor_takes_in_sequence() {
+        let mut core = CortexM0Plus::new();
+        core.enable_xip_decode_cursor();
+
+        let entries = [
+            op(0x1000_2000, 0xBE00, 0x0000, false),
+            op(0x1000_2002, 0xBF00, 0x0000, false),
+            op(0x1000_2004, 0xC000, 0x0000, false),
+        ];
+        core.install_short_decode_cursor_entries(&entries);
+
+        assert_eq!(
+            core.take_short_decode_cursor_if_pc_matches(0x1000_2000)
+                .map(|entry| entry.hw0),
+            Some(entries[0].hw0)
+        );
+        assert_eq!(
+            core.take_short_decode_cursor_if_pc_matches(0x1000_2002)
+                .map(|entry| entry.hw0),
+            Some(entries[1].hw0)
+        );
+        assert_eq!(
+            core.take_short_decode_cursor_if_pc_matches(0x1000_2004)
+                .map(|entry| entry.hw0),
+            Some(entries[2].hw0)
+        );
+        assert!(
+            core.take_short_decode_cursor_if_pc_matches(0x1000_2006)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn xip_decode_cursor_fail_closed_on_pc_mismatch() {
+        let mut core = CortexM0Plus::new();
+        core.enable_xip_decode_cursor();
+        let entry = [op(0x1000_3000, 0xD000, 0x0000, false)];
+        core.install_short_decode_cursor_entries(&entry);
+
+        assert!(
+            core.take_short_decode_cursor_if_pc_matches(0x1000_3002)
+                .is_none()
+        );
+        assert!(
+            core.take_short_decode_cursor_if_pc_matches(0x1000_3000)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn xip_decode_cursor_disabled_by_default() {
+        let mut core = CortexM0Plus::new();
+        let entry = [op(0x1000_4000, 0xA000, 0x0000, false)];
+        core.install_short_decode_cursor_entries(&entry);
+
+        assert!(
+            core.take_short_decode_cursor_if_pc_matches(0x1000_4000)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn xip_decode_cursor_rejects_sram_entries() {
+        let mut core = CortexM0Plus::new();
+        core.enable_xip_decode_cursor();
+        let entry = [op(0x2000_0000, 0xBF00, 0x0000, false)];
+        core.install_short_decode_cursor_entries(&entry);
+
+        assert!(core.xip_decode_cursor_is_empty());
+        assert!(
+            core.take_short_decode_cursor_if_pc_matches(0x2000_0000)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn xip_decode_cursor_preserves_on_sram_invalidation_clears_on_xip_scope() {
+        let mut core = CortexM0Plus::new();
+        let entries = [
+            op(0x1000_2000, 0xBF00, 0x0000, false),
+            op(0x1000_2002, 0xBF00, 0x0000, false),
+            op(0x1000_2004, 0xBF00, 0x0000, false),
+        ];
+        core.enable_xip_decode_cursor();
+        core.install_short_decode_cursor_entries(&entries);
+        assert!(!core.xip_decode_cursor_is_empty());
+
+        core.invalidate_decode_cache_entries(&[0x2000_0000]);
+        assert!(!core.xip_decode_cursor_is_empty());
+
+        core.invalidate_decode_cache_entries(&[0x1000_2002]);
+        assert!(core.xip_decode_cursor_is_empty());
+
+        core.install_short_decode_cursor_entries(&entries);
+        assert!(!core.xip_decode_cursor_is_empty());
+
+        core.invalidate_decode_cache_regions(crate::bus::invalidation_regions::XIP);
+        assert!(core.xip_decode_cursor_is_empty());
+
+        core.install_short_decode_cursor_entries(&entries);
+        assert!(!core.xip_decode_cursor_is_empty());
+
+        core.invalidate_decode_cache_all();
+        assert!(core.xip_decode_cursor_is_empty());
     }
 }

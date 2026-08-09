@@ -24,6 +24,9 @@ pub mod irq;
 pub mod memory;
 pub mod peripherals;
 
+#[cfg(feature = "xip-decode-cursor-proof")]
+pub use core::XipDecodeCursorProofSnapshot;
+
 mod idle_profile;
 
 #[cfg(feature = "event-horizon-profiler")]
@@ -420,6 +423,10 @@ impl Emulator {
             self.cores[i].regs.r[13] = initial_sp;
             self.cores[i].regs.set_pc(reset_vector & !1);
             self.cores[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
+        }
+        #[cfg(feature = "xip-decode-cursor-prototype")]
+        if self.execution_model == ExecutionModel::Serial {
+            self.cores[0].enable_xip_decode_cursor();
         }
 
         self.bus.sio.reset();
@@ -1453,6 +1460,13 @@ impl Emulator {
         any(target_os = "windows", target_os = "linux")
     ))]
     fn promote_to_threaded(&mut self) {
+        #[cfg(feature = "xip-decode-cursor-prototype")]
+        {
+            // OPT3-B is deliberately Serial/core-0 only.  Clear and disable
+            // the candidate before ownership moves to worker threads.
+            self.cores[0].disable_xip_decode_cursor();
+            self.cores[1].disable_xip_decode_cursor();
+        }
         let placeholder_bus = Bus::new();
         let placeholder_cores = [CortexM0Plus::with_id(0), CortexM0Plus::with_id(1)];
         let seeded_bus = std::mem::replace(&mut self.bus, placeholder_bus);
@@ -2316,6 +2330,10 @@ impl EmulatorBuilder {
             ))]
             bus_is_placeholder: false,
         };
+        #[cfg(feature = "xip-decode-cursor-prototype")]
+        if self.execution == ExecutionModel::Serial {
+            emu.cores[0].enable_xip_decode_cursor();
+        }
         // Default: core 1 halted — Pico SDK wakes it via SIO FIFO.
         // Route through the wrapper so the SIO handshake FSM `armed`
         // flag is in sync (HLD 2026.04.16 §2.1 / §5 invariant).
@@ -2332,6 +2350,22 @@ impl EmulatorBuilder {
             "emulator constructed"
         );
         Ok(emu)
+    }
+}
+
+#[cfg(all(test, feature = "xip-decode-cursor-proof"))]
+mod xip_decode_cursor_builder_tests {
+    use super::*;
+
+    #[test]
+    fn serial_builder_and_reset_enable_only_core_zero() {
+        let mut emu = EmulatorBuilder::new(Config::default()).build().unwrap();
+        assert!(emu.core(0).xip_decode_cursor_proof_snapshot().enabled);
+        assert!(!emu.core(1).xip_decode_cursor_proof_snapshot().enabled);
+
+        emu.reset();
+        assert!(emu.core(0).xip_decode_cursor_proof_snapshot().enabled);
+        assert!(!emu.core(1).xip_decode_cursor_proof_snapshot().enabled);
     }
 }
 

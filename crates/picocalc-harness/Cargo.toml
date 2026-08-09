@@ -22,6 +22,10 @@ event-horizon-profiler = ["idle-profiler", "behavior-trace", "rp2040-emu/event-h
 # Diagnostic-only OPT0-B correctness build. Normal conformance and
 # performance runners do not compile the streaming hash path.
 behavior-trace = ["rp2040-emu/behavior-trace"]
+# Prototype short immutable-XIP decode cursor tracking.
+xip-decode-cursor-prototype = ["rp2040-emu/xip-decode-cursor-prototype"]
+# Proof build for short immutable-XIP decode cursor semantics.
+xip-decode-cursor-proof = ["xip-decode-cursor-prototype", "rp2040-emu/xip-decode-cursor-proof"]
 
 [lints]
 workspace = true
