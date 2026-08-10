@@ -25,6 +25,8 @@ public release simply ships those current versions.
 - Add PicoCalc board models for both LCD transports, 8 MiB PSRAM, SPI SD, PWM observation, and the
   I2C keyboard/power controller. The keyboard model is conformance-tested against ClockworkPi's
   official STM32 firmware, including its 31-event FIFO, key transformations, repeat, and overflow.
+- Add deterministic PicoCalc PWM5_CC level statistics and optional unnormalised 48 kHz stereo WAV
+  export without changing the existing schema 8 conformance report.
 
 ### Changed
 

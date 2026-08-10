@@ -92,6 +92,24 @@ cargo run --release -p picocalc-harness --bin picocalc-run -- \
   --snapshot-dir /tmp/picocalc-snapshots --json /tmp/picocalc-report.json
 ```
 
+For the fixed PicoCalc 48 kHz stereo PWM5_CC path, the runner can also write a separate
+deterministic level-analysis artifact and an optional unnormalised listening WAV:
+
+```bash
+cargo run --release -p picocalc-harness --bin picocalc-run -- \
+  <the normal PicoCalc firmware arguments> \
+  --audio-analysis /tmp/picocalc-audio-analysis.json \
+  --audio-wav /tmp/picocalc-audio-raw.wav
+```
+
+The analysis reconstructs signed 16-bit samples from the post-quantizer 8-bit duty stream and
+reports peak, whole-stream and maximum complete 1024-frame-block RMS, active-frame ratio, DC offset, PWM
+rail ratio, and the longest consecutive rail run. A rail sample is not automatically a firmware
+clip and is not an automatic failure. Project policy belongs in `picocalc_emu`'s schema-2 quality
+contract: it rejects needlessly low level while allowing bounded saturation and only rejecting
+extreme rail occupancy. The WAV preserves the observed digital level; it is never normalised and
+does not model the amplifier, physical volume control, speaker, enclosure, or room.
+
 NEXT-4 also exposes the same persistent machine session as a deterministic JSON Lines API.
 Artifact and device options are fixed at process startup; one stdin line produces one stdout line,
 while UART and diagnostics never contaminate stdout. `run` is always bounded and subscriptions are

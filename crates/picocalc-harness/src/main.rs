@@ -30,7 +30,7 @@
 //! unsupported-MMIO list is sorted by `(addr, pc)`.
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -249,6 +249,8 @@ struct Args {
     expected_uart: Vec<String>,
     expected_audio_sink_count: Option<u64>,
     expected_audio_sink_sha256: Option<String>,
+    audio_analysis: Option<PathBuf>,
+    audio_wav: Option<PathBuf>,
     #[cfg(feature = "idle-profiler")]
     idle_profile: Option<PathBuf>,
     #[cfg(feature = "behavior-trace")]
@@ -342,6 +344,10 @@ fn print_usage() {
                                   Require exactly N DMA-origin PWM5_CC writes.\n\
          --expect-audio-sink-sha256 <hex>\n\
                                   Require the little-endian PWM5_CC stream SHA-256.\n\
+         --audio-analysis <path> Write deterministic digital-level metrics reconstructed\n\
+                                  from the 8-bit stereo PWM duty stream.\n\
+         --audio-wav <path>      Write the same unnormalised reconstructed stream as\n\
+                                  48 kHz stereo signed-16 WAV for listening.\n\
          -h, --help               This message."
     );
     #[cfg(feature = "idle-profiler")]
@@ -398,6 +404,8 @@ fn parse_args() -> Result<Args, String> {
     let mut expected_uart: Vec<String> = Vec::new();
     let mut expected_audio_sink_count: Option<u64> = None;
     let mut expected_audio_sink_sha256: Option<String> = None;
+    let mut audio_analysis: Option<PathBuf> = None;
+    let mut audio_wav: Option<PathBuf> = None;
     #[cfg(feature = "idle-profiler")]
     let mut idle_profile: Option<PathBuf> = None;
     #[cfg(feature = "behavior-trace")]
@@ -498,6 +506,18 @@ fn parse_args() -> Result<Args, String> {
                 }
                 expected_audio_sink_sha256 = Some(digest);
             }
+            "--audio-analysis" => {
+                if audio_analysis.is_some() {
+                    return Err("--audio-analysis may be specified only once".to_string());
+                }
+                audio_analysis = Some(PathBuf::from(value("--audio-analysis")?));
+            }
+            "--audio-wav" => {
+                if audio_wav.is_some() {
+                    return Err("--audio-wav may be specified only once".to_string());
+                }
+                audio_wav = Some(PathBuf::from(value("--audio-wav")?));
+            }
             #[cfg(feature = "idle-profiler")]
             "--idle-profile" => idle_profile = Some(PathBuf::from(value("--idle-profile")?)),
             #[cfg(feature = "behavior-trace")]
@@ -560,6 +580,9 @@ fn parse_args() -> Result<Args, String> {
     if expected_audio_sink_count.is_some() && board != Board::PicoCalc {
         return Err("audio sink expectations require --board picocalc".to_string());
     }
+    if (audio_analysis.is_some() || audio_wav.is_some()) && board != Board::PicoCalc {
+        return Err("audio analysis and WAV output require --board picocalc".to_string());
+    }
     if machine_api {
         let conflicts = [
             (scenario.is_some(), "--scenario"),
@@ -573,6 +596,8 @@ fn parse_args() -> Result<Args, String> {
                 expected_audio_sink_count.is_some(),
                 "audio sink expectations",
             ),
+            (audio_analysis.is_some(), "--audio-analysis"),
+            (audio_wav.is_some(), "--audio-wav"),
             (keys.is_some(), "--keys"),
         ];
         if let Some((_, name)) = conflicts.into_iter().find(|(present, _)| *present) {
@@ -630,6 +655,8 @@ fn parse_args() -> Result<Args, String> {
         expected_uart,
         expected_audio_sink_count,
         expected_audio_sink_sha256,
+        audio_analysis,
+        audio_wav,
         #[cfg(feature = "idle-profiler")]
         idle_profile,
         #[cfg(feature = "behavior-trace")]
@@ -2927,6 +2954,71 @@ impl AudioSinkReport {
         self.expected_count.is_some() && self.status != "pass"
     }
 
+    fn analysis_json(
+        &self,
+        backend_commit: &str,
+        backend_dirty: bool,
+        firmware_name: &str,
+        firmware_sha256: &str,
+    ) -> String {
+        format!(
+            concat!(
+                "{{\n",
+                "  \"schema_version\": 1,\n",
+                "  \"boundary\": \"dma_to_pwm5_cc\",\n",
+                "  \"interpretation\": \"digital_level_only_not_speaker_loudness\",\n",
+                "  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n",
+                "  \"firmware\": {{\"file\": {}, \"sha256\": {}}},\n",
+                "  \"observation_status\": {},\n",
+                "  \"pcm_sha256\": {},\n",
+                "  \"pcm_format\": {},\n",
+                "  \"sample_rate_hz\": {},\n",
+                "  \"channel_count\": {},\n",
+                "  \"frame_count\": {},\n",
+                "  \"window_frames\": {},\n",
+                "  \"active_abs_threshold\": {},\n",
+                "  \"peak_abs_left\": {},\n",
+                "  \"peak_abs_right\": {},\n",
+                "  \"stream_rms\": {},\n",
+                "  \"max_window_rms\": {},\n",
+                "  \"dc_offset_left\": {},\n",
+                "  \"dc_offset_right\": {},\n",
+                "  \"active_frame_count\": {},\n",
+                "  \"active_frame_ratio_ppm\": {},\n",
+                "  \"rail_sample_count\": {},\n",
+                "  \"rail_sample_ratio_ppm\": {},\n",
+                "  \"max_consecutive_rail_frames\": {},\n",
+                "  \"out_of_range_duty_sample_count\": {},\n",
+                "  \"rail_interpretation\": \"post_quantizer_pwm_rail_usage_not_source_clip_count\"\n",
+                "}}\n"
+            ),
+            json_string(backend_commit),
+            backend_dirty,
+            json_string(firmware_name),
+            json_string(firmware_sha256),
+            json_string(self.snapshot.status),
+            json_string(&self.snapshot.pcm_sha256),
+            json_string(self.snapshot.reconstructed_pcm_format),
+            self.snapshot.sample_rate_hz,
+            self.snapshot.channel_count,
+            self.snapshot.analysis_frame_count,
+            self.snapshot.analysis_window_frames,
+            self.snapshot.active_abs_threshold,
+            self.snapshot.peak_abs_left,
+            self.snapshot.peak_abs_right,
+            self.snapshot.stream_rms,
+            self.snapshot.max_window_rms,
+            self.snapshot.dc_offset_left,
+            self.snapshot.dc_offset_right,
+            self.snapshot.active_frame_count,
+            self.snapshot.active_frame_ratio_ppm,
+            self.snapshot.rail_sample_count,
+            self.snapshot.rail_sample_ratio_ppm,
+            self.snapshot.max_consecutive_rail_frames,
+            self.snapshot.out_of_range_duty_sample_count,
+        )
+    }
+
     fn to_json(&self) -> String {
         let words = |values: &[u32]| {
             values
@@ -3011,6 +3103,42 @@ impl AudioSinkReport {
             json_string(&self.snapshot.service_latency_sha256),
         )
     }
+}
+
+fn write_audio_wav(path: &Path, samples: &[i16]) -> Result<(), String> {
+    if !samples.len().is_multiple_of(2) {
+        return Err("audio PCM capture is not interleaved stereo".to_string());
+    }
+    let data_size = u32::try_from(samples.len().saturating_mul(2))
+        .map_err(|_| "audio WAV exceeds the RIFF 32-bit size limit".to_string())?;
+    let riff_size = 36u32
+        .checked_add(data_size)
+        .ok_or_else(|| "audio WAV exceeds the RIFF 32-bit size limit".to_string())?;
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("creating audio WAV {}: {e}", path.display()))?;
+    let mut output = BufWriter::new(file);
+    output
+        .write_all(b"RIFF")
+        .and_then(|_| output.write_all(&riff_size.to_le_bytes()))
+        .and_then(|_| output.write_all(b"WAVEfmt "))
+        .and_then(|_| output.write_all(&16u32.to_le_bytes()))
+        .and_then(|_| output.write_all(&1u16.to_le_bytes()))
+        .and_then(|_| output.write_all(&2u16.to_le_bytes()))
+        .and_then(|_| output.write_all(&48_000u32.to_le_bytes()))
+        .and_then(|_| output.write_all(&(48_000u32 * 4).to_le_bytes()))
+        .and_then(|_| output.write_all(&4u16.to_le_bytes()))
+        .and_then(|_| output.write_all(&16u16.to_le_bytes()))
+        .and_then(|_| output.write_all(b"data"))
+        .and_then(|_| output.write_all(&data_size.to_le_bytes()))
+        .map_err(|e| format!("writing audio WAV header {}: {e}", path.display()))?;
+    for sample in samples {
+        output
+            .write_all(&sample.to_le_bytes())
+            .map_err(|e| format!("writing audio WAV samples {}: {e}", path.display()))?;
+    }
+    output
+        .flush()
+        .map_err(|e| format!("flushing audio WAV {}: {e}", path.display()))
 }
 
 /// TOP register reset value; a slice still holding it was never given a
@@ -3699,6 +3827,9 @@ fn run() -> Result<Verdict, String> {
         emu.enable_running_event_profiler()
             .map_err(|e| format!("enabling running event-horizon profiler: {e}"))?;
     }
+    if args.audio_wav.is_some() {
+        emu.bus.enable_audio_pcm_capture();
+    }
 
     let handles = BoardHandles {
         lcd: lcd.clone(),
@@ -3859,6 +3990,23 @@ fn run() -> Result<Verdict, String> {
             args.expected_audio_sink_sha256.as_deref(),
         )
     });
+    if let (Some(path), Some(audio_sink)) = (&args.audio_analysis, &audio_sink_report) {
+        let analysis = audio_sink.analysis_json(
+            BUILT_BACKEND_COMMIT,
+            built_backend_dirty(),
+            &basename(&args.bin),
+            &firmware_sha,
+        );
+        std::fs::write(path, analysis.as_bytes())
+            .map_err(|e| format!("writing audio analysis {}: {e}", path.display()))?;
+    }
+    if let Some(path) = &args.audio_wav {
+        let samples = emu
+            .bus
+            .take_audio_pcm_capture()
+            .expect("--audio-wav enabled PCM capture before the run");
+        write_audio_wav(path, &samples)?;
+    }
 
     let pio_report = (args.board == Board::PicoCalc).then(|| PioReport::collect(&mut emu.bus));
 
@@ -4434,6 +4582,24 @@ mod tests {
             service_latency_min_cycles: None,
             service_latency_max_cycles: None,
             service_latency_sha256: String::new(),
+            analysis_frame_count: 3,
+            sample_rate_hz: 48_000,
+            channel_count: 2,
+            reconstructed_pcm_format: "stereo_s16le_from_pwm8_duty",
+            analysis_window_frames: 1024,
+            active_abs_threshold: 512,
+            peak_abs_left: 32_768,
+            peak_abs_right: 32_767,
+            stream_rms: 12_000,
+            max_window_rms: 16_000,
+            dc_offset_left: 0,
+            dc_offset_right: 0,
+            active_frame_count: 3,
+            active_frame_ratio_ppm: 1_000_000,
+            rail_sample_count: 1,
+            rail_sample_ratio_ppm: 166_666,
+            max_consecutive_rail_frames: 1,
+            out_of_range_duty_sample_count: 0,
         };
 
         assert_eq!(
@@ -4517,6 +4683,24 @@ mod tests {
                 service_latency_min_cycles: None,
                 service_latency_max_cycles: None,
                 service_latency_sha256: String::new(),
+                analysis_frame_count: 3,
+                sample_rate_hz: 48_000,
+                channel_count: 2,
+                reconstructed_pcm_format: "stereo_s16le_from_pwm8_duty",
+                analysis_window_frames: 1024,
+                active_abs_threshold: 512,
+                peak_abs_left: 32_768,
+                peak_abs_right: 32_767,
+                stream_rms: 12_000,
+                max_window_rms: 16_000,
+                dc_offset_left: 0,
+                dc_offset_right: 0,
+                active_frame_count: 3,
+                active_frame_ratio_ppm: 1_000_000,
+                rail_sample_count: 1,
+                rail_sample_ratio_ppm: 166_666,
+                max_consecutive_rail_frames: 1,
+                out_of_range_duty_sample_count: 0,
             },
             expected_count: Some(3),
             expected_sha256: Some("aabbccdd".repeat(8)),

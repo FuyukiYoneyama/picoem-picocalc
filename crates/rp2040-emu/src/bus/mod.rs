@@ -960,6 +960,16 @@ impl Bus {
         self.dma.audio_sink_snapshot()
     }
 
+    /// Enable optional PCM retention for a later diagnostic WAV export.
+    pub fn enable_audio_pcm_capture(&mut self) {
+        self.dma.enable_audio_pcm_capture();
+    }
+
+    /// Take the optional interleaved stereo PCM retained by the audio sink.
+    pub fn take_audio_pcm_capture(&mut self) -> Option<Vec<i16>> {
+        self.dma.take_audio_pcm_capture()
+    }
+
     /// Base read latency for an address region (cycles).
     #[inline]
     fn read_latency(region: u32) -> u32 {

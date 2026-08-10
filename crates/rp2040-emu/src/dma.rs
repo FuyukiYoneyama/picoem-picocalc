@@ -386,6 +386,16 @@ impl Dma {
         snapshot
     }
 
+    /// Retain reconstructed stereo PCM only when a harness explicitly requests it.
+    pub fn enable_audio_pcm_capture(&mut self) {
+        self.audio_sink.enable_pcm_capture();
+    }
+
+    /// Move the optional interleaved stereo PCM capture out of the DMA observer.
+    pub fn take_audio_pcm_capture(&mut self) -> Option<Vec<i16>> {
+        self.audio_sink.take_pcm_capture()
+    }
+
     /// True iff no channel is currently transferring (no `BUSY`) and no
     /// IRQ is latched. Consulted by the fast-path gate in
     /// [`crate::Emulator::step`] — when false, the slow path runs so
