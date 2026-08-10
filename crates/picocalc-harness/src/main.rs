@@ -905,6 +905,15 @@ fn boot(
                             Box::new(St7365pWire::new(lcd.clone())),
                         )
                         .map_err(|i| format!("no SPI instance {i} on RP2040"))?;
+                    // Variant A normally writes through SPI1, but its RAMRD
+                    // diagnostic temporarily deinitialises SPI1 and drives
+                    // the same pads from SIO. The SPI wire receives FIFO
+                    // frames; this pin wire receives only the SIO pad edges
+                    // and returns panel MISO through GPIO_IN. `update_gpio`
+                    // does not synthesize SPI-peripheral SCK/MOSI edges, so
+                    // attaching both paths cannot double-count normal writes.
+                    emu.bus
+                        .attach_pin_device(Box::new(LcdPioWire::new(lcd.clone())));
                 }
                 LcdVariant::B => {
                     emu.bus
