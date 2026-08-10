@@ -49,15 +49,10 @@
 //!   the opposite of the device. Recorded, not applied.
 //! # RAMRD byte order
 //!
-//! `read_buffer_spi` clocks one dummy byte after `0x2E`, then three
-//! bytes per pixel, and finally swaps each triple's first and third
-//! byte before `draw_buffer_spi` writes it straight back with RAMWR.
-//! `scroll_lcd_spi` moves a line through exactly that read-swap-write
-//! round trip, so for a scrolled line to keep its colour the panel has
-//! to answer in the reverse of the RAMWR order: blue first, red last.
-//! That is what this model does, and
-//! `ramrd_round_trip_through_the_drivers_byte_swap_preserves_colour`
-//! pins it down.
+//! The historical hardware-observed RGB666 diagnostic reads RAMRD in the same
+//! R, G, B channel order used by RAMWR.  The public RGB565 API converts
+//! those three bytes directly back to RGB565, so the model preserves
+//! that physical wire order.  RGB565 mode is likewise big-endian.
 //!
 //! # Framing
 //!
@@ -334,11 +329,7 @@ impl St7365p {
     /// Produce the next byte of a RAMRD stream.
     ///
     /// The panel answers with three bytes per pixel, one 6-bit channel
-    /// each in the top bits, and the driver in `read_buffer_spi` swaps
-    /// the first and third before writing them back with RAMWR. For a
-    /// read-modify-write scroll to preserve colour, the order on the
-    /// wire must therefore be the reverse of what RAMWR consumes — blue
-    /// first, red last.
+    /// each in the top bits, in the same R, G, B order used by RAMWR.
     fn ramrd_byte(&mut self) -> u8 {
         if self.ramrd_dummy_pending {
             self.ramrd_dummy_pending = false;
@@ -355,7 +346,7 @@ impl St7365p {
                     let r = (((colour >> 11) & 0x1F) as u8) << 3;
                     let g = (((colour >> 5) & 0x3F) as u8) << 2;
                     let b = ((colour & 0x1F) as u8) << 3;
-                    [b, g, r]
+                    [r, g, b]
                 }
                 // Big-endian on the wire, matching RAMWR.
                 Colmod::Rgb565 => [(colour >> 8) as u8, colour as u8, 0],
@@ -852,12 +843,8 @@ mod tests {
         assert_eq!(d.ramrd_count, 1);
     }
 
-    /// `read_buffer_spi` reads three bytes per pixel, swaps the first
-    /// and third, and `draw_buffer_spi` writes the result straight back.
-    /// That round trip is how `scroll_lcd_spi` moves a line, so it has
-    /// to return the pixel unchanged.
     #[test]
-    fn ramrd_round_trip_through_the_drivers_byte_swap_preserves_colour() {
+    fn ramrd_rgb666_uses_the_hardware_observed_rgb_order() {
         let mut d = ready();
         // Paint one known pixel at the origin.
         set_window(&mut d, 0, 0, 0, 0);
@@ -878,10 +865,9 @@ mod tests {
         for slot in got.iter_mut() {
             *slot = d.transfer_byte(0xFF);
         }
-        // The driver's swap: p[0] and p[2] exchange places.
-        got.swap(0, 2);
+        assert_eq!(got, [0xF8, 0x40, 0x08]);
 
-        // Write the swapped buffer back to a different pixel.
+        // Writing the read stream back to a different pixel preserves it.
         set_window(&mut d, 5, 5, 5, 5);
         cmd(&mut d, CMD_RAMWR);
         d.set_control_lines(false, true, true);
@@ -911,12 +897,11 @@ mod tests {
         let _dummy = d.transfer_byte(0xFF);
         let first: Vec<u8> = (0..3).map(|_| d.transfer_byte(0xFF)).collect();
         let second: Vec<u8> = (0..3).map(|_| d.transfer_byte(0xFF)).collect();
-        // Wire order is B, G, R: a red pixel leads with zero blue and a
-        // blue pixel leads with full blue.
-        assert_eq!(first[0], 0x00, "first pixel is red, so blue is zero");
-        assert_ne!(first[2], 0x00, "first pixel is red, so red is set");
-        assert_ne!(second[0], 0x00, "second pixel is blue");
-        assert_eq!(second[2], 0x00, "second pixel has no red");
+        // Wire order is R, G, B.
+        assert_ne!(first[0], 0x00, "first pixel is red");
+        assert_eq!(first[2], 0x00, "first pixel has no blue");
+        assert_eq!(second[0], 0x00, "second pixel has no red");
+        assert_ne!(second[2], 0x00, "second pixel is blue");
     }
 
     #[test]

@@ -59,6 +59,10 @@ pub struct LcdPioWire {
     miso_shift: u8,
     /// Level currently presented on MISO.
     miso_level: bool,
+    /// True after an actual pad-level SCK edge selected this transport.
+    /// Variant A also has a frame-level SPI wire, so CS alone is not
+    /// sufficient to decide which reply timing is active.
+    bit_level_active: bool,
 
     // --- observation counters ---
     /// Rising SCK edges seen while CS was asserted.
@@ -71,10 +75,6 @@ pub struct LcdPioWire {
 
 impl LcdPioWire {
     pub fn new(panel: Arc<Mutex<St7365p>>) -> Self {
-        // This transport is bit-level full duplex, so a reply is
-        // already one byte behind the request; the panel must not also
-        // count a dummy byte. See .
-        panel.lock().expect("panel mutex").set_ramrd_dummy(false);
         Self {
             panel,
             last: 0,
@@ -83,6 +83,7 @@ impl LcdPioWire {
             bit_count: 0,
             miso_shift: 0,
             miso_level: false,
+            bit_level_active: false,
             sck_edges: 0,
             bytes: 0,
             partial_bytes: 0,
@@ -119,6 +120,16 @@ impl PinWatchingDevice for LcdPioWire {
         // CS high ends any partial byte: the bits that were in flight
         // are not a byte the panel ever saw.
         if cs_high {
+            if self.bit_level_active {
+                // Frame-level SPI replies are returned in the same
+                // transfer and therefore need the model's explicit
+                // RAMRD dummy again after SIO/PIO bit traffic ends.
+                self.panel
+                    .lock()
+                    .expect("panel mutex")
+                    .set_ramrd_dummy(true);
+                self.bit_level_active = false;
+            }
             if self.bit_count != 0 {
                 self.partial_bytes += 1;
                 self.bit_count = 0;
@@ -129,6 +140,19 @@ impl PinWatchingDevice for LcdPioWire {
 
         let sck_was = Self::level(previous, pins::PIN_SCK);
         let sck_now = Self::level(pads, pins::PIN_SCK);
+
+        if sck_was != sck_now && !self.bit_level_active {
+            // A bit-level full-duplex reply is inherently one byte
+            // behind the request, so it already supplies the physical
+            // RAMRD dummy byte.  Activate this only after a real pad
+            // edge: variant A's normal SPI1 frames share CS/DC with this
+            // observer but do not synthesize pad-level SCK edges.
+            self.panel
+                .lock()
+                .expect("panel mutex")
+                .set_ramrd_dummy(false);
+            self.bit_level_active = true;
+        }
 
         // Falling edge: present the next MISO bit, so it is stable by
         // the time the master samples on the rising edge. Reads happen
@@ -195,6 +219,45 @@ mod tests {
         }
     }
 
+    /// Transfer one byte with the historical SIO observer timing: sample
+    /// MISO while SCK is low, latch MOSI on the rising edge, and finish low.
+    fn exchange(wire: &mut LcdPioWire, base: u32, byte: u8) -> u8 {
+        let mut reply = 0;
+        for i in (0..8).rev() {
+            let bit = if byte & (1 << i) != 0 { MOSI } else { 0 };
+            let sample = wire
+                .tick(base | bit)
+                .map(|(_, level)| level)
+                .unwrap_or(false);
+            reply = (reply << 1) | u8::from(sample);
+            wire.tick(base | bit | SCK);
+        }
+        wire.tick(base);
+        reply
+    }
+
+    fn paint_one_rgb666_pixel(panel: &Arc<Mutex<St7365p>>, rgb: [u8; 3]) {
+        let mut panel = panel.lock().unwrap();
+        for (command, data) in [
+            (crate::st7365p::CMD_CASET, &[0, 0, 0, 0][..]),
+            (crate::st7365p::CMD_RASET, &[0, 0, 0, 0][..]),
+        ] {
+            panel.set_control_lines(false, false, true);
+            panel.transfer_byte(command);
+            panel.set_control_lines(false, true, true);
+            for byte in data {
+                panel.transfer_byte(*byte);
+            }
+        }
+        panel.set_control_lines(false, false, true);
+        panel.transfer_byte(crate::st7365p::CMD_RAMWR);
+        panel.set_control_lines(false, true, true);
+        for byte in rgb {
+            panel.transfer_byte(byte);
+        }
+        panel.set_control_lines(true, true, true);
+    }
+
     #[test]
     fn a_command_byte_reaches_the_panel() {
         let (mut w, panel) = wire();
@@ -257,5 +320,38 @@ mod tests {
         assert!(panel.lock().unwrap().in_reset());
         w.tick(IDLE);
         assert!(!panel.lock().unwrap().in_reset());
+    }
+
+    #[test]
+    fn sio_ramrd_returns_rgb666_in_rgb_order_after_one_wire_dummy() {
+        let (mut wire, panel) = wire();
+        paint_one_rgb666_pixel(&panel, [0xF8, 0x40, 0x08]);
+
+        let command_reply = exchange(&mut wire, RESET, crate::st7365p::CMD_RAMRD);
+        let dummy = exchange(&mut wire, RESET | DC, 0);
+        let red = exchange(&mut wire, RESET | DC, 0);
+        let green = exchange(&mut wire, RESET | DC, 0);
+        let blue = exchange(&mut wire, RESET | DC, 0);
+
+        assert_eq!(command_reply, 0);
+        assert_eq!(dummy, 0);
+        assert_eq!([red, green, blue], [0xF8, 0x40, 0x08]);
+    }
+
+    #[test]
+    fn deselect_restores_same_transfer_spi_dummy_timing() {
+        let (mut wire, panel) = wire();
+        paint_one_rgb666_pixel(&panel, [0xF8, 0x40, 0x08]);
+
+        let _ = exchange(&mut wire, RESET, crate::st7365p::CMD_RAMRD);
+        let _ = exchange(&mut wire, RESET | DC, 0);
+        wire.tick(IDLE);
+
+        let mut panel = panel.lock().unwrap();
+        panel.set_control_lines(false, false, true);
+        panel.transfer_byte(crate::st7365p::CMD_RAMRD);
+        panel.set_control_lines(false, true, true);
+        assert_eq!(panel.transfer_byte(0), 0, "SPI path keeps explicit dummy");
+        assert_eq!(panel.transfer_byte(0), 0xF8, "pixel follows the dummy");
     }
 }
