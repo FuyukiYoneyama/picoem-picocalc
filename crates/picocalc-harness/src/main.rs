@@ -29,14 +29,16 @@
 //! absolute paths (basenames only), and no host-dependent values. The
 //! unsupported-MMIO list is sorted by `(addr, pc)`.
 
+use std::collections::BTreeSet;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{
-    Framebuffer, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire, SdFormat, St7365p,
-    St7365pWire, pins,
+    Framebuffer, KeyEvent, KeyState, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire,
+    SdFormat, St7365p, St7365pWire, pins,
 };
 #[cfg(feature = "behavior-trace")]
 use rp2040_emu::{BehaviorEventDomain, BehaviorTraceSnapshot};
@@ -52,6 +54,7 @@ use rp2040_emu::{
     RunningEventProfileSnapshot,
 };
 
+mod machine_protocol;
 mod scenario;
 
 /// Report schema version. Bump on any breaking field change.
@@ -241,6 +244,7 @@ struct Args {
     keys: Option<String>,
     scenario: Option<PathBuf>,
     snapshot_dir: PathBuf,
+    machine_api: bool,
     expected_stop: Option<StopReason>,
     expected_uart: Vec<String>,
     expected_audio_sink_count: Option<u64>,
@@ -330,6 +334,8 @@ fn print_usage() {
                                   the firmware has programmed.\n\
          --snapshot-dir <path>    Where scenario 'snapshot' steps write their PNGs.\n\
                                   Default: the current directory.\n\
+         --machine-api            NEXT-4 JSON Lines API on stdin/stdout. Uses the same\n\
+                                  startup artifact/device options; no scenario/final report.\n\
          --expect-stop <reason>   Required stop: cycle_limit, pc_match, or scenario_done.\n\
          --expect-uart <text>     Required UART substring. Repeat for each marker.\n\
          --expect-audio-sink-count <N>\n\
@@ -387,6 +393,7 @@ fn parse_args() -> Result<Args, String> {
     let mut keys: Option<String> = None;
     let mut scenario: Option<PathBuf> = None;
     let mut snapshot_dir: Option<PathBuf> = None;
+    let mut machine_api = false;
     let mut expected_stop: Option<StopReason> = None;
     let mut expected_uart: Vec<String> = Vec::new();
     let mut expected_audio_sink_count: Option<u64> = None;
@@ -454,6 +461,7 @@ fn parse_args() -> Result<Args, String> {
             "--keys" => keys = Some(value("--keys")?),
             "--scenario" => scenario = Some(PathBuf::from(value("--scenario")?)),
             "--snapshot-dir" => snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
+            "--machine-api" => machine_api = true,
             "--expect-stop" => {
                 if expected_stop.is_some() {
                     return Err("--expect-stop may be specified only once".to_string());
@@ -522,8 +530,8 @@ fn parse_args() -> Result<Args, String> {
     if keys.is_some() {
         keyboard = true;
     }
-    if snapshot_dir.is_some() && scenario.is_none() {
-        return Err("--snapshot-dir only means anything with --scenario".to_string());
+    if snapshot_dir.is_some() && scenario.is_none() && !machine_api {
+        return Err("--snapshot-dir requires --scenario or --machine-api".to_string());
     }
     if expected_stop == Some(StopReason::PcMatch) && stop_pc.is_none() {
         return Err("--expect-stop pc_match requires --stop-pc".to_string());
@@ -551,6 +559,37 @@ fn parse_args() -> Result<Args, String> {
     }
     if expected_audio_sink_count.is_some() && board != Board::PicoCalc {
         return Err("audio sink expectations require --board picocalc".to_string());
+    }
+    if machine_api {
+        let conflicts = [
+            (scenario.is_some(), "--scenario"),
+            (stop_pc.is_some(), "--stop-pc"),
+            (json.is_some(), "--json"),
+            (uart.is_some(), "--uart"),
+            (fb_png.is_some(), "--fb-png"),
+            (expected_stop.is_some(), "--expect-stop"),
+            (!expected_uart.is_empty(), "--expect-uart"),
+            (
+                expected_audio_sink_count.is_some(),
+                "audio sink expectations",
+            ),
+            (keys.is_some(), "--keys"),
+        ];
+        if let Some((_, name)) = conflicts.into_iter().find(|(present, _)| *present) {
+            return Err(format!("--machine-api cannot be combined with {name}"));
+        }
+    }
+    #[cfg(feature = "idle-profiler")]
+    if machine_api && idle_profile.is_some() {
+        return Err("--machine-api cannot be combined with --idle-profile".to_string());
+    }
+    #[cfg(feature = "behavior-trace")]
+    if machine_api && behavior_trace.is_some() {
+        return Err("--machine-api cannot be combined with --behavior-trace".to_string());
+    }
+    #[cfg(feature = "event-horizon-profiler")]
+    if machine_api && event_horizon_profile.is_some() {
+        return Err("--machine-api cannot be combined with --event-horizon-profile".to_string());
     }
     #[cfg(all(feature = "idle-profiler", feature = "behavior-trace"))]
     if idle_profile.is_some() && behavior_trace.is_some() {
@@ -586,6 +625,7 @@ fn parse_args() -> Result<Args, String> {
         keys,
         scenario,
         snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
+        machine_api,
         expected_stop,
         expected_uart,
         expected_audio_sink_count,
@@ -1037,43 +1077,155 @@ impl VirtualClock {
 struct BoardHandles {
     lcd: Option<Arc<Mutex<St7365p>>>,
     keyboard: Option<Arc<Mutex<Keyboard>>>,
+    sd: Option<Arc<Mutex<SdCard>>>,
+}
+
+/// One persistent, deterministic headless machine session.
+///
+/// This is the shared execution boundary for the batch scenario runner and
+/// NEXT-4's JSONL adapter.  Keeping UART accumulation and the virtual clock
+/// here prevents either client from inventing subtly different stepping,
+/// clock-rebase, or observation semantics.
+struct MachineSession {
+    emu: Emulator,
+    vclock: VirtualClock,
+    uart_bytes: Vec<u8>,
+    dispatches: u64,
+    board: BoardHandles,
+    sticky_stop: Option<SessionStop>,
+}
+
+#[derive(Clone)]
+enum SessionStop {
+    Exception(&'static str),
+    Error(String),
+}
+
+impl MachineSession {
+    #[inline]
+    fn new(emu: Emulator, board: BoardHandles) -> Self {
+        let vclock = VirtualClock::new(emu.bus.clock_tree.sys_clk_hz);
+        Self {
+            emu,
+            vclock,
+            uart_bytes: Vec::new(),
+            dispatches: 0,
+            board,
+            sticky_stop: None,
+        }
+    }
+
+    #[inline(always)]
+    fn cycles(&self) -> u64 {
+        self.emu.clock.cycles
+    }
+
+    #[inline(always)]
+    fn elapsed_ns(&self) -> u64 {
+        self.vclock.ns_at(self.cycles())
+    }
+
+    fn fatal_exception(&self) -> Option<&'static str> {
+        self.emu
+            .cores
+            .iter()
+            .enumerate()
+            .find_map(|(core, state)| fatal_exception_name(core, state.regs.xpsr & 0x1FF))
+    }
+
+    fn refresh_sticky_stop(&mut self) {
+        if self.sticky_stop.is_none()
+            && let Some(exception) = self.fatal_exception()
+        {
+            self.sticky_stop = Some(SessionStop::Exception(exception));
+        }
+    }
+
+    fn stopped(&self) -> Option<&SessionStop> {
+        self.sticky_stop.as_ref()
+    }
+
+    #[inline(always)]
+    fn drain_uart(&mut self) {
+        self.uart_bytes
+            .extend_from_slice(&self.emu.drain_uart0_tx_log());
+    }
+
+    fn poll_scenario(&mut self, engine: &mut scenario::Engine) {
+        self.drain_uart();
+        engine.poll(&scenario::Observation {
+            now_ns: self.elapsed_ns(),
+            cycles: self.cycles(),
+            lcd: self.board.lcd.as_deref(),
+            keyboard: self.board.keyboard.as_deref(),
+            uart: &self.uart_bytes,
+        });
+    }
+
+    /// Execute one scheduler dispatch without crossing a proven idle
+    /// external boundary. Returns `(cycles_consumed, clock_rate_changed)`.
+    #[inline(always)]
+    fn advance_once(&mut self, external_event_cycle: u64) -> Result<(u64, bool), String> {
+        let consumed = self.emu.step_until(external_event_cycle).map_err(|error| {
+            let message = error.to_string();
+            self.sticky_stop = Some(SessionStop::Error(message.clone()));
+            message
+        })?;
+        self.dispatches = self.dispatches.saturating_add(1);
+        if self.dispatches.is_multiple_of(UART_DRAIN_INTERVAL) {
+            self.drain_uart();
+        }
+        let rebased = self
+            .vclock
+            .rebase(self.emu.clock.cycles, self.emu.bus.clock_tree.sys_clk_hz);
+        Ok((consumed, rebased))
+    }
+
+    fn mark_clock_stalled(&mut self) {
+        let detail = format!(
+            "clock stalled: core0 {}, core1 {} — no wake source can fire while the master clock is frozen",
+            park_state(&self.emu, 0),
+            park_state(&self.emu, 1)
+        );
+        self.sticky_stop = Some(SessionStop::Error(detail));
+    }
+
+    fn finish(
+        &mut self,
+        stop_reason: StopReason,
+        exception: Option<&'static str>,
+        error: Option<String>,
+    ) -> RunOutcome {
+        self.drain_uart();
+        RunOutcome {
+            stop_reason,
+            cycles: self.cycles(),
+            elapsed_ns: self.elapsed_ns(),
+            pc: self.emu.cores[0].regs.pc(),
+            exception,
+            error,
+            uart_bytes: std::mem::take(&mut self.uart_bytes),
+        }
+    }
 }
 
 fn run_loop(
-    emu: &mut Emulator,
+    machine: &mut MachineSession,
     cycle_limit: u64,
     stop_pc: Option<u32>,
     mut engine: Option<&mut scenario::Engine>,
-    board: &BoardHandles,
 ) -> RunOutcome {
-    let mut uart_bytes: Vec<u8> = Vec::new();
-    let mut steps: u64 = 0;
-
-    let mut vclock = VirtualClock::new(emu.bus.clock_tree.sys_clk_hz);
+    // Keep the established batch hot loop byte-for-byte simple. The
+    // persistent API uses `MachineSession::advance_once`; the scenario client
+    // owns the same session state but retains its historical local dispatch
+    // counter so NEXT-4 does not add protocol bookkeeping to conformance runs.
+    let mut steps = 0u64;
     // Comparing cycles rather than converting to nanoseconds keeps the
     // per-step check to one integer compare; the division only happens
     // at a poll or a clock change.
     let mut next_poll_cycles = match engine.as_deref() {
-        Some(e) => vclock.cycles_at(e.next_poll_ns()),
+        Some(e) => machine.vclock.cycles_at(e.next_poll_ns()),
         None => u64::MAX,
-    };
-
-    let finish = |emu: &mut Emulator,
-                  vclock: &VirtualClock,
-                  uart_bytes: &mut Vec<u8>,
-                  stop_reason: StopReason,
-                  exception: Option<&'static str>,
-                  error: Option<String>| {
-        uart_bytes.extend_from_slice(&emu.drain_uart0_tx_log());
-        RunOutcome {
-            stop_reason,
-            cycles: emu.clock.cycles,
-            elapsed_ns: vclock.ns_at(emu.clock.cycles),
-            pc: emu.cores[0].regs.pc(),
-            exception,
-            error,
-            uart_bytes: std::mem::take(uart_bytes),
-        }
     };
 
     loop {
@@ -1081,19 +1233,12 @@ fn run_loop(
         // `--stop-pc` equal to the reset vector matches immediately, and
         // that a scenario's first step sees the machine at reset.
         if let Some(e) = engine.as_deref_mut()
-            && emu.clock.cycles >= next_poll_cycles
+            && machine.cycles() >= next_poll_cycles
         {
             // The engine may test the UART stream, so it must see every
             // byte sent so far — not just those the periodic drain has
             // collected.
-            uart_bytes.extend_from_slice(&emu.drain_uart0_tx_log());
-            e.poll(&scenario::Observation {
-                now_ns: vclock.ns_at(emu.clock.cycles),
-                cycles: emu.clock.cycles,
-                lcd: board.lcd.as_deref(),
-                keyboard: board.keyboard.as_deref(),
-                uart: &uart_bytes,
-            });
+            machine.poll_scenario(e);
             #[cfg(feature = "behavior-trace")]
             {
                 // The scenario file digest identifies the complete input
@@ -1103,73 +1248,39 @@ fn run_loop(
                 payload.extend_from_slice(&(e.results().len() as u64).to_be_bytes());
                 payload.push(u8::from(e.is_done()));
                 payload.extend_from_slice(&e.next_poll_ns().to_be_bytes());
-                payload.extend_from_slice(&(uart_bytes.len() as u64).to_be_bytes());
-                emu.record_behavior_event(BehaviorEventDomain::ScenarioInput, 1, &payload);
+                payload.extend_from_slice(&(machine.uart_bytes.len() as u64).to_be_bytes());
+                machine
+                    .emu
+                    .record_behavior_event(BehaviorEventDomain::ScenarioInput, 1, &payload);
             }
             if e.is_done() {
-                return finish(
-                    emu,
-                    &vclock,
-                    &mut uart_bytes,
-                    StopReason::ScenarioDone,
-                    None,
-                    None,
-                );
+                return machine.finish(StopReason::ScenarioDone, None, None);
             }
-            next_poll_cycles = vclock.cycles_at(e.next_poll_ns());
+            next_poll_cycles = machine.vclock.cycles_at(e.next_poll_ns());
             // A poll that changed nothing would otherwise re-fire every
             // step until virtual time moved on.
-            next_poll_cycles = next_poll_cycles.max(emu.clock.cycles + 1);
+            next_poll_cycles = next_poll_cycles.max(machine.cycles() + 1);
         }
 
         if let Some(target) = stop_pc
-            && emu.cores[0].regs.pc() == target
+            && machine.emu.cores[0].regs.pc() == target
         {
-            return finish(
-                emu,
-                &vclock,
-                &mut uart_bytes,
-                StopReason::PcMatch,
-                None,
-                None,
-            );
+            return machine.finish(StopReason::PcMatch, None, None);
         }
-        for (core, state) in emu.cores.iter().enumerate() {
+        for (core, state) in machine.emu.cores.iter().enumerate() {
             if let Some(name) = fatal_exception_name(core, state.regs.xpsr & 0x1FF) {
-                return finish(
-                    emu,
-                    &vclock,
-                    &mut uart_bytes,
-                    StopReason::Exception,
-                    Some(name),
-                    None,
-                );
+                return machine.finish(StopReason::Exception, Some(name), None);
             }
         }
-        if emu.clock.cycles >= cycle_limit {
-            return finish(
-                emu,
-                &vclock,
-                &mut uart_bytes,
-                StopReason::CycleLimit,
-                None,
-                None,
-            );
+        if machine.cycles() >= cycle_limit {
+            return machine.finish(StopReason::CycleLimit, None, None);
         }
 
         let external_event_cycle = next_poll_cycles.min(cycle_limit);
-        let consumed = match emu.step_until(external_event_cycle) {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = e.to_string();
-                return finish(
-                    emu,
-                    &vclock,
-                    &mut uart_bytes,
-                    StopReason::Error,
-                    None,
-                    Some(msg),
-                );
+        let consumed = match machine.emu.step_until(external_event_cycle) {
+            Ok(consumed) => consumed,
+            Err(error) => {
+                return machine.finish(StopReason::Error, None, Some(error.to_string()));
             }
         };
         steps += 1;
@@ -1184,21 +1295,14 @@ fn run_loop(
             let detail = format!(
                 "clock stalled: core0 {}, core1 {} — no wake source can fire \
                  while the master clock is frozen",
-                park_state(emu, 0),
-                park_state(emu, 1)
+                park_state(&machine.emu, 0),
+                park_state(&machine.emu, 1)
             );
-            return finish(
-                emu,
-                &vclock,
-                &mut uart_bytes,
-                StopReason::Error,
-                None,
-                Some(detail),
-            );
+            return machine.finish(StopReason::Error, None, Some(detail));
         }
 
         if steps.is_multiple_of(UART_DRAIN_INTERVAL) {
-            uart_bytes.extend_from_slice(&emu.drain_uart0_tx_log());
+            machine.drain_uart();
         }
 
         // Firmware reprograms the clock tree during init; from here on,
@@ -1206,12 +1310,928 @@ fn run_loop(
         // mean. The pending poll deadline is expressed in nanoseconds, so
         // it moves with the rebase rather than being stranded at the old
         // rate.
-        if vclock.rebase(emu.clock.cycles, emu.bus.clock_tree.sys_clk_hz)
-            && let Some(e) = engine.as_deref()
+        if machine.vclock.rebase(
+            machine.emu.clock.cycles,
+            machine.emu.bus.clock_tree.sys_clk_hz,
+        ) && let Some(e) = engine.as_deref()
         {
-            next_poll_cycles = vclock.cycles_at(e.next_poll_ns()).max(emu.clock.cycles + 1);
+            next_poll_cycles = machine
+                .vclock
+                .cycles_at(e.next_poll_ns())
+                .max(machine.cycles() + 1);
         }
     }
+}
+
+const MACHINE_MAX_DISPATCHES: u64 = 1_000_000;
+const MACHINE_MAX_CYCLES: u64 = 100_000_000_000;
+const MACHINE_MAX_REQUEST_BYTES: usize = 1_048_576;
+const MACHINE_MAX_EVENT_BYTES: usize = 1_048_576;
+
+#[derive(Default)]
+struct MachineApiState {
+    subscriptions: BTreeSet<String>,
+    next_event_sequence: u64,
+    uart_cursor: usize,
+    framebuffer_sha: Option<String>,
+    stop_seen: bool,
+}
+
+fn protocol_error(
+    code: machine_protocol::ErrorCode,
+    message: impl Into<String>,
+) -> machine_protocol::ProtocolError {
+    machine_protocol::ProtocolError::new(code, message)
+}
+
+fn invalid_request(message: impl Into<String>) -> machine_protocol::ProtocolError {
+    protocol_error(machine_protocol::ErrorCode::InvalidRequest, message)
+}
+
+fn request_object(
+    request: &serde_json::Value,
+) -> Result<&serde_json::Map<String, serde_json::Value>, machine_protocol::ProtocolError> {
+    request
+        .as_object()
+        .ok_or_else(|| invalid_request("request root must be an object"))
+}
+
+fn required_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    min: u64,
+    max: u64,
+) -> Result<u64, machine_protocol::ProtocolError> {
+    let value = object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            invalid_request(format!("field '{field}' must be a non-negative integer"))
+        })?;
+    if !(min..=max).contains(&value) {
+        return Err(invalid_request(format!(
+            "field '{field}' must be in {min}..={max}"
+        )));
+    }
+    Ok(value)
+}
+
+fn string_array(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Vec<String>, machine_protocol::ProtocolError> {
+    let values = object
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid_request(format!("field '{field}' must be an array")))?;
+    if values.is_empty() {
+        return Err(invalid_request(format!(
+            "field '{field}' must not be empty"
+        )));
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                invalid_request(format!("field '{field}[{index}]' must be a string"))
+            })
+        })
+        .collect()
+}
+
+fn session_stop_json(stop: Option<&SessionStop>) -> serde_json::Value {
+    match stop {
+        None => serde_json::Value::Null,
+        Some(SessionStop::Exception(exception)) => serde_json::json!({
+            "reason": "exception",
+            "exception": exception,
+        }),
+        Some(SessionStop::Error(error)) => serde_json::json!({
+            "reason": "error",
+            "error": error,
+        }),
+    }
+}
+
+fn framebuffer_json(
+    machine: &MachineSession,
+) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
+    let lcd = machine.board.lcd.as_ref().ok_or_else(|| {
+        protocol_error(
+            machine_protocol::ErrorCode::UnsupportedObservation,
+            "framebuffer observation requires --board picocalc",
+        )
+    })?;
+    let framebuffer = lcd
+        .lock()
+        .map_err(|_| {
+            protocol_error(
+                machine_protocol::ErrorCode::ModelError,
+                "LCD mutex poisoned",
+            )
+        })?
+        .framebuffer();
+    Ok(serde_json::json!({
+        "width": framebuffer.width,
+        "height": framebuffer.height,
+        "rgb565_sha256": framebuffer.rgb565_sha256(),
+        "non_black_pixels": framebuffer.non_black_pixels(),
+    }))
+}
+
+fn observe_domain(
+    machine: &mut MachineSession,
+    domain: &str,
+) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
+    match domain {
+        "machine" => {
+            machine.refresh_sticky_stop();
+            Ok(serde_json::json!({
+                "cycle": machine.cycles(),
+                "virtual_ns": machine.elapsed_ns(),
+                "core0": {
+                    "pc": machine.emu.cores[0].regs.pc(),
+                    "park": park_state(&machine.emu, 0),
+                },
+                "core1": {
+                    "pc": machine.emu.cores[1].regs.pc(),
+                    "park": park_state(&machine.emu, 1),
+                },
+                "stop": session_stop_json(machine.stopped()),
+            }))
+        }
+        "uart" => {
+            machine.drain_uart();
+            Ok(serde_json::json!({
+                "bytes": machine.uart_bytes.len(),
+                "sha256": sha256_hex(&machine.uart_bytes),
+                "text": String::from_utf8_lossy(&machine.uart_bytes),
+            }))
+        }
+        "framebuffer" => framebuffer_json(machine),
+        "keyboard" => {
+            let keyboard = machine.board.keyboard.as_ref().ok_or_else(|| {
+                protocol_error(
+                    machine_protocol::ErrorCode::UnsupportedObservation,
+                    "keyboard observation requires --keyboard",
+                )
+            })?;
+            let keyboard = keyboard.lock().map_err(|_| {
+                protocol_error(
+                    machine_protocol::ErrorCode::ModelError,
+                    "keyboard mutex poisoned",
+                )
+            })?;
+            Ok(serde_json::json!({
+                "queued": keyboard.queued(),
+                "delivered": keyboard.key_events_delivered,
+                "dropped": keyboard.key_events_dropped,
+                "overwritten": keyboard.key_events_overwritten,
+                "caps_lock": keyboard.caps_lock,
+                "num_lock": keyboard.num_lock,
+            }))
+        }
+        "sd" => {
+            let card = machine.board.sd.as_ref().ok_or_else(|| {
+                protocol_error(
+                    machine_protocol::ErrorCode::UnsupportedObservation,
+                    "SD observation requires --sd",
+                )
+            })?;
+            let card = card.lock().map_err(|_| {
+                protocol_error(machine_protocol::ErrorCode::ModelError, "SD mutex poisoned")
+            })?;
+            Ok(serde_json::json!({
+                "format": card.format().as_str(),
+                "commands_seen": card.commands_seen,
+                "blocks_read": card.blocks_read,
+                "blocks_written": card.blocks_written,
+                "unknown_commands": card.unknown_commands,
+            }))
+        }
+        "unsupported_mmio" => Ok(serde_json::json!({
+            "entries": machine.emu.bus.unsupported_mmio_log(),
+            "truncated": machine.emu.bus.unsupported_mmio_log_truncated(),
+        })),
+        other => Err(protocol_error(
+            machine_protocol::ErrorCode::UnsupportedObservation,
+            format!("unknown observation domain '{other}'"),
+        )),
+    }
+}
+
+fn run_machine_budget(
+    machine: &mut MachineSession,
+    max_cycles: u64,
+) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
+    machine.refresh_sticky_stop();
+    if machine.stopped().is_some() {
+        return Err(protocol_error(
+            machine_protocol::ErrorCode::MachineStopped,
+            "machine is already stopped",
+        ));
+    }
+    let start = machine.cycles();
+    let target = start
+        .checked_add(max_cycles)
+        .ok_or_else(|| invalid_request("max_cycles overflows the master-cycle counter"))?;
+    let reason = loop {
+        machine.refresh_sticky_stop();
+        if machine.stopped().is_some() {
+            break "stopped";
+        }
+        if machine.cycles() >= target {
+            break "cycle_budget";
+        }
+        match machine.advance_once(target) {
+            Ok((0, _)) => {
+                machine.mark_clock_stalled();
+                break "stopped";
+            }
+            Ok(_) => {}
+            Err(_) if machine.stopped().is_some() => break "stopped",
+            Err(error) => {
+                return Err(protocol_error(
+                    machine_protocol::ErrorCode::ModelError,
+                    error,
+                ));
+            }
+        }
+    };
+    machine.drain_uart();
+    Ok(serde_json::json!({
+        "reason": reason,
+        "advanced_cycles": machine.cycles().saturating_sub(start),
+        "stop": session_stop_json(machine.stopped()),
+    }))
+}
+
+fn condition_holds(
+    machine: &mut MachineSession,
+    condition: &serde_json::Value,
+) -> Result<bool, machine_protocol::ProtocolError> {
+    let object = condition
+        .as_object()
+        .ok_or_else(|| invalid_request("field 'condition' must be an object"))?;
+    let kind = object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_request("field 'condition.kind' must be a string"))?;
+    let allowed: &[&str] = match kind {
+        "pc_equals" | "cycle_at_least" => &["kind", "value"],
+        "uart_contains" => &["kind", "text"],
+        "pixel_equals" => &["kind", "x", "y", "value"],
+        "region_hash_equals" => &["kind", "x", "y", "w", "h", "sha256"],
+        other => {
+            return Err(invalid_request(format!("unknown condition kind '{other}'")));
+        }
+    };
+    let mut unknown = object
+        .keys()
+        .filter(|field| !allowed.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown.sort();
+    if !unknown.is_empty() {
+        return Err(invalid_request(format!(
+            "condition contains unknown field(s): {}",
+            unknown.join(", ")
+        )));
+    }
+    let number = |field: &str| -> Result<u64, machine_protocol::ProtocolError> {
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                invalid_request(format!(
+                    "field 'condition.{field}' must be a non-negative integer"
+                ))
+            })
+    };
+    match kind {
+        "pc_equals" => {
+            let pc = u32::try_from(number("value")?)
+                .map_err(|_| invalid_request("field 'condition.value' does not fit in u32"))?;
+            Ok(machine.emu.cores[0].regs.pc() == pc)
+        }
+        "cycle_at_least" => Ok(machine.cycles() >= number("value")?),
+        "uart_contains" => {
+            let text = object
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| {
+                    invalid_request("field 'condition.text' must be a non-empty string")
+                })?;
+            machine.drain_uart();
+            Ok(machine
+                .uart_bytes
+                .windows(text.len())
+                .any(|window| window == text.as_bytes()))
+        }
+        "pixel_equals" => {
+            let x = usize::try_from(number("x")?)
+                .map_err(|_| invalid_request("condition.x is too large"))?;
+            let y = usize::try_from(number("y")?)
+                .map_err(|_| invalid_request("condition.y is too large"))?;
+            let value = u16::try_from(number("value")?)
+                .map_err(|_| invalid_request("condition.value does not fit in RGB565"))?;
+            let lcd = machine.board.lcd.as_ref().ok_or_else(|| {
+                protocol_error(
+                    machine_protocol::ErrorCode::UnsupportedObservation,
+                    "pixel condition requires --board picocalc",
+                )
+            })?;
+            let lcd = lcd.lock().map_err(|_| {
+                protocol_error(
+                    machine_protocol::ErrorCode::ModelError,
+                    "LCD mutex poisoned",
+                )
+            })?;
+            let pixel = lcd
+                .gram_pixel(x, y)
+                .ok_or_else(|| invalid_request("pixel coordinate is outside the framebuffer"))?;
+            Ok(pixel == value)
+        }
+        "region_hash_equals" => {
+            let x = usize::try_from(number("x")?)
+                .map_err(|_| invalid_request("condition.x is too large"))?;
+            let y = usize::try_from(number("y")?)
+                .map_err(|_| invalid_request("condition.y is too large"))?;
+            let w = usize::try_from(number("w")?)
+                .map_err(|_| invalid_request("condition.w is too large"))?;
+            let h = usize::try_from(number("h")?)
+                .map_err(|_| invalid_request("condition.h is too large"))?;
+            if w == 0 || h == 0 {
+                return Err(invalid_request(
+                    "condition region dimensions must be non-zero",
+                ));
+            }
+            let expected = object
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| {
+                    invalid_request("field 'condition.sha256' must be 64 hexadecimal characters")
+                })?;
+            let lcd = machine.board.lcd.as_ref().ok_or_else(|| {
+                protocol_error(
+                    machine_protocol::ErrorCode::UnsupportedObservation,
+                    "region condition requires --board picocalc",
+                )
+            })?;
+            let lcd = lcd.lock().map_err(|_| {
+                protocol_error(
+                    machine_protocol::ErrorCode::ModelError,
+                    "LCD mutex poisoned",
+                )
+            })?;
+            let framebuffer = lcd.framebuffer();
+            if x.checked_add(w)
+                .is_none_or(|right| right > framebuffer.width)
+                || y.checked_add(h)
+                    .is_none_or(|bottom| bottom > framebuffer.height)
+            {
+                return Err(invalid_request(
+                    "condition region is outside the framebuffer",
+                ));
+            }
+            let mut bytes = Vec::with_capacity(w.saturating_mul(h).saturating_mul(2));
+            for row in y..y + h {
+                for column in x..x + w {
+                    bytes
+                        .extend_from_slice(&lcd.gram_pixel(column, row).unwrap_or(0).to_le_bytes());
+                }
+            }
+            Ok(sha256_hex(&bytes).eq_ignore_ascii_case(expected))
+        }
+        _ => unreachable!("condition kind was validated above"),
+    }
+}
+
+fn run_machine_until(
+    machine: &mut MachineSession,
+    condition: &serde_json::Value,
+    max_cycles: u64,
+    poll_cycles: u64,
+) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
+    machine.refresh_sticky_stop();
+    if machine.stopped().is_some() {
+        return Err(protocol_error(
+            machine_protocol::ErrorCode::MachineStopped,
+            "machine is already stopped",
+        ));
+    }
+    let start = machine.cycles();
+    let target = start
+        .checked_add(max_cycles)
+        .ok_or_else(|| invalid_request("max_cycles overflows the master-cycle counter"))?;
+    let mut next_poll = start;
+    let reason = loop {
+        machine.refresh_sticky_stop();
+        if machine.stopped().is_some() {
+            break "stopped";
+        }
+        if machine.cycles() >= next_poll {
+            if condition_holds(machine, condition)? {
+                break "condition";
+            }
+            next_poll = machine.cycles().saturating_add(poll_cycles).min(target);
+        }
+        if machine.cycles() >= target {
+            break "cycle_budget";
+        }
+        let boundary = next_poll.min(target);
+        match machine.advance_once(boundary) {
+            Ok((0, _)) => {
+                machine.mark_clock_stalled();
+                break "stopped";
+            }
+            Ok(_) => {}
+            Err(_) if machine.stopped().is_some() => break "stopped",
+            Err(error) => {
+                return Err(protocol_error(
+                    machine_protocol::ErrorCode::ModelError,
+                    error,
+                ));
+            }
+        }
+    };
+    machine.drain_uart();
+    Ok(serde_json::json!({
+        "reason": reason,
+        "condition_met": reason == "condition",
+        "advanced_cycles": machine.cycles().saturating_sub(start),
+        "stop": session_stop_json(machine.stopped()),
+    }))
+}
+
+fn inject_input(
+    machine: &mut MachineSession,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
+    machine.refresh_sticky_stop();
+    if machine.stopped().is_some() {
+        return Err(protocol_error(
+            machine_protocol::ErrorCode::MachineStopped,
+            "machine is already stopped",
+        ));
+    }
+    let object = request_object(request)?;
+    let has_text = object.contains_key("text");
+    let has_events = object.contains_key("events");
+    if has_text == has_events {
+        return Err(invalid_request(
+            "input requires exactly one of 'text' or 'events'",
+        ));
+    }
+    let keyboard = machine.board.keyboard.as_ref().ok_or_else(|| {
+        protocol_error(
+            machine_protocol::ErrorCode::UnsupportedObservation,
+            "input requires --keyboard",
+        )
+    })?;
+    let mut parsed = Vec::new();
+    if let Some(text) = object.get("text") {
+        let text = text
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| invalid_request("field 'text' must be a non-empty string"))?;
+        for character in text.chars() {
+            let code = u8::try_from(character as u32).map_err(|_| {
+                invalid_request(format!("character {character:?} is not an 8-bit key code"))
+            })?;
+            parsed.push(KeyEvent::pressed(code));
+            parsed.push(KeyEvent::released(code));
+        }
+    } else {
+        let events = object
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .filter(|events| !events.is_empty())
+            .ok_or_else(|| invalid_request("field 'events' must be a non-empty array"))?;
+        for (index, event) in events.iter().enumerate() {
+            let event = event.as_object().ok_or_else(|| {
+                invalid_request(format!("field 'events[{index}]' must be an object"))
+            })?;
+            if event
+                .keys()
+                .any(|field| field != "state" && field != "code")
+            {
+                return Err(invalid_request(format!(
+                    "field 'events[{index}]' contains an unknown field"
+                )));
+            }
+            let state = match event.get("state").and_then(serde_json::Value::as_str) {
+                Some("pressed") => KeyState::Pressed,
+                Some("held") => KeyState::Held,
+                Some("released") => KeyState::Released,
+                _ => {
+                    return Err(invalid_request(format!(
+                        "field 'events[{index}].state' must be pressed, held, or released"
+                    )));
+                }
+            };
+            let code = event
+                .get("code")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| {
+                    invalid_request(format!("field 'events[{index}].code' must be in 0..=255"))
+                })?;
+            parsed.push(KeyEvent { state, code });
+        }
+    }
+    let mut keyboard = keyboard.lock().map_err(|_| {
+        protocol_error(
+            machine_protocol::ErrorCode::ModelError,
+            "keyboard mutex poisoned",
+        )
+    })?;
+    let dropped_before = keyboard.key_events_dropped;
+    for event in &parsed {
+        keyboard.push_event(*event);
+    }
+    let dropped = keyboard.key_events_dropped.saturating_sub(dropped_before);
+    Ok(serde_json::json!({
+        "status": if dropped == 0 { "accepted" } else { "dropped" },
+        "events": parsed.len(),
+        "dropped": dropped,
+        "queued": keyboard.queued(),
+    }))
+}
+
+fn snapshot_machine(
+    machine: &MachineSession,
+    request: &serde_json::Value,
+    snapshot_dir: &Path,
+) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
+    let object = request_object(request)?;
+    let lcd = machine.board.lcd.as_ref().ok_or_else(|| {
+        protocol_error(
+            machine_protocol::ErrorCode::UnsupportedObservation,
+            "snapshot requires --board picocalc",
+        )
+    })?;
+    let framebuffer = lcd
+        .lock()
+        .map_err(|_| {
+            protocol_error(
+                machine_protocol::ErrorCode::ModelError,
+                "LCD mutex poisoned",
+            )
+        })?
+        .framebuffer();
+    let png = object
+        .get("png")
+        .map(|value| {
+            let name = value
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| invalid_request("field 'png' must be a non-empty basename"))?;
+            let path = Path::new(name);
+            if path.is_absolute()
+                || path.components().count() != 1
+                || path.file_name().and_then(|value| value.to_str()) != Some(name)
+            {
+                return Err(invalid_request(
+                    "field 'png' must be a basename without path separators or '..'",
+                ));
+            }
+            let output = snapshot_dir.join(path);
+            framebuffer.write_png(&output).map_err(|error| {
+                protocol_error(
+                    machine_protocol::ErrorCode::ModelError,
+                    format!("writing snapshot {name}: {error}"),
+                )
+            })?;
+            Ok::<_, machine_protocol::ProtocolError>(name.to_string())
+        })
+        .transpose()?;
+    Ok(serde_json::json!({
+        "width": framebuffer.width,
+        "height": framebuffer.height,
+        "rgb565_sha256": framebuffer.rgb565_sha256(),
+        "non_black_pixels": framebuffer.non_black_pixels(),
+        "png": png,
+    }))
+}
+
+fn collect_subscription_events(
+    machine: &mut MachineSession,
+    state: &mut MachineApiState,
+) -> Result<Vec<serde_json::Value>, machine_protocol::ProtocolError> {
+    let mut events = Vec::new();
+    for topic in state.subscriptions.clone() {
+        let data = match topic.as_str() {
+            "uart" => {
+                machine.drain_uart();
+                let bytes = &machine.uart_bytes[state.uart_cursor..];
+                if bytes.len() > MACHINE_MAX_EVENT_BYTES {
+                    return Err(protocol_error(
+                        machine_protocol::ErrorCode::EventOverflow,
+                        format!(
+                            "UART event contains {} bytes, limit is {MACHINE_MAX_EVENT_BYTES}",
+                            bytes.len()
+                        ),
+                    ));
+                }
+                if bytes.is_empty() {
+                    continue;
+                }
+                let offset = state.uart_cursor;
+                state.uart_cursor = machine.uart_bytes.len();
+                serde_json::json!({
+                    "offset": offset,
+                    "bytes": bytes,
+                    "text": String::from_utf8_lossy(bytes),
+                })
+            }
+            "stop" => {
+                machine.refresh_sticky_stop();
+                if machine.stopped().is_none() || state.stop_seen {
+                    continue;
+                }
+                state.stop_seen = true;
+                session_stop_json(machine.stopped())
+            }
+            "framebuffer" => {
+                let current = framebuffer_json(machine)?;
+                let sha = current
+                    .get("rgb565_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("framebuffer result always has sha256")
+                    .to_string();
+                if state.framebuffer_sha.as_deref() == Some(&sha) {
+                    continue;
+                }
+                state.framebuffer_sha = Some(sha);
+                current
+            }
+            _ => unreachable!("subscribe validates every topic"),
+        };
+        let sequence = state.next_event_sequence;
+        state.next_event_sequence = state.next_event_sequence.saturating_add(1);
+        events.push(serde_json::json!({
+            "sequence": sequence,
+            "topic": topic,
+            "cycle": machine.cycles(),
+            "data": data,
+        }));
+    }
+    Ok(events)
+}
+
+fn dispatch_machine_request(
+    machine: &mut MachineSession,
+    state: &mut MachineApiState,
+    request: &serde_json::Value,
+    header: &machine_protocol::RequestHeader,
+    snapshot_dir: &Path,
+) -> Result<(serde_json::Value, bool), machine_protocol::ProtocolError> {
+    let object = request_object(request)?;
+    match header.op.as_str() {
+        "run" => {
+            machine_protocol::reject_unknown_top_level_fields(request, &["max_cycles"])?;
+            let max_cycles = required_u64(object, "max_cycles", 1, MACHINE_MAX_CYCLES)?;
+            Ok((run_machine_budget(machine, max_cycles)?, true))
+        }
+        "step" => {
+            machine_protocol::reject_unknown_top_level_fields(request, &["count"])?;
+            let count = object
+                .get("count")
+                .map(|_| required_u64(object, "count", 1, MACHINE_MAX_DISPATCHES))
+                .transpose()?
+                .unwrap_or(1);
+            machine.refresh_sticky_stop();
+            if machine.stopped().is_some() {
+                return Err(protocol_error(
+                    machine_protocol::ErrorCode::MachineStopped,
+                    "machine is already stopped",
+                ));
+            }
+            let start = machine.cycles();
+            let mut completed = 0;
+            while completed < count {
+                machine.refresh_sticky_stop();
+                if machine.stopped().is_some() {
+                    break;
+                }
+                match machine.advance_once(u64::MAX) {
+                    Ok((0, _)) => {
+                        machine.mark_clock_stalled();
+                        break;
+                    }
+                    Ok(_) => completed += 1,
+                    Err(_) if machine.stopped().is_some() => break,
+                    Err(error) => {
+                        return Err(protocol_error(
+                            machine_protocol::ErrorCode::ModelError,
+                            error,
+                        ));
+                    }
+                }
+            }
+            machine.drain_uart();
+            Ok((
+                serde_json::json!({
+                    "requested_dispatches": count,
+                    "completed_dispatches": completed,
+                    "advanced_cycles": machine.cycles().saturating_sub(start),
+                    "stop": session_stop_json(machine.stopped()),
+                }),
+                true,
+            ))
+        }
+        "run_until" => {
+            machine_protocol::reject_unknown_top_level_fields(
+                request,
+                &["condition", "max_cycles", "poll_cycles"],
+            )?;
+            let condition = object
+                .get("condition")
+                .ok_or_else(|| invalid_request("missing required field 'condition'"))?;
+            let max_cycles = required_u64(object, "max_cycles", 1, MACHINE_MAX_CYCLES)?;
+            let poll_cycles = required_u64(object, "poll_cycles", 1, max_cycles)?;
+            Ok((
+                run_machine_until(machine, condition, max_cycles, poll_cycles)?,
+                true,
+            ))
+        }
+        "input" => {
+            machine_protocol::reject_unknown_top_level_fields(request, &["text", "events"])?;
+            Ok((inject_input(machine, request)?, true))
+        }
+        "observe" => {
+            machine_protocol::reject_unknown_top_level_fields(request, &["domains"])?;
+            let domains = string_array(object, "domains")?;
+            let mut result = serde_json::Map::new();
+            for domain in domains {
+                if result.contains_key(&domain) {
+                    return Err(invalid_request(format!(
+                        "observation domain '{domain}' is duplicated"
+                    )));
+                }
+                result.insert(domain.clone(), observe_domain(machine, &domain)?);
+            }
+            Ok((serde_json::Value::Object(result), false))
+        }
+        "subscribe" => {
+            machine_protocol::reject_unknown_top_level_fields(request, &["domains"])?;
+            let domains = string_array(object, "domains")?;
+            let mut subscriptions = BTreeSet::new();
+            for domain in domains {
+                if !matches!(domain.as_str(), "uart" | "stop" | "framebuffer") {
+                    return Err(protocol_error(
+                        machine_protocol::ErrorCode::UnsupportedObservation,
+                        format!("unsupported subscription topic '{domain}'"),
+                    ));
+                }
+                if !subscriptions.insert(domain.clone()) {
+                    return Err(invalid_request(format!(
+                        "subscription topic '{domain}' is duplicated"
+                    )));
+                }
+            }
+            machine.drain_uart();
+            state.uart_cursor = machine.uart_bytes.len();
+            state.stop_seen = machine.stopped().is_some();
+            state.framebuffer_sha = if subscriptions.contains("framebuffer") {
+                Some(
+                    framebuffer_json(machine)?
+                        .get("rgb565_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("framebuffer result always has sha256")
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            state.subscriptions = subscriptions;
+            Ok((
+                serde_json::json!({
+                    "domains": state.subscriptions,
+                    "next_event_sequence": state.next_event_sequence,
+                }),
+                false,
+            ))
+        }
+        "snapshot" => {
+            machine_protocol::reject_unknown_top_level_fields(request, &["png"])?;
+            Ok((snapshot_machine(machine, request, snapshot_dir)?, false))
+        }
+        other => Err(protocol_error(
+            machine_protocol::ErrorCode::UnsupportedOperation,
+            format!("unknown operation '{other}'"),
+        )),
+    }
+}
+
+fn run_machine_api(machine: &mut MachineSession, snapshot_dir: &Path) -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
+    let mut state = MachineApiState::default();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|error| format!("reading machine API stdin: {error}"))?;
+        if line.len() > MACHINE_MAX_REQUEST_BYTES {
+            let error = invalid_request(format!(
+                "request contains {} bytes, limit is {MACHINE_MAX_REQUEST_BYTES}",
+                line.len()
+            ));
+            stdout
+                .write_all(
+                    machine_protocol::error_response_line(None, machine.cycles(), &error)
+                        .as_bytes(),
+                )
+                .map_err(|write| format!("writing machine API response: {write}"))?;
+            stdout
+                .flush()
+                .map_err(|flush| format!("flushing machine API response: {flush}"))?;
+            continue;
+        }
+        let parsed = match machine_protocol::parse_request_line(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                stdout
+                    .write_all(
+                        machine_protocol::error_response_line(None, machine.cycles(), &error)
+                            .as_bytes(),
+                    )
+                    .map_err(|write| format!("writing machine API response: {write}"))?;
+                stdout
+                    .flush()
+                    .map_err(|flush| format!("flushing machine API response: {flush}"))?;
+                continue;
+            }
+        };
+        let correlation = machine_protocol::correlation_id(&parsed);
+        let header = match machine_protocol::parse_request_header(&parsed) {
+            Ok(header) => header,
+            Err(error) => {
+                stdout
+                    .write_all(
+                        machine_protocol::error_response_line(
+                            correlation.as_ref(),
+                            machine.cycles(),
+                            &error,
+                        )
+                        .as_bytes(),
+                    )
+                    .map_err(|write| format!("writing machine API response: {write}"))?;
+                stdout
+                    .flush()
+                    .map_err(|flush| format!("flushing machine API response: {flush}"))?;
+                continue;
+            }
+        };
+        let response =
+            match dispatch_machine_request(machine, &mut state, &parsed, &header, snapshot_dir) {
+                Ok((result, state_changed)) => {
+                    let events = if state_changed {
+                        match collect_subscription_events(machine, &mut state) {
+                            Ok(events) => events,
+                            Err(error) => {
+                                let line = machine_protocol::error_response_line(
+                                    Some(&header.id),
+                                    machine.cycles(),
+                                    &error,
+                                );
+                                stdout.write_all(line.as_bytes()).map_err(|write| {
+                                    format!("writing machine API response: {write}")
+                                })?;
+                                stdout.flush().map_err(|flush| {
+                                    format!("flushing machine API response: {flush}")
+                                })?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    machine_protocol::success_response_line(
+                        &header.id,
+                        machine.cycles(),
+                        result,
+                        events,
+                    )
+                }
+                Err(error) => machine_protocol::error_response_line(
+                    Some(&header.id),
+                    machine.cycles(),
+                    &error,
+                ),
+            };
+        stdout
+            .write_all(response.as_bytes())
+            .map_err(|error| format!("writing machine API response: {error}"))?;
+        stdout
+            .flush()
+            .map_err(|error| format!("flushing machine API response: {error}"))?;
+    }
+    Ok(())
 }
 
 /// JSON string escaping per RFC 8259 §7.
@@ -2683,16 +3703,19 @@ fn run() -> Result<Verdict, String> {
     let handles = BoardHandles {
         lcd: lcd.clone(),
         keyboard: keyboard.clone(),
+        sd: sd_card.clone(),
     };
+    let mut machine = MachineSession::new(emu, handles);
+    if args.machine_api {
+        run_machine_api(&mut machine, &args.snapshot_dir)?;
+        return Ok(Verdict::Pass);
+    }
     let mut engine = scenario.map(|s| scenario::Engine::new(s, args.snapshot_dir.clone()));
 
-    let outcome = run_loop(
-        &mut emu,
-        args.cycles,
-        args.stop_pc,
-        engine.as_mut(),
-        &handles,
-    );
+    let outcome = run_loop(&mut machine, args.cycles, args.stop_pc, engine.as_mut());
+    // Report generation still consumes the emulator after the shared
+    // session ends. Moving it back out preserves the existing schema bytes.
+    let MachineSession { mut emu, .. } = machine;
 
     #[cfg(feature = "idle-profiler")]
     if let Some(path) = &args.idle_profile {
@@ -2963,15 +3986,18 @@ fn run() -> Result<Verdict, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioSinkReport, BoardHandles, RunOutcome, SdReport, StopReason, Verdict,
-        apply_audio_sink_expectation, fatal_exception_name, json_escape, judge_run, run_loop,
+        AudioSinkReport, BoardHandles, MachineApiState, MachineSession, RunOutcome, SdReport,
+        StopReason, Verdict, apply_audio_sink_expectation, dispatch_machine_request,
+        fatal_exception_name, json_escape, judge_run, run_loop, snapshot_machine,
         validate_backend_identity, validate_sd_selection,
     };
-    use picocalc_board::SdFormat;
+    use picocalc_board::{Keyboard, SdFormat, St7365p};
     use rp2040_emu::AudioSinkSnapshot;
     #[cfg(feature = "idle-profiler")]
     use rp2040_emu::IdleProfileSnapshot;
     use rp2040_emu::{Config, EmulatorBuilder};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     #[cfg(feature = "behavior-trace")]
     use super::behavior_projection;
@@ -3210,7 +4236,8 @@ mod tests {
             .expect("serial emulator build");
         emu.cores[1].regs.xpsr = (emu.cores[1].regs.xpsr & !0x1ff) | 3;
 
-        let run = run_loop(&mut emu, 100, None, None, &BoardHandles::default());
+        let mut machine = MachineSession::new(emu, BoardHandles::default());
+        let run = run_loop(&mut machine, 100, None, None);
 
         assert!(run.stop_reason == StopReason::Exception);
         assert_eq!(run.exception, Some("core1 HardFault"));
@@ -3227,6 +4254,117 @@ mod tests {
         );
         assert!(verdict.status == Verdict::Fail);
         assert_eq!(verdict.reasons, ["exception", "stop_reason_mismatch"]);
+    }
+
+    #[test]
+    fn machine_api_rejects_unknown_fields_before_advancing() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("serial emulator build");
+        let mut machine = MachineSession::new(emu, BoardHandles::default());
+        let request = serde_json::json!({
+            "schema": 1,
+            "id": "r1",
+            "op": "run",
+            "max_cycles": 100,
+            "max_cylces": 100
+        });
+        let header = super::machine_protocol::parse_request_header(&request).unwrap();
+        let mut state = MachineApiState::default();
+        let before = machine.cycles();
+        let error =
+            dispatch_machine_request(&mut machine, &mut state, &request, &header, Path::new("."))
+                .expect_err("unknown field must fail closed");
+        assert_eq!(
+            error.code,
+            super::machine_protocol::ErrorCode::InvalidRequest
+        );
+        assert_eq!(machine.cycles(), before);
+    }
+
+    #[test]
+    fn machine_api_run_is_bounded_and_reports_actual_cycles() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .step_quantum(1)
+            .build()
+            .expect("serial emulator build");
+        let mut machine = MachineSession::new(emu, BoardHandles::default());
+        let request = serde_json::json!({
+            "schema": 1,
+            "id": "bounded",
+            "op": "run",
+            "max_cycles": 1
+        });
+        let header = super::machine_protocol::parse_request_header(&request).unwrap();
+        let (result, changed) = dispatch_machine_request(
+            &mut machine,
+            &mut MachineApiState::default(),
+            &request,
+            &header,
+            Path::new("."),
+        )
+        .expect("bounded run must execute");
+        assert!(changed);
+        assert_eq!(result["reason"], "cycle_budget");
+        assert!(result["advanced_cycles"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn machine_api_input_makes_fifo_drop_explicit() {
+        let keyboard = Arc::new(Mutex::new(Keyboard::picocalc()));
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("serial emulator build");
+        let mut machine = MachineSession::new(
+            emu,
+            BoardHandles {
+                keyboard: Some(keyboard),
+                ..BoardHandles::default()
+            },
+        );
+        let request = serde_json::json!({
+            "schema": 1,
+            "id": 2,
+            "op": "input",
+            "text": "abcdefghijklmnop"
+        });
+        let header = super::machine_protocol::parse_request_header(&request).unwrap();
+        let (result, changed) = dispatch_machine_request(
+            &mut machine,
+            &mut MachineApiState::default(),
+            &request,
+            &header,
+            Path::new("."),
+        )
+        .expect("valid input command");
+        assert!(changed);
+        assert_eq!(result["status"], "dropped");
+        assert_eq!(result["dropped"], 1);
+        assert_eq!(result["queued"], 31);
+    }
+
+    #[test]
+    fn machine_api_snapshot_cannot_escape_its_output_directory() {
+        let lcd = Arc::new(Mutex::new(St7365p::new()));
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("serial emulator build");
+        let machine = MachineSession::new(
+            emu,
+            BoardHandles {
+                lcd: Some(lcd),
+                ..BoardHandles::default()
+            },
+        );
+        for name in ["../escape.png", "/tmp/escape.png", "nested/escape.png"] {
+            let request = serde_json::json!({"png": name});
+            let error = snapshot_machine(&machine, &request, Path::new("safe"))
+                .expect_err("path escape must be rejected");
+            assert_eq!(
+                error.code,
+                super::machine_protocol::ErrorCode::InvalidRequest
+            );
+        }
     }
 
     #[test]

@@ -92,6 +92,25 @@ cargo run --release -p picocalc-harness --bin picocalc-run -- \
   --snapshot-dir /tmp/picocalc-snapshots --json /tmp/picocalc-report.json
 ```
 
+NEXT-4 also exposes the same persistent machine session as a deterministic JSON Lines API.
+Artifact and device options are fixed at process startup; one stdin line produces one stdout line,
+while UART and diagnostics never contaminate stdout. `run` is always bounded and subscriptions are
+pulled at command boundaries rather than delivered by a wall-clock thread:
+
+```bash
+cargo run --release -p picocalc-harness --bin picocalc-run -- \
+  --machine-api --bin /absolute/path/to/picocalc_app.bin \
+  --bootrom "$PWD/roms/rp2040/bootrom-rp2040-b2.bin" \
+  --board picocalc --lcd-variant pio-rgb565 --psram --sd --keyboard \
+  --snapshot-dir /tmp/picocalc-machine-snapshots
+```
+
+The schema-1 operations are `run`, `step`, `run_until`, `input`, `observe`, `subscribe`, and
+`snapshot`. `step` means one scheduler dispatch, not one CPU instruction or one master cycle, and
+returns the actual cycle count. `snapshot` means a framebuffer snapshot, not a restorable emulator
+checkpoint. The normative wire schema and fail-closed rules are documented in
+[`picocalc_emu/docs/NEXT4_HEADLESS_MACHINE_API.md`](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/NEXT4_HEADLESS_MACHINE_API.md).
+
 The command above is authoritative only when its structured report is checked against the
 target's declared expectations. The cross-repository acceptance order, source/toolchain pins,
 and current hardening work are owned by
