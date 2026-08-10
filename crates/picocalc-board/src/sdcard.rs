@@ -20,9 +20,11 @@
 //! Command framing follows the driver's own shape: six bytes (`0x40 |
 //! index`, four argument bytes, CRC), then the card holds MISO high for
 //! a few bytes before answering. R1 is one byte; R3 and R7 add four
-//! trailing bytes. Data blocks arrive after a `0xFE` token and end with
-//! two CRC bytes the model accepts and ignores, because SPI mode leaves
-//! CRC off by default and the driver never turns it on.
+//! trailing bytes. CMD0 and CMD8 command CRCs are checked even while
+//! general SPI-mode CRC is disabled, as required by the SD protocol.
+//! Data blocks arrive after a `0xFE` token and end with two CRC bytes the
+//! model accepts and ignores, because the driver never enables general
+//! CRC checking.
 //!
 //! # What is not modelled
 //!
@@ -81,6 +83,8 @@ impl std::str::FromStr for SdFormat {
 const IDLE: u8 = 0xFF;
 /// R1 bit 0: the card is in idle state (still initialising).
 const R1_IDLE: u8 = 0x01;
+/// R1 bit 3: the received command frame failed its mandatory CRC check.
+const R1_COM_CRC_ERROR: u8 = 0x08;
 /// R1 with no bits set: ready.
 const R1_READY: u8 = 0x00;
 /// Start token for a single block, both directions.
@@ -398,10 +402,9 @@ impl SdCard {
                         taken: taken + 1,
                     };
                 } else {
-                    // Fifth byte is the CRC; SPI mode ignores it unless
-                    // CRC checking was turned on, which this driver
-                    // never does.
-                    self.begin_reply(index);
+                    // CMD0 and CMD8 retain mandatory command-CRC checking
+                    // even while general SPI-mode CRC is disabled.
+                    self.begin_reply(index, byte);
                 }
                 IDLE
             }
@@ -474,14 +477,25 @@ impl SdCard {
         u32::from_be_bytes(self.arg)
     }
 
-    fn begin_reply(&mut self, index: u8) {
+    fn begin_reply(&mut self, index: u8, received_crc: u8) {
         self.commands_seen += 1;
-        let is_app = std::mem::take(&mut self.app_cmd_pending);
         self.reply.clear();
         // The card takes a byte or two to answer; the driver polls for
         // the first byte with bit 7 clear, so one idle byte in front is
         // both realistic and harmless.
         self.reply.push_back(IDLE);
+
+        if matches!(index, 0 | 8) && received_crc != self.command_crc(index) {
+            // A rejected command has no R3/R7 extension and must not
+            // otherwise change card state. In particular, do not consume
+            // a pending APP_CMD prefix for a frame that was never accepted.
+            let state = if self.initialised { R1_READY } else { R1_IDLE };
+            self.reply.push_back(state | R1_COM_CRC_ERROR);
+            self.phase = Phase::Reply;
+            return;
+        }
+
+        let is_app = std::mem::take(&mut self.app_cmd_pending);
 
         if is_app {
             match index {
@@ -551,6 +565,28 @@ impl SdCard {
         self.phase = Phase::Reply;
     }
 
+    /// CRC byte for a command frame: CRC7 over command+argument, shifted
+    /// left with the required end bit set.
+    fn command_crc(&self, index: u8) -> u8 {
+        let mut crc = 0u8;
+        for mut byte in [
+            0x40 | index,
+            self.arg[0],
+            self.arg[1],
+            self.arg[2],
+            self.arg[3],
+        ] {
+            for _ in 0..8 {
+                crc <<= 1;
+                if (byte ^ crc) & 0x80 != 0 {
+                    crc ^= 0x09;
+                }
+                byte <<= 1;
+            }
+        }
+        (crc << 1) | 1
+    }
+
     fn queue_block_read(&mut self, block: u32) {
         let offset = block as usize * BLOCK_SIZE;
         if offset + BLOCK_SIZE > self.blocks.len() {
@@ -587,6 +623,15 @@ mod format_tests {
 
     fn u16_at(bytes: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    #[test]
+    fn mandatory_command_crc_known_vectors_match_sd_protocol() {
+        let mut card = SdCard::new_with_format(64, SdFormat::Fat16);
+        card.arg = [0x00, 0x00, 0x00, 0x00];
+        assert_eq!(card.command_crc(0), 0x95);
+        card.arg = [0x00, 0x00, 0x01, 0xAA];
+        assert_eq!(card.command_crc(8), 0x87);
     }
 
     fn u32_at(bytes: &[u8], offset: usize) -> u32 {

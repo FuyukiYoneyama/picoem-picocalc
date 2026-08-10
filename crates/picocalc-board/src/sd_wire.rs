@@ -72,13 +72,22 @@ mod tests {
 
     /// Send a command frame and collect the reply bytes the driver would
     /// see while polling.
-    fn command(wire: &mut SdCardWire, index: u8, arg: u32) -> Vec<u8> {
+    fn command_with_crc(wire: &mut SdCardWire, index: u8, arg: u32, crc: u8) -> Vec<u8> {
         wire.transfer(0x40 | index as u16, 8);
         for shift in [24, 16, 8, 0] {
             wire.transfer(((arg >> shift) & 0xFF) as u16, 8);
         }
-        wire.transfer(0x95, 8); // CRC, ignored in SPI mode
+        wire.transfer(crc as u16, 8);
         (0..8).map(|_| wire.transfer(0xFF, 8) as u8).collect()
+    }
+
+    fn command(wire: &mut SdCardWire, index: u8, arg: u32) -> Vec<u8> {
+        let crc = match index {
+            0 => 0x95,
+            8 => 0x87,
+            _ => 0x01, // dummy end-bit CRC while general CRC is disabled
+        };
+        command_with_crc(wire, index, arg, crc)
     }
 
     /// First byte with bit 7 clear is the R1 response.
@@ -106,6 +115,29 @@ mod tests {
         assert_eq!(reply[start], 0x01, "R1 idle");
         assert_eq!(reply[start + 3], 0x01, "voltage nibble");
         assert_eq!(reply[start + 4], 0xAA, "check pattern");
+    }
+
+    #[test]
+    fn send_if_cond_rejects_bad_crc_without_r7() {
+        let (mut w, _card) = wire();
+        let reply = command_with_crc(&mut w, 8, 0x0000_01AA, 0x85);
+        let start = reply.iter().position(|b| b & 0x80 == 0).unwrap();
+        assert_eq!(reply[start], 0x09, "idle plus COM_CRC_ERROR");
+        assert!(
+            reply[start + 1..].iter().all(|byte| *byte == 0xFF),
+            "CRC error must not carry an R7 payload: {reply:02x?}"
+        );
+    }
+
+    #[test]
+    fn go_idle_state_rejects_bad_crc_and_accepts_a_retry() {
+        let (mut w, _card) = wire();
+        assert_eq!(
+            r1(&command_with_crc(&mut w, 0, 0, 0x97)),
+            0x09,
+            "idle plus COM_CRC_ERROR"
+        );
+        assert_eq!(r1(&command(&mut w, 0, 0)), 0x01);
     }
 
     #[test]
@@ -187,6 +219,7 @@ mod tests {
     #[test]
     fn releasing_cs_abandons_a_partial_command() {
         let (mut w, _card) = wire();
+        w.observe_pins(0); // select the card before starting the frame
         w.transfer(0x40, 8); // CMD0, then interrupted
         w.observe_pins(1 << SD_PIN_CS);
         w.observe_pins(0);
