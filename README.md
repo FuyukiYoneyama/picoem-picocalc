@@ -109,7 +109,7 @@ The schema-1 operations are `run`, `step`, `run_until`, `input`, `observe`, `sub
 `snapshot`. `step` means one scheduler dispatch, not one CPU instruction or one master cycle, and
 returns the actual cycle count. `snapshot` means a framebuffer snapshot, not a restorable emulator
 checkpoint. The normative wire schema and fail-closed rules are documented in
-[`picocalc_emu/docs/NEXT4_HEADLESS_MACHINE_API.md`](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/NEXT4_HEADLESS_MACHINE_API.md).
+[`picocalc_emu/docs/HEADLESS_MACHINE_API.md`](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/HEADLESS_MACHINE_API.md).
 
 The command above is authoritative only when its structured report is checked against the
 target's declared expectations. The cross-repository acceptance order, source/toolchain pins,
