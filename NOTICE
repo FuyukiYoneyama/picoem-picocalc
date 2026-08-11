@@ -53,16 +53,19 @@ Raspberry Pi RP2350 Bootrom
 Raspberry Pi RP2040 B2 Bootrom
     File:      roms/rp2040/bootrom-rp2040-b2.bin
     Source:    https://github.com/raspberrypi/pico-bootrom-rp2040
-    License:   BSD-3-Clause; local copy in roms/rp2040/bootrom-rp2040-LICENSE.txt
+    License:   Composite image: BSD-3-Clause bootrom sources plus the
+               separately licensed mufplib.S and mufplib-double.S code;
+               texts in roms/rp2040/bootrom-rp2040-LICENSE.txt and
+               roms/rp2040/mufplib-LICENSE.txt
     Copyright: Copyright 2020 (c) 2020 Raspberry Pi (Trading) Ltd.
+               mufplib: Copyright (c) 2020 Mark Owen.
 
-    Note from upstream: the BSD-3-Clause grant covers the whole
-    pico-bootrom-rp2040 repository EXCEPT the files
-    bootrom/mufplib.S and bootrom/mufplib-double.S, which the upstream
-    repository documents as separately licensed. The bootrom binary
-    we redistribute (bootrom-rp2040-b2.bin) is the linked image; the
-    upstream LICENSE file as published is preserved verbatim at
-    roms/rp2040/bootrom-rp2040-LICENSE.txt.
+    Note from upstream: the BSD-3-Clause grant covers the repository
+    EXCEPT bootrom/mufplib.S and bootrom/mufplib-double.S. The bootrom
+    binary we redistribute is the linked image and therefore must carry
+    both the BSD notice and the separate mufplib terms. The upstream BSD
+    text is preserved at roms/rp2040/bootrom-rp2040-LICENSE.txt; the
+    separate mufplib text is preserved at roms/rp2040/mufplib-LICENSE.txt.
 
     Redistribution and use in source and binary forms, with or without
     modification, are permitted provided that the following conditions are met:
