@@ -150,6 +150,56 @@ PicoGUS Firmware (v4.0.0)
     is documented in
     third_party/picogus/picogus-v4.0.0-test_psram-fastpath.md.
 
+OneROM RP2350 firmware fixtures
+    Files:      crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-1541-cpu.bin
+                crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-1541.bin
+                crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-seabios-cpu.bin
+                crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-test-sdrr-0-cpu.bin
+                crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-test-sdrr-0.bin
+                crates/picoem-harness/fixtures/onerom-fire-32-a-rp2350-seabios.bin
+    Source:     https://github.com/piersfinlayson/one-rom
+    License:    MIT; complete text in third_party/onerom/LICENSE-MIT
+    Copyright:  Copyright (c) 2026 Piers Finlayson and contributors.
+
+    These are locally built, fixed RP2350 firmware inputs for the harness,
+    derived from the upstream OneROM software/firmware. The OneROM source
+    tree and hardware files are not redistributed here. SHA-256 values and
+    the limits of the historical source provenance are recorded in
+    crates/picoem-harness/fixtures/README.md.
+
+OneROM PIO differential submodules
+    Files:      crates/epio-sys/third_party/epio/ (git submodule)
+                crates/epio-sys/third_party/apio/ (git submodule)
+                crates/epio-sys/src/c_shim/trace_gen_core.c (includes a
+                small setup function lifted from epio's test helper)
+    Sources:    https://github.com/piersfinlayson/epio
+                https://github.com/piersfinlayson/apio
+    Pinned gitlinks: epio feecc8fe6f8b7bf5a57b6f3b0794ef8ffd834d9b
+                    apio 82ff8528c6c3fe311ebb2259f9b74a2bff41f12a
+    License:    MIT; copies in third_party/epio/LICENSE-MIT and
+                third_party/apio/LICENSE-MIT; the initialized submodules
+                also carry their upstream LICENSE files.
+    Copyright:  Copyright (c) 2026 Piers Finlayson and contributors.
+
+--------------------------------------------------------------------------------
+
+SeaBIOS payload used by OneROM fixtures
+    Files:      crates/picoem-harness/fixtures/sources/seabios-256k.bin
+                crates/picoem-harness/fixtures/onerom-fire-24-a-rp2350-seabios-cpu.bin
+                crates/picoem-harness/fixtures/onerom-fire-32-a-rp2350-seabios.bin
+    Source:     https://github.com/coreboot/seabios
+    License:    GNU Lesser General Public License version 3
+                (LGPL-3.0); complete texts in
+                third_party/seabios/COPYING.LESSER and
+                third_party/seabios/COPYING.
+    Copyright:  The SeaBIOS/coreboot authors and contributors.
+
+    The first file is the SeaBIOS payload. The latter two are generated
+    OneROM carrier images containing that payload. The carrier implementation
+    and the SeaBIOS payload retain separate license boundaries; preserve this
+    notice when redistributing the fixtures. No SeaBIOS source tree is
+    included here.
+
 --------------------------------------------------------------------------------
 
 Test fixtures (not third-party redistribution):

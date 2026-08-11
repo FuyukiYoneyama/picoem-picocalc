@@ -3,6 +3,28 @@
 Vendored patches and external artefacts consumed by the mdpicoem
 workspace. Nothing in here is compiled by `cargo build`.
 
+## `seabios/`
+
+License texts for the SeaBIOS binary used by the OneROM harness fixtures.
+The payload itself remains under
+`crates/picoem-harness/fixtures/sources/`; this directory keeps the
+LGPL-3.0/GPL-3.0 license texts and provenance together with the other
+redistributed third-party assets.
+
+## `onerom/`
+
+License and provenance for the OneROM RP2350 firmware images used by the
+OneROM harness fixtures. The upstream OneROM software/firmware is MIT-licensed;
+the fixed binary fixture list and the limits of its historical source
+provenance are recorded in
+[`crates/picoem-harness/fixtures/README.md`](../crates/picoem-harness/fixtures/README.md).
+
+## `epio/` and `apio/`
+
+MIT license copies for the two Piers Finlayson projects consumed as git
+submodules by `crates/epio-sys`. The submodule source trees remain upstream
+gitlinks; a recursive checkout obtains their own source and license files.
+
 ## `dosbox-x-picogus-tap.patch`
 
 ### Purpose

@@ -355,7 +355,7 @@ at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
-This repository redistributes third-party content under their respective licenses — Raspberry Pi RP2350 and RP2040 bootroms (BSD-3-Clause), the PicoGUS firmware (GPL-2.0-or-later), and a vendored fork of probe-rs (MIT OR Apache-2.0). See [NOTICE](NOTICE) for the full list and attribution.
+This repository redistributes third-party content under their respective licenses — Raspberry Pi RP2350 and RP2040 bootroms (BSD-3-Clause), the PicoGUS firmware (GPL-2.0-or-later), OneROM RP2350 firmware fixtures (MIT), the SeaBIOS payload used by OneROM fixtures (LGPL-3.0), the `epio`/`apio` MIT submodules used by the PIO differential helper, and a vendored fork of probe-rs (MIT OR Apache-2.0). See [NOTICE](NOTICE) for the full list and attribution.
 
 ## Trademarks
 
