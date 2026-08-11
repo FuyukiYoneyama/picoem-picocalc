@@ -11,6 +11,10 @@ Public-project guidance is in [`CONTRIBUTING.md`](CONTRIBUTING.md),
 [`SECURITY.md`](SECURITY.md), and [`NOTICE`](NOTICE). The repository does not
 promise a response SLA, and development-probe identifiers remain per-machine
 operator configuration rather than checked-in project data.
+Users should select a GitHub Release and immutable SemVer tag rather than the
+moving `main` branch. The backend/emulator pairing and exact commit policy is
+documented in [`docs/VERSIONING.md`](docs/VERSIONING.md) and the canonical
+[`picocalc_emu` versioning policy](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/VERSIONING.md).
 
 The upstream Git history is intentionally retained. The current tree removes
 operator-specific probe identifiers and paths from public instructions, but
