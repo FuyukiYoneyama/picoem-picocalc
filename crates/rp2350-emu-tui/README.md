@@ -1,10 +1,10 @@
 # rp2350-emu-tui
 
 > **Status:** Personal research project — no maintenance commitments.
-> See the [project repository](https://github.com/0x4D44/picoem).
+> See the [project repository](https://github.com/FuyukiYoneyama/picoem-picocalc).
 
 [![Crates.io](https://img.shields.io/crates/v/rp2350-emu-tui.svg)](https://crates.io/crates/rp2350-emu-tui)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/FuyukiYoneyama/picoem-picocalc)
 
 Interactive terminal UI for the
 [`rp2350-emu`](https://crates.io/crates/rp2350-emu) Raspberry Pi
@@ -23,7 +23,7 @@ cargo install rp2350-emu-tui
 ```
 
 Then point it at a bootrom + firmware image. See the
-[picoem repo](https://github.com/0x4D44/picoem) for ready-to-run
+[picoem repo](https://github.com/FuyukiYoneyama/picoem-picocalc) for ready-to-run
 bootrom and demo firmware (blinky, LCD demo, benchmark stubs).
 
 ## What it shows
@@ -46,7 +46,7 @@ need an interactive RISC-V driver today, use the library API directly.
 
 ## Workspace context
 
-Part of the [picoem](https://github.com/0x4D44/picoem) workspace, which
+Part of the [picoem](https://github.com/FuyukiYoneyama/picoem-picocalc) workspace, which
 also publishes:
 
 - [`rp2350-emu`](https://crates.io/crates/rp2350-emu) — the underlying RP2350 emulator library.

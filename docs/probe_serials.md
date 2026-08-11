@@ -1,25 +1,25 @@
 # Probe serial → DUT mapping
 
-This document records the hard-wired mapping between the Pico debug
-probes attached to the development host and the silicon they connect
-to. The harness binaries that talk to real silicon take a
-`--probe <VID:PID:SERIAL>` argument to disambiguate when more than one
-probe is attached; the table below is the canonical answer to "which
-serial goes where" on this rig.
+This document records how to configure a user's own Pico debug probes.
+Probe serials are deliberately not part of the public source tree: they are
+per-device identifiers for one development rig, not emulator inputs. The
+harness binaries that talk to real silicon take a `--probe <VID:PID:SERIAL>`
+argument to disambiguate when more than one probe is attached.
 
 ## Mapping
 
 | Probe serial | `--probe` argument | DUT |
 |---|---|---|
-| `E46410955F614129` | `2e8a:000c:E46410955F614129` | RP2354 (Pico 2) |
-| `E46410955F3C5C27` | `2e8a:000c:E46410955F3C5C27` | RP2040 (Pico V1) |
+| `<RP2354 probe serial>` | `2e8a:000c:<RP2354 probe serial>` | RP2354 (Pico 2) |
+| `<RP2040 probe serial>` | `2e8a:000c:<RP2040 probe serial>` | RP2040 (Pico V1) |
 
 `2e8a:000c` is the USB VID:PID for the Raspberry Pi debug probe
 (`2e8a` = Raspberry Pi Foundation, `000c` = debug probe). The serial
 suffix is the per-device unique ID burnt into the probe's RP2040.
 
-`probe-rs list` shows the serials of all probes currently attached;
-match against the table above to identify which probe is which.
+`probe-rs list` shows the serials of all probes currently attached. Match the
+target type reported by `probe-rs info` and pass the corresponding selector;
+never copy a serial from another user's machine.
 
 ## Why explicit `--probe` is required on this host
 
@@ -50,6 +50,6 @@ All silicon-touching harness binaries accept `--probe`:
 
 ## If the probes are reassigned
 
-If a probe is moved to a different DUT or replaced, update this file
-in place. The mapping is referenced from `CLAUDE.md` and is the
-single source of truth for the development rig.
+Keep the mapping in your private operator notes. Do not commit per-device
+serials to this public repository. The public harness accepts an explicit
+selector or `auto` when the host has only one compatible probe.

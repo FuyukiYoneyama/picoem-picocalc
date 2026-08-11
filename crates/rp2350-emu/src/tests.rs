@@ -10391,7 +10391,7 @@ fn mtime_stays_zero_at_post_reset_matches_silicon() {
 fn sysinfo_reads_hardcoded_readonly_fields() {
     let (_, mut bus) = core_and_bus();
     // CHIP_ID: live RP2354 silicon value (V12 Stage 3, probe
-    // E46410955F614129). PART=0x0004 (RP2354) occupies bits [14:12]
+    // a physical RP2354 probe). PART=0x0004 (RP2354) occupies bits [14:12]
     // → 0x4 << 12 = 0x4000; MAN=0x927 (Raspberry Pi); REV=0 (masked).
     assert_eq!(
         bus.read32(0x4000_0000, 0),
@@ -10406,7 +10406,7 @@ fn sysinfo_reads_hardcoded_readonly_fields() {
         "SYSINFO.PACKAGE_SEL: RP2350A"
     );
     // PLATFORM: live RP2354 silicon reads 0 (V12 Stage 3, probe
-    // E46410955F614129).
+    // on the reference silicon.
     assert_eq!(
         bus.read32(0x4000_0008, 0),
         0x0000_0000,

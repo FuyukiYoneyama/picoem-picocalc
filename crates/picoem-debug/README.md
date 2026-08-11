@@ -1,14 +1,14 @@
 # picoem-debug
 
 > **Status:** Personal research project — no maintenance commitments.
-> See the [project repository](https://github.com/0x4D44/picoem).
+> See the [project repository](https://github.com/FuyukiYoneyama/picoem-picocalc).
 
 [![Crates.io](https://img.shields.io/crates/v/picoem-debug.svg)](https://crates.io/crates/picoem-debug)
 [![Docs.rs](https://docs.rs/picoem-debug/badge.svg)](https://docs.rs/picoem-debug)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/FuyukiYoneyama/picoem-picocalc)
 
 Placeholder crate for the future GDB RSP server, instruction trace, and
-DWT-driven tooling in the [picoem](https://github.com/0x4D44/picoem)
+DWT-driven tooling in the [picoem](https://github.com/FuyukiYoneyama/picoem-picocalc)
 RP2350 / RP2354 / RP2040 emulator workspace.
 
 **This crate currently has no public API.** It is reserved on crates.io

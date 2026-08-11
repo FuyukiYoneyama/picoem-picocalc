@@ -313,8 +313,10 @@ The only reliable fix is **physical unplug + replug**:
 5. Verify with `probe-rs list` that both serials reappear.
 6. Run a quick attach probe to confirm recovery:
    ```bash
-   probe-rs info --probe 2e8a:000c:E46410955F614129 --chip RP235x | head -5
-   probe-rs info --probe 2e8a:000c:E46410955F3C5C27 --chip RP2040 | head -5
+   export RP2354_PROBE='2e8a:000c:<your RP2354 probe serial>'
+   export RP2040_PROBE='2e8a:000c:<your RP2040 probe serial>'
+   probe-rs info --probe "$RP2354_PROBE" --chip RP235x | head -5
+   probe-rs info --probe "$RP2040_PROBE" --chip RP2040 | head -5
    ```
    The output should start with `Probing target via JTAG/SWD` and
    reach a real chip-info section, not the "Could not determine a

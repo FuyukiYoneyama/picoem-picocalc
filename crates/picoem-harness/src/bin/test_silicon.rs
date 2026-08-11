@@ -1087,11 +1087,11 @@ mod tests {
 
     #[test]
     fn test_parse_args_probe_full_selector() {
-        let a = parse_args(vec!["--probe".into(), "2e8a:000c:E46410955F614129".into()]).unwrap();
+        let a = parse_args(vec!["--probe".into(), "2e8a:000c:TEST-RP2354".into()]).unwrap();
         let sel = a.probe.expect("probe must be Some");
         assert_eq!(sel.vendor_id, 0x2e8a);
         assert_eq!(sel.product_id, 0x000c);
-        assert_eq!(sel.serial_number.as_deref(), Some("E46410955F614129"));
+        assert_eq!(sel.serial_number.as_deref(), Some("TEST-RP2354"));
     }
 
     #[test]

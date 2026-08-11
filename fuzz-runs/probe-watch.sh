@@ -16,8 +16,8 @@ if [ -z "$DEADLINE" ]; then
 fi
 echo "=== probe-watch started $(date -Iseconds), deadline $(date -d @$DEADLINE -Iseconds) ===" >> "$LOG"
 
-RP2354_PROBE="2e8a:000c:E46410955F614129"
-RP2040_PROBE="2e8a:000c:E46410955F3C5C27"
+: "${RP2354_PROBE:?set RP2354_PROBE to your RP2354 probe VID:PID:SERIAL}"
+: "${RP2040_PROBE:?set RP2040_PROBE to your RP2040 probe VID:PID:SERIAL}"
 
 # Track whether each silicon driver is already running so we don't
 # double-launch on a flaky reattach.

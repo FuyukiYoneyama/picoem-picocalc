@@ -1,16 +1,16 @@
 # rp2350-emu
 
 > **Status:** Personal research project — no maintenance commitments.
-> See the [project repository](https://github.com/0x4D44/picoem).
+> See the [project repository](https://github.com/FuyukiYoneyama/picoem-picocalc).
 
 [![Crates.io](https://img.shields.io/crates/v/rp2350-emu.svg)](https://crates.io/crates/rp2350-emu)
 [![Docs.rs](https://docs.rs/rp2350-emu/badge.svg)](https://docs.rs/rp2350-emu)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/FuyukiYoneyama/picoem-picocalc)
 
 A cycle-accurate emulator library for the **Raspberry Pi RP2350 / RP2354**
 (dual Arm Cortex-M33 @ 150 MHz, 520 KB SRAM, FPU, coprocessors, PIO).
 
-`rp2350-emu` is the RP2350-side of the [picoem](https://github.com/0x4D44/picoem)
+`rp2350-emu` is the RP2350-side of the [picoem](https://github.com/FuyukiYoneyama/picoem-picocalc)
 workspace. It boots the real Raspberry Pi bootrom, runs ARMv8-M Mainline
 firmware, and is differentially validated against both QEMU's Cortex-M33 and
 real RP2354 silicon via SWD.
@@ -101,7 +101,7 @@ This crate is part of the `picoem` workspace; the project also publishes:
 
 The full workspace, including TUI applications, the test harness, the
 QEMU + silicon differential oracles, and design documents, lives at
-<https://github.com/0x4D44/picoem>.
+<https://github.com/FuyukiYoneyama/picoem-picocalc>.
 
 ## License
 

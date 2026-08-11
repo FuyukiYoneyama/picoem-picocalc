@@ -22,10 +22,13 @@ See `wrk_docs/2026.04.14 - HLD - mdpicoem Workspace Restructure.md` for the phas
 
 For keyboard-controller behavior, ClockworkPi's official
 [`PicoCalc/Code/picocalc_keyboard`](https://github.com/clockworkpi/PicoCalc/tree/master/Code/picocalc_keyboard)
-STM32F103R8T6 firmware is the primary reference. The local workspace checkout is
-`/home/fuyuki/pico_dvl/codex/PicoCalc/Code/picocalc_keyboard`. RP2040 drivers
+STM32F103R8T6 firmware is the primary reference. Checkout that repository at any
+local path when conformance work needs it. RP2040 drivers
 and applications are consumer evidence. Do not infer controller FIFO, modifier, repeat, register,
 or overflow semantics from a consumer when the official producer source answers the question.
+
+Development-probe serials are per-machine configuration and are intentionally
+not recorded here; see `docs/probe_serials.md` for the public setup procedure.
 
 The SD device is a filesystem-independent block model. Its in-memory test volume is 64 MiB and is
 provisioned as FAT32 by default, matching the filesystem choice rather than the capacity of PicoCalc's

@@ -1,16 +1,16 @@
 # rp2040-emu
 
 > **Status:** Personal research project — no maintenance commitments.
-> See the [project repository](https://github.com/0x4D44/picoem).
+> See the [project repository](https://github.com/FuyukiYoneyama/picoem-picocalc).
 
 [![Crates.io](https://img.shields.io/crates/v/rp2040-emu.svg)](https://crates.io/crates/rp2040-emu)
 [![Docs.rs](https://docs.rs/rp2040-emu/badge.svg)](https://docs.rs/rp2040-emu)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/FuyukiYoneyama/picoem-picocalc)
 
 A cycle-accurate emulator library for the **Raspberry Pi RP2040**
 (dual Arm Cortex-M0+ @ 133 MHz, 264 KB SRAM, PIO).
 
-`rp2040-emu` is the RP2040-side of the [picoem](https://github.com/0x4D44/picoem)
+`rp2040-emu` is the RP2040-side of the [picoem](https://github.com/FuyukiYoneyama/picoem-picocalc)
 workspace. It runs ARMv6-M firmware and is differentially validated
 against both QEMU's `cortex-m0` and real RP2040 silicon via SWD.
 
@@ -94,7 +94,7 @@ This crate is part of the `picoem` workspace; the project also publishes:
 
 The full workspace, including TUI applications, the test harness, the
 QEMU + silicon differential oracles, and design documents, lives at
-<https://github.com/0x4D44/picoem>.
+<https://github.com/FuyukiYoneyama/picoem-picocalc>.
 
 ## License
 

@@ -2,6 +2,20 @@
 
 An independent PicoCalc-oriented derivative of [`0x4D44/picoem`](https://github.com/0x4D44/picoem), retaining the upstream Git history and dual MIT OR Apache-2.0 licensing.
 
+The maintained public distribution is
+[`FuyukiYoneyama/picoem-picocalc`](https://github.com/FuyukiYoneyama/picoem-picocalc).
+Links to `0x4D44/picoem` identify the upstream origin, not this derivative's
+distribution location.
+
+Public-project guidance is in [`CONTRIBUTING.md`](CONTRIBUTING.md),
+[`SECURITY.md`](SECURITY.md), and [`NOTICE`](NOTICE). The repository does not
+promise a response SLA, and development-probe identifiers remain per-machine
+operator configuration rather than checked-in project data.
+
+The upstream Git history is intentionally retained. The current tree removes
+operator-specific probe identifiers and paths from public instructions, but
+historical commits are not rewritten by this release-preparation work.
+
 ## Derivative origin and direction
 
 - **Upstream:** `0x4D44/picoem`
@@ -75,7 +89,7 @@ pixel, and framebuffer-region conditions while firmware is executing.
 The primary reference for keyboard-controller behavior is ClockworkPi's official
 [`PicoCalc/Code/picocalc_keyboard`](https://github.com/clockworkpi/PicoCalc/tree/master/Code/picocalc_keyboard)
 STM32F103R8T6 firmware. In this workspace it is checked out at
-`/home/fuyuki/pico_dvl/codex/PicoCalc/Code/picocalc_keyboard`. R1 conformance is complete: the Rust
+an arbitrary local checkout of that repository. R1 conformance is complete: the Rust
 device pins the consumer-visible `0x01..0x0e` replies, 31-event FIFO, official matrix/button map,
 state and modifier transformations, strict hold/repeat thresholds, both overflow policies,
 backlights, battery, reset, C64, and power-off behavior to that source. It deliberately does not

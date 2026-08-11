@@ -54,10 +54,6 @@ const TARGET_TRANSITIONS: usize = 10;
 const INTER_SAMPLE_SLEEP: Duration = Duration::from_micros(500);
 const HALT_TIMEOUT: Duration = Duration::from_millis(500);
 
-// Default probe selector (CLAUDE.md — "hard-wired probe serial → DUT
-// mapping"): Arthur's RP2354 Pico 2 debug probe.
-const DEFAULT_PROBE: &str = "2e8a:000c:E46410955F614129";
-
 struct Args {
     probe: Option<DebugProbeSelector>,
 }
@@ -66,10 +62,10 @@ use picoem_harness::cli::parse_probe_selector;
 
 fn parse_args() -> Result<Args, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    // Default to the hard-wired RP2354 serial; users override with
-    // `--probe <VID:PID:SERIAL>` or `--probe auto` to fall back to
-    // probe-rs `auto_attach`.
-    let mut probe = Some(parse_probe_selector(DEFAULT_PROBE)?);
+    // Do not assume a particular development probe. Users can provide
+    // `--probe <VID:PID:SERIAL>` when multiple probes are attached, or use
+    // `--probe auto`/the default to let probe-rs auto-attach.
+    let mut probe = None;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -88,7 +84,7 @@ fn parse_args() -> Result<Args, String> {
                 return Err(format!(
                     "unknown argument '{other}'\n\
                      Usage:\n  \
-                     smoke_powman_pacing_rp2350                         Use default RP2354 probe\n  \
+                     smoke_powman_pacing_rp2350                         Use probe-rs auto_attach\n  \
                      smoke_powman_pacing_rp2350 --probe VID:PID:SERIAL  Select a specific probe\n  \
                      smoke_powman_pacing_rp2350 --probe auto            probe-rs auto_attach"
                 ));

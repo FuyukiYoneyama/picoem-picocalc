@@ -1,4 +1,4 @@
-From: mdpicoem PicoGUS Integration <martingdavidson@gmail.com>
+From: mdpicoem PicoGUS Integration <noreply@users.noreply.github.com>
 Date: 2026-04-25
 Subject: [PATCH] gus+adlib: optional CSV tap of GUS and OPL3 port I/O
 

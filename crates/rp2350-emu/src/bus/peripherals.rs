@@ -69,7 +69,7 @@ impl Bus {
     pub(crate) fn sysinfo_read(&self, offset: u32) -> u32 {
         match offset {
             // CHIP_ID: live RP2354 silicon value, measured V12 Stage 3
-            // against probe E46410955F614129 — register reads
+            // against a physical RP2354 probe — register reads
             // 0x0000_4927.
             //
             //   REVISION[31:28]    = 0      (masked by silicon scenario)
@@ -91,7 +91,7 @@ impl Bus {
             // and SDK `SYSINFO_PACKAGE_SEL_RESET = 0x0`.
             0x004 => 0x0000_0000,
             // PLATFORM: live RP2354 silicon reads 0 (V12 Stage 3,
-            // probe E46410955F614129). The pico-sdk header
+            // probe). The pico-sdk header
             // `SYSINFO_PLATFORM_RESET = 0x0` was right all along; V11
             // Stage 1's "ASIC silicon expected to read bit 1" guess
             // was unsourced and silicon disproved it.

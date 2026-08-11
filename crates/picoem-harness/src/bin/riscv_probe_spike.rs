@@ -12,7 +12,7 @@
 //
 // Usage:
 //   riscv_probe_spike
-//   riscv_probe_spike --probe 2e8a:000c:E46410955F614129
+//   riscv_probe_spike --probe <VID:PID:RP2354_PROBE_SERIAL>
 //   riscv_probe_spike --attempt-archsel-flip   # only if RUNBOOK offset is pinned
 
 use picoem_harness::{EMU_TEST_SLOT, EMU_TEST_STACK};
