@@ -17,6 +17,17 @@ fn git(repo: &PathBuf, args: &[&str]) -> Option<String> {
 fn main() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let repo = manifest.join("../..");
+    // The compile-time provenance also includes whether tracked files were
+    // modified. Watch the tracked paths so Cargo reruns this build script when
+    // a source or documentation edit changes that dirty-state value; watching
+    // only .git metadata leaves a stale `backend_build.dirty=false` in the next
+    // binary. The index watcher below also refreshes this list when files are
+    // added or removed from the checkout.
+    if let Some(files) = git(&repo, &["ls-files"]) {
+        for file in files.lines() {
+            println!("cargo:rerun-if-changed={}", repo.join(file).display());
+        }
+    }
     let commit = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let dirty = git(&repo, &["status", "--porcelain", "--untracked-files=no"])
         .is_none_or(|status| !status.is_empty());

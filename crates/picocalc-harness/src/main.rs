@@ -34,6 +34,7 @@ use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{
@@ -245,6 +246,8 @@ struct Args {
     scenario: Option<PathBuf>,
     snapshot_dir: PathBuf,
     machine_api: bool,
+    run_id: Option<String>,
+    progress_interval: Option<u64>,
     expected_stop: Option<StopReason>,
     expected_uart: Vec<String>,
     expected_audio_sink_count: Option<u64>,
@@ -257,6 +260,156 @@ struct Args {
     behavior_trace: Option<PathBuf>,
     #[cfg(feature = "event-horizon-profiler")]
     event_horizon_profile: Option<PathBuf>,
+}
+
+const PROGRESS_CLOCK_CHECK_DISPATCHES: u64 = 256;
+
+fn validate_run_id(run_id: &str) -> Result<(), String> {
+    if run_id.is_empty() {
+        return Err("--run-id must not be empty".to_string());
+    }
+    if run_id.len() > 64 {
+        return Err("--run-id must be at most 64 ASCII characters".to_string());
+    }
+    if !run_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(
+            "--run-id may contain only ASCII letters, digits, '.', '_', ':' and '-'".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_progress_interval(seconds: u64) -> Result<(), String> {
+    if seconds == 0 {
+        return Err("--progress-interval must be >= 1 second".to_string());
+    }
+    if Instant::now()
+        .checked_add(Duration::from_secs(seconds))
+        .is_none()
+    {
+        return Err("--progress-interval is too large for the host monotonic clock".to_string());
+    }
+    Ok(())
+}
+
+/// Best-effort wall-clock progress reporting. This type deliberately lives
+/// outside the report/verdict path: heartbeat output is diagnostic metadata,
+/// never an emulator observation or an acceptance input.
+struct ProgressReporter {
+    run_id: String,
+    pid: u32,
+    interval: Duration,
+    started_at: Instant,
+    next_deadline: Instant,
+    dispatches_since_check: u64,
+    sequence: u64,
+    enabled: bool,
+}
+
+impl ProgressReporter {
+    fn new(run_id: String, interval_seconds: u64) -> Result<Self, String> {
+        validate_progress_interval(interval_seconds)?;
+        let started_at = Instant::now();
+        let interval = Duration::from_secs(interval_seconds);
+        let next_deadline = started_at.checked_add(interval).ok_or_else(|| {
+            "--progress-interval is too large for the host monotonic clock".to_string()
+        })?;
+        Ok(Self {
+            run_id,
+            pid: std::process::id(),
+            interval,
+            started_at,
+            next_deadline,
+            dispatches_since_check: 0,
+            sequence: 0,
+            enabled: true,
+        })
+    }
+
+    fn write_line(&mut self, line: String) {
+        if !self.enabled {
+            return;
+        }
+        let mut stderr = std::io::stderr().lock();
+        if writeln!(stderr, "{line}")
+            .and_then(|_| stderr.flush())
+            .is_err()
+        {
+            // A closed pipe or redirected stderr must not change the
+            // firmware verdict. Stop attempting diagnostics after the first
+            // failure, but leave the run itself untouched.
+            self.enabled = false;
+        }
+    }
+
+    fn start(&mut self, budget: u64) {
+        self.write_line(format!(
+            "[PICOCALC][RUN] event=start run={} pid={} budget={budget}",
+            self.run_id, self.pid
+        ));
+    }
+
+    fn maybe_emit(&mut self, cycles: u64, budget: u64) {
+        if !self.enabled {
+            return;
+        }
+        self.dispatches_since_check = self.dispatches_since_check.saturating_add(1);
+        if self.dispatches_since_check < PROGRESS_CLOCK_CHECK_DISPATCHES {
+            return;
+        }
+        self.dispatches_since_check = 0;
+
+        let now = Instant::now();
+        if now < self.next_deadline {
+            return;
+        }
+
+        self.sequence = self.sequence.saturating_add(1);
+        let elapsed_s = now.duration_since(self.started_at).as_secs_f64();
+        let rate_mcycles_s = if elapsed_s > 0.0 {
+            cycles as f64 / elapsed_s / 1_000_000.0
+        } else {
+            0.0
+        };
+        let pct = if budget > 0 {
+            cycles as f64 * 100.0 / budget as f64
+        } else {
+            0.0
+        };
+        self.write_line(format!(
+            "[PICOCALC][RUN] event=heartbeat run={} pid={} seq={} cycles={} budget={} pct={pct:.3} elapsed_s={elapsed_s:.3} rate_mcycles_s={rate_mcycles_s:.3}",
+            self.run_id, self.pid, self.sequence, cycles, budget
+        ));
+
+        // Do not emit a burst after a long host stall. Advance the deadline
+        // past the current time while retaining the requested cadence.
+        while self.next_deadline <= now {
+            let Some(next_deadline) = self.next_deadline.checked_add(self.interval) else {
+                self.enabled = false;
+                break;
+            };
+            self.next_deadline = next_deadline;
+        }
+    }
+
+    fn finish(&mut self, outcome: &RunOutcome, status: Verdict) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed_s = now.duration_since(self.started_at).as_secs_f64();
+        self.write_line(format!(
+            "[PICOCALC][RUN] event=finish run={} pid={} cycles={} elapsed_s={elapsed_s:.3} stop={} exit={}",
+            self.run_id,
+            self.pid,
+            outcome.cycles,
+            outcome.stop_reason.as_str(),
+            status.exit_code()
+        ));
+    }
 }
 
 /// Parse a `start:len` range, e.g. `0:10000` or `0x100:0x2000` (either
@@ -338,6 +491,8 @@ fn print_usage() {
                                   Default: the current directory.\n\
          --machine-api            NEXT-4 JSON Lines API on stdin/stdout. Uses the same\n\
                                   startup artifact/device options; no scenario/final report.\n\
+         --run-id <ID>            Optional diagnostic ID; requires --progress-interval.\n\
+         --progress-interval <N> Emit stderr heartbeat lines every N seconds (opt-in).\n\
          --expect-stop <reason>   Required stop: cycle_limit, pc_match, or scenario_done.\n\
          --expect-uart <text>     Required UART substring. Repeat for each marker.\n\
          --expect-audio-sink-count <N>\n\
@@ -400,6 +555,8 @@ fn parse_args() -> Result<Args, String> {
     let mut scenario: Option<PathBuf> = None;
     let mut snapshot_dir: Option<PathBuf> = None;
     let mut machine_api = false;
+    let mut run_id: Option<String> = None;
+    let mut progress_interval: Option<u64> = None;
     let mut expected_stop: Option<StopReason> = None;
     let mut expected_uart: Vec<String> = Vec::new();
     let mut expected_audio_sink_count: Option<u64> = None;
@@ -470,6 +627,27 @@ fn parse_args() -> Result<Args, String> {
             "--scenario" => scenario = Some(PathBuf::from(value("--scenario")?)),
             "--snapshot-dir" => snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
             "--machine-api" => machine_api = true,
+            "--run-id" => {
+                if run_id.is_some() {
+                    return Err("--run-id may be specified only once".to_string());
+                }
+                let id = value("--run-id")?;
+                validate_run_id(&id)?;
+                run_id = Some(id);
+            }
+            "--progress-interval" => {
+                if progress_interval.is_some() {
+                    return Err("--progress-interval may be specified only once".to_string());
+                }
+                let raw = value("--progress-interval")?;
+                let interval = raw.parse::<u64>().map_err(|error| {
+                    format!(
+                        "invalid --progress-interval '{raw}' (expected integer seconds): {error}"
+                    )
+                })?;
+                validate_progress_interval(interval)?;
+                progress_interval = Some(interval);
+            }
             "--expect-stop" => {
                 if expected_stop.is_some() {
                     return Err("--expect-stop may be specified only once".to_string());
@@ -583,6 +761,13 @@ fn parse_args() -> Result<Args, String> {
     if (audio_analysis.is_some() || audio_wav.is_some()) && board != Board::PicoCalc {
         return Err("audio analysis and WAV output require --board picocalc".to_string());
     }
+    match (&run_id, progress_interval) {
+        (Some(_), None) => return Err("--run-id requires --progress-interval".to_string()),
+        (None, Some(_)) => {
+            return Err("--progress-interval requires --run-id".to_string());
+        }
+        _ => {}
+    }
     if machine_api {
         let conflicts = [
             (scenario.is_some(), "--scenario"),
@@ -599,6 +784,8 @@ fn parse_args() -> Result<Args, String> {
             (audio_analysis.is_some(), "--audio-analysis"),
             (audio_wav.is_some(), "--audio-wav"),
             (keys.is_some(), "--keys"),
+            (run_id.is_some(), "--run-id"),
+            (progress_interval.is_some(), "--progress-interval"),
         ];
         if let Some((_, name)) = conflicts.into_iter().find(|(present, _)| *present) {
             return Err(format!("--machine-api cannot be combined with {name}"));
@@ -651,6 +838,8 @@ fn parse_args() -> Result<Args, String> {
         scenario,
         snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
         machine_api,
+        run_id,
+        progress_interval,
         expected_stop,
         expected_uart,
         expected_audio_sink_count,
@@ -732,6 +921,14 @@ impl Verdict {
             Verdict::Pass => "pass",
             Verdict::Fail => "fail",
             Verdict::CannotJudge => "cannot_judge",
+        }
+    }
+
+    fn exit_code(self) -> u8 {
+        match self {
+            Verdict::Pass => 0,
+            Verdict::Fail => 1,
+            Verdict::CannotJudge => 2,
         }
     }
 }
@@ -1241,6 +1438,7 @@ fn run_loop(
     cycle_limit: u64,
     stop_pc: Option<u32>,
     mut engine: Option<&mut scenario::Engine>,
+    mut progress: Option<&mut ProgressReporter>,
 ) -> RunOutcome {
     // Keep the established batch hot loop byte-for-byte simple. The
     // persistent API uses `MachineSession::advance_once`; the scenario client
@@ -1330,6 +1528,10 @@ fn run_loop(
 
         if steps.is_multiple_of(UART_DRAIN_INTERVAL) {
             machine.drain_uart();
+        }
+
+        if let Some(reporter) = progress.as_mut() {
+            reporter.maybe_emit(machine.cycles(), cycle_limit);
         }
 
         // Firmware reprograms the clock tree during init; from here on,
@@ -3722,6 +3924,16 @@ fn run() -> Result<Verdict, String> {
         validate_backend_identity(expected, BUILT_BACKEND_COMMIT, built_backend_dirty())?;
     }
 
+    let mut progress = match (args.run_id.clone(), args.progress_interval) {
+        (Some(run_id), Some(interval)) => {
+            let mut reporter = ProgressReporter::new(run_id, interval)?;
+            reporter.start(args.cycles);
+            Some(reporter)
+        }
+        (None, None) => None,
+        _ => unreachable!("parse_args validates heartbeat option pairing"),
+    };
+
     #[cfg(feature = "behavior-trace")]
     let scenario_sha256 = match &args.scenario {
         Some(path) => Some(sha256_hex(&std::fs::read(path).map_err(|e| {
@@ -3843,7 +4055,13 @@ fn run() -> Result<Verdict, String> {
     }
     let mut engine = scenario.map(|s| scenario::Engine::new(s, args.snapshot_dir.clone()));
 
-    let outcome = run_loop(&mut machine, args.cycles, args.stop_pc, engine.as_mut());
+    let outcome = run_loop(
+        &mut machine,
+        args.cycles,
+        args.stop_pc,
+        engine.as_mut(),
+        progress.as_mut(),
+    );
     // Report generation still consumes the emulator after the shared
     // session ends. Moving it back out preserves the existing schema bytes.
     let MachineSession { mut emu, .. } = machine;
@@ -4128,6 +4346,9 @@ fn run() -> Result<Verdict, String> {
             picocalc_board::keyboard::MAX_QUEUED_EVENTS
         );
     }
+    if let Some(reporter) = progress.as_mut() {
+        reporter.finish(&outcome, verdict.status);
+    }
     Ok(verdict.status)
 }
 
@@ -4137,7 +4358,8 @@ mod tests {
         AudioSinkReport, BoardHandles, MachineApiState, MachineSession, RunOutcome, SdReport,
         StopReason, Verdict, apply_audio_sink_expectation, dispatch_machine_request,
         fatal_exception_name, json_escape, judge_run, run_loop, snapshot_machine,
-        validate_backend_identity, validate_sd_selection,
+        validate_backend_identity, validate_progress_interval, validate_run_id,
+        validate_sd_selection,
     };
     use picocalc_board::{Keyboard, SdFormat, St7365p};
     use rp2040_emu::AudioSinkSnapshot;
@@ -4217,6 +4439,35 @@ mod tests {
         assert_eq!(StopReason::PcMatch.as_str(), "pc_match");
         assert_eq!(StopReason::Exception.as_str(), "exception");
         assert_eq!(StopReason::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn run_id_validation_accepts_safe_identifiers() {
+        assert_eq!(validate_run_id("mapper19-case.a_1:ok"), Ok(()));
+        assert_eq!(validate_run_id(&"a".repeat(64)), Ok(()));
+    }
+
+    #[test]
+    fn run_id_validation_rejects_ambiguous_or_injectable_identifiers() {
+        let too_long = "a".repeat(65);
+        for invalid in ["", "has space", "line\nfeed", "日本語"] {
+            assert!(validate_run_id(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert!(validate_run_id(&too_long).is_err());
+    }
+
+    #[test]
+    fn verdict_exit_codes_are_stable() {
+        assert_eq!(Verdict::Pass.exit_code(), 0);
+        assert_eq!(Verdict::Fail.exit_code(), 1);
+        assert_eq!(Verdict::CannotJudge.exit_code(), 2);
+    }
+
+    #[test]
+    fn progress_interval_validation_rejects_zero_and_clock_overflow() {
+        assert!(validate_progress_interval(0).is_err());
+        assert!(validate_progress_interval(1).is_ok());
+        assert!(validate_progress_interval(u64::MAX).is_err());
     }
 
     fn outcome(stop_reason: StopReason, uart: &[u8]) -> RunOutcome {
@@ -4385,7 +4636,7 @@ mod tests {
         emu.cores[1].regs.xpsr = (emu.cores[1].regs.xpsr & !0x1ff) | 3;
 
         let mut machine = MachineSession::new(emu, BoardHandles::default());
-        let run = run_loop(&mut machine, 100, None, None);
+        let run = run_loop(&mut machine, 100, None, None, None);
 
         assert!(run.stop_reason == StopReason::Exception);
         assert_eq!(run.exception, Some("core1 HardFault"));

@@ -110,6 +110,28 @@ cargo run --release -p picocalc-harness --bin picocalc-run -- \
   --snapshot-dir /tmp/picocalc-snapshots --json /tmp/picocalc-report.json
 ```
 
+For long-running firmware sessions, the runner can emit best-effort progress lines to stderr without
+changing the deterministic report or verdict inputs. The two options are deliberately an explicit pair:
+
+```bash
+cargo run --release -p picocalc-harness --bin picocalc-run -- \
+  --run-id run-a --progress-interval 10 \
+  --bin /absolute/path/to/picocalc_app.bin \
+  --bootrom "$PWD/roms/rp2040/bootrom-rp2040-b2.bin" \
+  --board picocalc --lcd-variant pio-rgb565 --psram --sd --keyboard \
+  --scenario /absolute/path/to/scenario.json \
+  --snapshot-dir /tmp/picocalc-runs/run-a/snapshots \
+  --json /tmp/picocalc-runs/run-a/report.json
+```
+
+The normal `picocalc_emu/tools/picocalc.py test --mode firmware` entry point enables a ten-second
+heartbeat by default and supplies `<target>-<wrapper-pid>` when `--run-id` is omitted. Use
+`--no-progress` to disable it. Allocate a distinct output directory for every concurrent run; the
+runner does not create a central run registry or protect shared artifact paths. Heartbeat lines are
+diagnostic stderr only, and `event=finish` carries the runner's authoritative `exit` value (`0=pass`,
+`1=fail`, `2=cannot_judge`). WSL supervisors should check `finish` and the report before trusting an
+outer shell exit code. See the canonical [concurrent-run guidance](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/CONCURRENT_RUNS.md).
+
 For the fixed PicoCalc 48 kHz stereo PWM5_CC path, the runner can also write a separate
 deterministic level-analysis artifact and an optional unnormalised listening WAV:
 
