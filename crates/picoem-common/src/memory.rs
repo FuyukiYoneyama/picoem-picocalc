@@ -193,6 +193,39 @@ impl Memory {
         }
     }
 
+    /// Read a byte from the fixed XIP backing store without bus decoding.
+    /// Used by the SSI flash model when applying a program operation.
+    pub fn xip_byte(&self, offset: usize) -> Option<u8> {
+        self.xip.get(offset).copied()
+    }
+
+    /// Apply the physical NOR-flash transition for one byte. Programming
+    /// can only clear bits (1 -> 0); callers validate range and policy.
+    pub fn xip_program_byte(&mut self, offset: usize, value: u8) -> Option<u8> {
+        let current = *self.xip.get(offset)?;
+        let programmed = current & value;
+        self.xip[offset] = programmed;
+        Some(programmed)
+    }
+
+    /// Erase a range of the XIP backing store to the NOR erased state.
+    /// Returns false when the requested range is outside the fixed window.
+    pub fn xip_erase(&mut self, offset: usize, len: usize) -> bool {
+        let Some(end) = offset.checked_add(len) else {
+            return false;
+        };
+        if end > self.xip.len() {
+            return false;
+        }
+        self.xip[offset..end].fill(0xFF);
+        true
+    }
+
+    /// Snapshot the current XIP image for a diagnostic/export operation.
+    pub fn xip_image(&self) -> Vec<u8> {
+        self.xip.clone()
+    }
+
     // --- Direct access (for test / debug, bypasses bus) ---
 
     pub fn peek8(&self, addr: u32) -> u8 {

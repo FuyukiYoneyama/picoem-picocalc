@@ -35,6 +35,11 @@
 //! exercises those, and a half-modelled busy state would be harder to
 //! reason about than its absence.
 
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
 /// Bytes per block. SDHC addresses in blocks, not bytes.
 pub const BLOCK_SIZE: usize = 512;
 
@@ -79,6 +84,17 @@ impl std::str::FromStr for SdFormat {
     }
 }
 
+/// Stable, path-free metadata for a RAW-backed card. The source path is
+/// intentionally omitted so callers can report provenance without leaking
+/// host-specific absolute paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawMetadata {
+    pub bytes: u64,
+    pub blocks: usize,
+    pub dirty_blocks: usize,
+    pub source_sha256: String,
+}
+
 /// Idle byte. The card leaves MISO high when it has nothing to say.
 const IDLE: u8 = 0xFF;
 /// R1 bit 0: the card is in idle state (still initialising).
@@ -109,9 +125,115 @@ enum Phase {
     DataResponse,
 }
 
+struct RawBacking {
+    file: File,
+    source_path: PathBuf,
+    source_sha256: String,
+    block_count: usize,
+    /// Only sectors written by the emulated card are kept here. The input
+    /// file remains read-only and is never changed by a run.
+    overlay: HashMap<usize, Box<[u8; BLOCK_SIZE]>>,
+}
+
+impl RawBacking {
+    fn open(path: &Path) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SD RAW backing must be a regular file",
+            ));
+        }
+        let length = metadata.len();
+        if length == 0 || length % BLOCK_SIZE as u64 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SD RAW image must be non-empty and a multiple of 512 bytes",
+            ));
+        }
+        let block_count = usize::try_from(length / BLOCK_SIZE as u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SD RAW image is too large for this host",
+            )
+        })?;
+        let source_sha256 = crate::sha256::sha256_reader_hex(&mut file)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            file,
+            source_path: std::fs::canonicalize(path)?,
+            block_count,
+            source_sha256,
+            overlay: HashMap::new(),
+        })
+    }
+
+    fn read_sector(&mut self, block: usize) -> io::Result<[u8; BLOCK_SIZE]> {
+        if let Some(sector) = self.overlay.get(&block) {
+            return Ok(**sector);
+        }
+        let offset = (block as u64)
+            .checked_mul(BLOCK_SIZE as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "SD block offset overflow")
+            })?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut sector = [0u8; BLOCK_SIZE];
+        self.file.read_exact(&mut sector)?;
+        Ok(sector)
+    }
+
+    fn write_sector(&mut self, block: usize, data: &[u8]) -> io::Result<()> {
+        if block >= self.block_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SD block is outside the RAW image",
+            ));
+        }
+        if data.len() != BLOCK_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SD sector writes must be exactly 512 bytes",
+            ));
+        }
+        let mut sector = [0u8; BLOCK_SIZE];
+        sector.copy_from_slice(data);
+        self.overlay.insert(block, Box::new(sector));
+        Ok(())
+    }
+
+    fn export_raw(&mut self, output: &Path) -> io::Result<()> {
+        if std::fs::canonicalize(output).ok().as_deref() == Some(self.source_path.as_path())
+            || output == self.source_path.as_path()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SD RAW input and output must be different files",
+            ));
+        }
+        let temporary =
+            output.with_extension(format!("tmp-{}-{}", std::process::id(), self.overlay.len()));
+        let mut sink = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        for block in 0..self.block_count {
+            let sector = self.read_sector(block)?;
+            sink.write_all(&sector)?;
+        }
+        sink.flush()?;
+        sink.sync_all()?;
+        std::fs::rename(&temporary, output)?;
+        Ok(())
+    }
+}
+
 /// SD card in SPI mode.
 pub struct SdCard {
     blocks: Vec<u8>,
+    raw: Option<RawBacking>,
     format: SdFormat,
     phase: Phase,
     /// Argument bytes of the command being assembled.
@@ -157,6 +279,7 @@ impl SdCard {
     pub fn new_with_format(block_count: usize, format: SdFormat) -> Self {
         let mut card = Self {
             blocks: vec![0u8; block_count * BLOCK_SIZE],
+            raw: None,
             format,
             phase: Phase::Idle,
             arg: [0; 4],
@@ -179,6 +302,59 @@ impl SdCard {
             SdFormat::Fat32 => card.format_fat32(),
         }
         card
+    }
+
+    /// Open a non-empty, 512-byte-aligned RAW image as a read-only card
+    /// backing. Writes are kept in a sector-sized copy-on-write overlay.
+    /// The default format label is FAT32 for compatibility with the normal
+    /// in-memory card; the RAW bytes themselves are not reformatted.
+    pub fn from_raw_file(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::from_raw_file_with_format(path, SdFormat::default())
+    }
+
+    /// Open a RAW image and retain an explicit format label for reports.
+    /// The selected format does not modify or validate the image contents.
+    pub fn from_raw_file_with_format(path: impl AsRef<Path>, format: SdFormat) -> io::Result<Self> {
+        let raw = RawBacking::open(path.as_ref())?;
+        Ok(Self {
+            blocks: Vec::new(),
+            raw: Some(raw),
+            format,
+            phase: Phase::Idle,
+            arg: [0; 4],
+            reply: std::collections::VecDeque::new(),
+            app_cmd_pending: false,
+            initialised: false,
+            acmd41_busy_left: 2,
+            write_block: 0,
+            write_pending: false,
+            write_buf: Vec::with_capacity(BLOCK_SIZE),
+            commands_seen: 0,
+            blocks_read: 0,
+            blocks_written: 0,
+            unknown_commands: Vec::new(),
+        })
+    }
+
+    /// Export the complete RAW image, applying any dirty overlay sectors.
+    /// Memory-backed cards do not have an input image to export.
+    pub fn export_raw(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.raw
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "card has no RAW backing"))?
+            .export_raw(path.as_ref())
+    }
+
+    /// Return path-free RAW metadata, or `None` for the legacy in-memory
+    /// backing. Dirty blocks are the sectors currently held by the COW
+    /// overlay and have not been written to the input file.
+    pub fn raw_metadata(&self) -> Option<RawMetadata> {
+        self.raw.as_ref().map(|raw| RawMetadata {
+            bytes: (raw.block_count as u64) * BLOCK_SIZE as u64,
+            blocks: raw.block_count,
+            dirty_blocks: raw.overlay.len(),
+            source_sha256: raw.source_sha256.clone(),
+        })
     }
 
     /// Initial filesystem profile selected for this card.
@@ -371,7 +547,36 @@ impl SdCard {
 
     /// Capacity in blocks.
     pub fn block_count(&self) -> usize {
-        self.blocks.len() / BLOCK_SIZE
+        self.raw
+            .as_ref()
+            .map_or(self.blocks.len() / BLOCK_SIZE, |raw| raw.block_count)
+    }
+
+    fn read_sector(&mut self, block: usize) -> io::Result<[u8; BLOCK_SIZE]> {
+        if let Some(raw) = self.raw.as_mut() {
+            if block >= raw.block_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SD block is outside the RAW image",
+                ));
+            }
+            return raw.read_sector(block);
+        }
+        let offset = block.checked_mul(BLOCK_SIZE).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SD block offset overflow")
+        })?;
+        let end = offset.checked_add(BLOCK_SIZE).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SD block offset overflow")
+        })?;
+        if end > self.blocks.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "SD block is outside the card",
+            ));
+        }
+        let mut sector = [0u8; BLOCK_SIZE];
+        sector.copy_from_slice(&self.blocks[offset..end]);
+        Ok(sector)
     }
 
     /// Chip select released: abandon whatever was in flight.
@@ -464,9 +669,19 @@ impl SdCard {
     }
 
     fn commit_write(&mut self) {
-        let offset = self.write_block as usize * BLOCK_SIZE;
-        if offset + BLOCK_SIZE <= self.blocks.len() {
-            self.blocks[offset..offset + BLOCK_SIZE].copy_from_slice(&self.write_buf);
+        let block = self.write_block as usize;
+        let committed = if let Some(raw) = self.raw.as_mut() {
+            block < raw.block_count && raw.write_sector(block, &self.write_buf).is_ok()
+        } else {
+            let offset = block * BLOCK_SIZE;
+            if offset + BLOCK_SIZE <= self.blocks.len() {
+                self.blocks[offset..offset + BLOCK_SIZE].copy_from_slice(&self.write_buf);
+                true
+            } else {
+                false
+            }
+        };
+        if committed {
             self.blocks_written += 1;
         }
         self.write_buf.clear();
@@ -588,16 +803,17 @@ impl SdCard {
     }
 
     fn queue_block_read(&mut self, block: u32) {
-        let offset = block as usize * BLOCK_SIZE;
-        if offset + BLOCK_SIZE > self.blocks.len() {
-            // Out of range: leave the host polling for a token that
-            // never comes rather than inventing data.
-            return;
-        }
+        let block = block as usize;
+        let sector = match self.read_sector(block) {
+            Ok(sector) => sector,
+            Err(_) => {
+                // Out of range or unreadable: leave the host polling for a
+                // token that never comes rather than inventing data.
+                return;
+            }
+        };
         self.reply.push_back(TOKEN_START);
-        for i in 0..BLOCK_SIZE {
-            self.reply.push_back(self.blocks[offset + i]);
-        }
+        self.reply.extend(sector);
         // Two CRC bytes the driver reads and discards.
         self.reply.push_back(0xFF);
         self.reply.push_back(0xFF);
@@ -620,6 +836,11 @@ impl SdCard {
 #[cfg(test)]
 mod format_tests {
     use super::{BLOCK_SIZE, DEFAULT_BLOCKS, SdCard, SdFormat};
+    use std::path::PathBuf;
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("picocalc-sdcard-{label}-{}", std::process::id()))
+    }
 
     fn u16_at(bytes: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
@@ -702,5 +923,65 @@ mod format_tests {
         assert_eq!("fat16".parse(), Ok(SdFormat::Fat16));
         assert_eq!("FAT32".parse(), Ok(SdFormat::Fat32));
         assert!("exfat".parse::<SdFormat>().is_err());
+    }
+
+    #[test]
+    fn raw_backing_reads_through_and_exports_cow_sectors() {
+        let input = temp_path("raw-input");
+        let output = temp_path("raw-output");
+        let original: Vec<u8> = (0..(2 * BLOCK_SIZE)).map(|value| value as u8).collect();
+        std::fs::write(&input, &original).unwrap();
+
+        let mut card = SdCard::from_raw_file(&input).unwrap();
+        assert_eq!(card.block_count(), 2);
+        assert_eq!(
+            card.read_sector(0).unwrap().as_slice(),
+            &original[..BLOCK_SIZE]
+        );
+
+        let replacement = [0xA5u8; BLOCK_SIZE];
+        card.raw
+            .as_mut()
+            .unwrap()
+            .write_sector(1, &replacement)
+            .unwrap();
+        assert_eq!(card.read_sector(1).unwrap(), replacement);
+        card.export_raw(&output).unwrap();
+
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        let mut expected = original;
+        expected[BLOCK_SIZE..].copy_from_slice(&replacement);
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn raw_backing_rejects_empty_and_unaligned_inputs() {
+        let empty = temp_path("raw-empty");
+        let unaligned = temp_path("raw-unaligned");
+        std::fs::write(&empty, []).unwrap();
+        std::fs::write(&unaligned, [0u8; BLOCK_SIZE - 1]).unwrap();
+
+        assert!(SdCard::from_raw_file(&empty).is_err());
+        assert!(SdCard::from_raw_file(&unaligned).is_err());
+
+        let _ = std::fs::remove_file(empty);
+        let _ = std::fs::remove_file(unaligned);
+    }
+
+    #[test]
+    fn raw_export_rejects_the_input_path_and_memory_cards() {
+        let input = temp_path("raw-same-path");
+        std::fs::write(&input, [0u8; BLOCK_SIZE]).unwrap();
+        let mut raw = SdCard::from_raw_file(&input).unwrap();
+        assert!(raw.export_raw(&input).is_err());
+        assert!(
+            SdCard::new_with_format(1024, SdFormat::Fat16)
+                .export_raw(temp_path("memory-output"))
+                .is_err()
+        );
+        let _ = std::fs::remove_file(input);
     }
 }

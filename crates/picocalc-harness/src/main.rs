@@ -232,6 +232,7 @@ struct Args {
     stop_pc: Option<u32>,
     json: Option<PathBuf>,
     uart: Option<PathBuf>,
+    flash_image_out: Option<PathBuf>,
     expected_backend_commit: Option<String>,
     board: Board,
     lcd_variant: LcdVariant,
@@ -241,6 +242,8 @@ struct Args {
     psram_verify_range: Option<(u32, u32)>,
     keyboard: bool,
     sd: bool,
+    sd_image: Option<PathBuf>,
+    sd_image_out: Option<PathBuf>,
     sd_format: SdFormat,
     keys: Option<String>,
     scenario: Option<PathBuf>,
@@ -430,7 +433,18 @@ fn parse_range(raw: &str) -> Result<(u32, u32), String> {
     Ok((parse_num(start_raw)?, parse_num(len_raw)?))
 }
 
-fn validate_sd_selection(sd: bool, format_explicit: bool) -> Result<(), String> {
+fn validate_sd_selection(
+    sd: bool,
+    sd_image: Option<&Path>,
+    sd_image_out: Option<&Path>,
+    format_explicit: bool,
+) -> Result<(), String> {
+    if sd && sd_image.is_some() {
+        return Err("--sd and --sd-image are mutually exclusive".to_string());
+    }
+    if sd_image_out.is_some() && sd_image.is_none() {
+        return Err("--sd-image-out requires --sd-image".to_string());
+    }
     if format_explicit && !sd {
         return Err("--sd-format requires --sd".to_string());
     }
@@ -479,6 +493,10 @@ fn print_usage() {
                                   starts. Implies --keyboard. For input that has to be\n\
                                   timed against what the program is doing, use --scenario.\n\
          --sd                     Attach an SD card on SPI0, pre-formatted FAT32 by default.\n\
+         --sd-image <path>        Attach a non-empty 512-byte-aligned RAW SD image read-only;\n\
+                                  emulated writes use a sector copy-on-write overlay.\n\
+         --sd-image-out <path>    Atomically export the RAW image plus COW writes after the run.\n\
+                                  Requires --sd-image and must differ from the input path.\n\
          --sd-format <fat32|fat16>\n\
                                   Initial filesystem profile. FAT32 is the default, matching\n\
                                   PicoCalc's bundled 32 GB card. Requires --sd.\n\
@@ -503,6 +521,7 @@ fn print_usage() {
                                   from the 8-bit stereo PWM duty stream.\n\
          --audio-wav <path>      Write the same unnormalised reconstructed stream as\n\
                                   48 kHz stereo signed-16 WAV for listening.\n\
+         --flash-image-out <path> Export the final 2 MiB XIP image after SSI erase/program.\n\\
          -h, --help               This message."
     );
     #[cfg(feature = "idle-profiler")]
@@ -530,6 +549,7 @@ fn parse_args() -> Result<Args, String> {
     let mut stop_pc: Option<u32> = None;
     let mut json: Option<PathBuf> = None;
     let mut uart: Option<PathBuf> = None;
+    let mut flash_image_out: Option<PathBuf> = None;
     let mut expected_backend_commit: Option<String> = None;
     let mut board = Board::None;
     // Variant B is the Canonical BSP default; variant A is what the
@@ -549,6 +569,8 @@ fn parse_args() -> Result<Args, String> {
     let mut psram_verify_range: Option<(u32, u32)> = None;
     let mut keyboard = false;
     let mut sd = false;
+    let mut sd_image: Option<PathBuf> = None;
+    let mut sd_image_out: Option<PathBuf> = None;
     let mut sd_format = SdFormat::default();
     let mut sd_format_explicit = false;
     let mut keys: Option<String> = None;
@@ -601,6 +623,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--json" => json = Some(PathBuf::from(value("--json")?)),
             "--uart" => uart = Some(PathBuf::from(value("--uart")?)),
+            "--flash-image-out" => {
+                if flash_image_out.is_some() {
+                    return Err("--flash-image-out may be specified only once".to_string());
+                }
+                flash_image_out = Some(PathBuf::from(value("--flash-image-out")?));
+            }
             "--backend-commit" => expected_backend_commit = Some(value("--backend-commit")?),
             "--board" => board = Board::parse(&value("--board")?)?,
             "--lcd-variant" => lcd_variant = LcdVariant::parse(&value("--lcd-variant")?)?,
@@ -618,6 +646,8 @@ fn parse_args() -> Result<Args, String> {
             "--psram" => psram = true,
             "--keyboard" => keyboard = true,
             "--sd" => sd = true,
+            "--sd-image" => sd_image = Some(PathBuf::from(value("--sd-image")?)),
+            "--sd-image-out" => sd_image_out = Some(PathBuf::from(value("--sd-image-out")?)),
             "--sd-format" => {
                 let raw = value("--sd-format")?;
                 sd_format = raw.parse::<SdFormat>()?;
@@ -723,7 +753,12 @@ fn parse_args() -> Result<Args, String> {
     if psram_verify_range.is_some() && !psram {
         return Err("--psram-verify-range requires --psram".to_string());
     }
-    validate_sd_selection(sd, sd_format_explicit)?;
+    validate_sd_selection(
+        sd,
+        sd_image.as_deref(),
+        sd_image_out.as_deref(),
+        sd_format_explicit,
+    )?;
     // Queueing keys implies the controller they arrive through.
     if keys.is_some() {
         keyboard = true;
@@ -774,6 +809,7 @@ fn parse_args() -> Result<Args, String> {
             (stop_pc.is_some(), "--stop-pc"),
             (json.is_some(), "--json"),
             (uart.is_some(), "--uart"),
+            (flash_image_out.is_some(), "--flash-image-out"),
             (fb_png.is_some(), "--fb-png"),
             (expected_stop.is_some(), "--expect-stop"),
             (!expected_uart.is_empty(), "--expect-uart"),
@@ -784,6 +820,7 @@ fn parse_args() -> Result<Args, String> {
             (audio_analysis.is_some(), "--audio-analysis"),
             (audio_wav.is_some(), "--audio-wav"),
             (keys.is_some(), "--keys"),
+            (sd_image_out.is_some(), "--sd-image-out"),
             (run_id.is_some(), "--run-id"),
             (progress_interval.is_some(), "--progress-interval"),
         ];
@@ -824,6 +861,7 @@ fn parse_args() -> Result<Args, String> {
         stop_pc,
         json,
         uart,
+        flash_image_out,
         expected_backend_commit,
         board,
         lcd_variant,
@@ -833,6 +871,8 @@ fn parse_args() -> Result<Args, String> {
         psram_verify_range,
         keyboard,
         sd,
+        sd_image,
+        sd_image_out,
         sd_format,
         keys,
         scenario,
@@ -2486,6 +2526,14 @@ fn json_string(s: &str) -> String {
     format!("\"{}\"", json_escape(s))
 }
 
+fn json_array_strings(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| json_string(value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(feature = "idle-profiler")]
 fn u64_json_array(values: &[u64]) -> String {
     values
@@ -3343,6 +3391,14 @@ fn write_audio_wav(path: &Path, samples: &[i16]) -> Result<(), String> {
         .map_err(|e| format!("flushing audio WAV {}: {e}", path.display()))
 }
 
+fn write_flash_image(path: &Path, image: &[u8]) -> Result<(), String> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, image)
+        .map_err(|error| format!("writing flash image {}: {error}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|error| format!("publishing flash image {}: {error}", path.display()))
+}
+
 /// TOP register reset value; a slice still holding it was never given a
 /// wrap point.
 const TOP_RESET_VALUE: u16 = 0xFFFF;
@@ -3355,6 +3411,7 @@ struct SdReport {
     blocks_read: u64,
     blocks_written: u64,
     unknown_commands: Vec<(u8, u32)>,
+    raw: Option<picocalc_board::sdcard::RawMetadata>,
 }
 
 impl SdReport {
@@ -3368,6 +3425,7 @@ impl SdReport {
             blocks_read: card.blocks_read,
             blocks_written: card.blocks_written,
             unknown_commands,
+            raw: card.raw_metadata(),
         }
     }
 
@@ -3384,6 +3442,15 @@ impl SdReport {
             "    \"commands_seen\": {}, \"blocks_read\": {}, \"blocks_written\": {},\n",
             self.commands_seen, self.blocks_read, self.blocks_written
         ));
+        if let Some(raw) = self.raw.as_ref() {
+            s.push_str(&format!(
+                "    \"raw_image\": {{\"bytes\": {}, \"blocks\": {}, \"dirty_blocks\": {}, \"source_sha256\": {} }},\n",
+                raw.bytes,
+                raw.blocks,
+                raw.dirty_blocks,
+                json_string(&raw.source_sha256),
+            ));
+        }
         s.push_str("    \"unknown_commands\": [");
         if self.unknown_commands.is_empty() {
             s.push_str("]\n");
@@ -3531,6 +3598,43 @@ impl PsramReport {
     }
 }
 
+struct FlashReport {
+    image_bytes: usize,
+    erase_count: u64,
+    program_count: u64,
+    program_bytes: u64,
+    command_counts: Vec<(u8, u32)>,
+    unknown_commands: Vec<(u8, u32)>,
+    errors: Vec<String>,
+}
+
+impl FlashReport {
+    fn to_json(&self) -> String {
+        let unknown = self
+            .unknown_commands
+            .iter()
+            .map(|(command, count)| format!("{{\"command\": {command}, \"count\": {count}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let commands = self
+            .command_counts
+            .iter()
+            .map(|(command, count)| format!("{{\"command\": {command}, \"count\": {count}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "  \"flash\": {{\"image_bytes\": {}, \"erase_count\": {}, \"program_count\": {}, \"program_bytes\": {}, \"command_counts\": [{}], \"unknown_commands\": [{}], \"errors\": [{}]}},\n",
+            self.image_bytes,
+            self.erase_count,
+            self.program_count,
+            self.program_bytes,
+            commands,
+            unknown,
+            json_array_strings(&self.errors),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_report(
     backend_commit: &str,
@@ -3552,6 +3656,7 @@ fn build_report(
     lcd: Option<&LcdReport>,
     fb: Option<&FramebufferReport>,
     psram: Option<&PsramReport>,
+    flash: Option<&FlashReport>,
     sd: Option<&SdReport>,
     keyboard: Option<&KeyboardReport>,
     pwm: Option<&PwmReport>,
@@ -3667,6 +3772,9 @@ fn build_report(
     if let Some(psram) = psram {
         s.push_str(&psram.to_json());
     }
+    if let Some(flash) = flash {
+        s.push_str(&flash.to_json());
+    }
     if let Some(sd) = sd {
         s.push_str(&sd.to_json());
     }
@@ -3741,6 +3849,7 @@ fn behavior_projection(
         "unsupported_mmio_truncated",
         "lcd",
         "psram",
+        "flash",
         "sd",
         "keyboard",
         "pwm",
@@ -3999,12 +4108,18 @@ fn run() -> Result<Verdict, String> {
     // The BSP mounts but does not format (FF_USE_MKFS=0), so the card
     // constructor supplies the selected pre-formatted volume. FAT32 is
     // the default; FAT16 is retained for compatibility targets.
-    let sd_card = args.sd.then(|| {
-        Arc::new(Mutex::new(SdCard::new_with_format(
+    let sd_card = if args.sd {
+        Some(Arc::new(Mutex::new(SdCard::new_with_format(
             picocalc_board::sdcard::DEFAULT_BLOCKS,
             args.sd_format,
-        )))
-    });
+        ))))
+    } else if let Some(path) = args.sd_image.as_deref() {
+        let card = SdCard::from_raw_file_with_format(path, args.sd_format)
+            .map_err(|e| format!("opening SD RAW image {}: {e}", path.display()))?;
+        Some(Arc::new(Mutex::new(card)))
+    } else {
+        None
+    };
 
     let (mut emu, boot_mode, lcd) = boot(
         firmware,
@@ -4065,6 +4180,38 @@ fn run() -> Result<Verdict, String> {
     // Report generation still consumes the emulator after the shared
     // session ends. Moving it back out preserves the existing schema bytes.
     let MachineSession { mut emu, .. } = machine;
+
+    let flash_image = emu.bus.flash_image();
+    if let Some(path) = args.flash_image_out.as_deref() {
+        let input_canonical = std::fs::canonicalize(&args.bin).ok();
+        let output_canonical = std::fs::canonicalize(path).ok();
+        if input_canonical.is_some() && input_canonical == output_canonical {
+            return Err("--flash-image-out must differ from --bin".to_string());
+        }
+        write_flash_image(path, &flash_image)?;
+    }
+    let flash_unknown_commands = emu.bus.flash_unknown_commands().to_vec();
+    let flash_command_counts = emu.bus.flash_command_counts().to_vec();
+    let flash_errors = emu.bus.flash_mutation_errors().to_vec();
+    let flash_report = if args.flash_image_out.is_some()
+        || emu.bus.flash_erase_count() != 0
+        || emu.bus.flash_program_count() != 0
+        || !flash_command_counts.is_empty()
+        || !flash_unknown_commands.is_empty()
+        || !flash_errors.is_empty()
+    {
+        Some(FlashReport {
+            image_bytes: flash_image.len(),
+            erase_count: emu.bus.flash_erase_count(),
+            program_count: emu.bus.flash_program_count(),
+            program_bytes: emu.bus.flash_program_bytes(),
+            command_counts: flash_command_counts,
+            unknown_commands: flash_unknown_commands,
+            errors: flash_errors,
+        })
+    } else {
+        None
+    };
 
     #[cfg(feature = "idle-profiler")]
     if let Some(path) = &args.idle_profile {
@@ -4171,6 +4318,15 @@ fn run() -> Result<Verdict, String> {
         let card = card.lock().expect("SD mutex");
         SdReport::snapshot(&card)
     });
+
+    if let Some(path) = args.sd_image_out.as_deref() {
+        let card = sd_card
+            .as_ref()
+            .ok_or_else(|| "--sd-image-out requires an attached RAW SD image".to_string())?;
+        let mut card = card.lock().expect("SD mutex");
+        card.export_raw(path)
+            .map_err(|e| format!("exporting SD RAW image {}: {e}", path.display()))?;
+    }
 
     let keyboard_report = keyboard.as_ref().map(|kbd| {
         let k = kbd.lock().expect("keyboard mutex");
@@ -4289,6 +4445,7 @@ fn run() -> Result<Verdict, String> {
         lcd_report.as_ref(),
         fb_report.as_ref(),
         psram_report.as_ref(),
+        flash_report.as_ref(),
         sd_report.as_ref(),
         keyboard_report.as_ref(),
         pwm_report.as_ref(),
@@ -4776,11 +4933,11 @@ mod tests {
 
     #[test]
     fn an_explicit_sd_format_requires_an_attached_card() {
-        assert_eq!(validate_sd_selection(true, true), Ok(()));
-        assert_eq!(validate_sd_selection(true, false), Ok(()));
-        assert_eq!(validate_sd_selection(false, false), Ok(()));
+        assert_eq!(validate_sd_selection(true, None, None, true), Ok(()));
+        assert_eq!(validate_sd_selection(true, None, None, false), Ok(()));
+        assert_eq!(validate_sd_selection(false, None, None, false), Ok(()));
         assert_eq!(
-            validate_sd_selection(false, true),
+            validate_sd_selection(false, None, None, true),
             Err("--sd-format requires --sd".to_string())
         );
     }
@@ -4794,6 +4951,7 @@ mod tests {
             blocks_read: 2,
             blocks_written: 1,
             unknown_commands: Vec::new(),
+            raw: None,
         }
         .to_json();
         assert!(report.contains("\"format\": \"fat32\""));

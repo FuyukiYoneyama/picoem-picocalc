@@ -104,6 +104,14 @@ pub const TIMER_BASE: u32 = 0x4005_4000;
 pub const WATCHDOG_BASE: u32 = 0x4005_8000;
 pub const XIP_CTRL_BASE: u32 = 0x1400_0000;
 pub const SSI_BASE: u32 = 0x1800_0000;
+/// IO_QSPI GPIO1 (QSPI_SS_N) control register. The RP2040 ROM flash
+/// helpers force this output low/high around command transfers instead of
+/// toggling SSIENR, so it is also the flash transaction boundary.
+const IO_QSPI_SS_CTRL: u32 = 0x0C;
+const IO_QSPI_OUTOVER_SHIFT: u32 = 8;
+const IO_QSPI_OUTOVER_MASK: u32 = 0x3 << IO_QSPI_OUTOVER_SHIFT;
+const IO_QSPI_OUTOVER_LOW: u32 = 0x2 << IO_QSPI_OUTOVER_SHIFT;
+const IO_QSPI_OUTOVER_HIGH: u32 = 0x3 << IO_QSPI_OUTOVER_SHIFT;
 /// XIP_SSI register offsets touched by the boot-time flash helpers.
 const SSI_SSIENR: u32 = 0x08;
 const SSI_TXFLR: u32 = 0x20;
@@ -783,6 +791,40 @@ impl Bus {
         self.pending_invalidation_regions |= invalidation_regions::XIP;
     }
 
+    /// Snapshot the current XIP flash image, including SSI erase/program
+    /// mutations performed by firmware during the run.
+    pub fn flash_image(&self) -> Vec<u8> {
+        self.memory.xip_image()
+    }
+
+    /// SSI flash protocol/range errors accumulated during the run.
+    pub fn flash_mutation_errors(&self) -> &[String] {
+        &self.ssi_flash.errors
+    }
+
+    /// Unknown SSI opcodes observed during the run.
+    pub fn flash_unknown_commands(&self) -> &[(u8, u32)] {
+        &self.ssi_flash.unknown_commands
+    }
+
+    /// Every SSI flash opcode observed, including commands the model does
+    /// not yet implement. Counts are bounded by opcode, not transaction.
+    pub fn flash_command_counts(&self) -> &[(u8, u32)] {
+        &self.ssi_flash.command_counts
+    }
+
+    pub fn flash_erase_count(&self) -> u64 {
+        self.ssi_flash.erase_count
+    }
+
+    pub fn flash_program_count(&self) -> u64 {
+        self.ssi_flash.program_count
+    }
+
+    pub fn flash_program_bytes(&self) -> u64 {
+        self.ssi_flash.program_bytes
+    }
+
     // --- Bus-fault plumbing -----------------------------------------------
 
     pub fn bus_fault(&self) -> bool {
@@ -1140,7 +1182,41 @@ impl Bus {
             }
             ROSC_BASE => self.rosc_regs.write32(offset, val, alias),
             IO_BANK0_BASE => self.io_bank0.write32(offset, val, alias),
+            IO_QSPI_BASE => {
+                let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
+                let new = match alias {
+                    0 => val,
+                    1 => old ^ val,
+                    2 => old | val,
+                    3 => old & !val,
+                    _ => val,
+                };
+                if offset == IO_QSPI_SS_CTRL {
+                    let old_out = old & IO_QSPI_OUTOVER_MASK;
+                    let new_out = new & IO_QSPI_OUTOVER_MASK;
+                    // ROM flash_cs_force() drives active-low CS low to
+                    // begin a command and high to commit it. End the
+                    // parser transaction on the rising edge; relying only
+                    // on SSIENR misses the SDK/bootrom path entirely.
+                    if old_out == IO_QSPI_OUTOVER_LOW && new_out == IO_QSPI_OUTOVER_HIGH {
+                        self.ssi_flash.end_transaction();
+                        self.apply_ssi_flash_mutations();
+                    }
+                }
+                self.peripheral_regs.insert(canonical, new);
+            }
             PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
+            PADS_QSPI_BASE => {
+                let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
+                let new = match alias {
+                    0 => val,
+                    1 => old ^ val,
+                    2 => old | val,
+                    3 => old & !val,
+                    _ => val,
+                };
+                self.peripheral_regs.insert(canonical, new);
+            }
             PIO0_BASE => self.pio[0].write32(pio_rp2040_to_internal(offset), val, alias),
             PIO1_BASE => self.pio[1].write32(pio_rp2040_to_internal(offset), val, alias),
             DMA_BASE => self.dma.write32(offset, val, alias),
@@ -1234,12 +1310,76 @@ impl Bus {
             SSI_SSIENR => {
                 if val & 1 == 0 {
                     self.ssi_flash.end_transaction();
+                    self.apply_ssi_flash_mutations();
                 }
                 self.ssi_regs.insert(offset, val);
             }
-            SSI_DR0 => self.ssi_flash.push_tx(val as u8),
+            SSI_DR0 => {
+                self.ssi_flash.push_tx(val as u8);
+                // A transaction normally commits at SSIENR=0.  Applying
+                // here as well keeps the model correct for firmware that
+                // leaves the controller enabled between commands.
+                self.apply_ssi_flash_mutations();
+            }
             _ => {
                 self.ssi_regs.insert(offset, val);
+            }
+        }
+    }
+
+    /// Apply completed SSI NOR operations to the executable XIP image.
+    /// The SSI parser deliberately emits operations instead of borrowing
+    /// `Memory`, so the bus can update XIP and invalidate decode caches at
+    /// one well-defined boundary.
+    fn apply_ssi_flash_mutations(&mut self) {
+        use ssi_flash::FlashMutation;
+
+        let mutations = self.ssi_flash.take_mutations();
+        for mutation in mutations {
+            match mutation {
+                FlashMutation::Erase { offset, len } => {
+                    let start = offset as usize;
+                    let erase_len = if len == 0 {
+                        self.memory.flash_size().saturating_sub(start)
+                    } else {
+                        len as usize
+                    };
+                    if !self.memory.xip_erase(start, erase_len) {
+                        self.ssi_flash.errors.push(format!(
+                            "erase_out_of_range:offset=0x{offset:08x}:len=0x{len:08x}"
+                        ));
+                    } else {
+                        self.pending_invalidation_regions |= invalidation_regions::XIP;
+                    }
+                }
+                FlashMutation::Program { offset, data } => {
+                    let start = offset as usize;
+                    let Some(end) = start.checked_add(data.len()) else {
+                        self.ssi_flash.errors.push("program_range_overflow".into());
+                        continue;
+                    };
+                    if end > self.memory.flash_size() {
+                        self.ssi_flash.errors.push(format!(
+                            "program_out_of_range:offset=0x{offset:08x}:len=0x{:x}",
+                            data.len()
+                        ));
+                        continue;
+                    }
+                    for (index, requested) in data.into_iter().enumerate() {
+                        let address = start + index;
+                        let current = self.memory.xip_byte(address).unwrap_or(0);
+                        // NOR programming cannot change a zero back to one.
+                        // Do not silently accept a firmware bug: retain the
+                        // physical AND result but record a fail-closed error.
+                        if (requested & !current) != 0 {
+                            self.ssi_flash.errors.push(format!(
+                                "program_attempted_0_to_1:offset=0x{address:08x}:old=0x{current:02x}:requested=0x{requested:02x}"
+                            ));
+                        }
+                        let _ = self.memory.xip_program_byte(address, requested);
+                    }
+                    self.pending_invalidation_regions |= invalidation_regions::XIP;
+                }
             }
         }
     }
@@ -2650,6 +2790,47 @@ mod tests {
         assert_eq!(bus.read8(0x1000_0000), 0xAA);
         assert_eq!(bus.read8(0x1000_0003), 0xDD);
         assert_eq!(bus.read16(0x1000_0002), 0xDDCC);
+    }
+
+    #[test]
+    fn ssi_erase_program_mutates_xip_and_records_zero_to_one() {
+        let mut bus = Bus::new();
+        bus.load_flash(&[0x00; 0x2000]);
+        let tx = |bus: &mut Bus, bytes: &[u8]| {
+            bus.write32(SSI_BASE + SSI_SSIENR, 1);
+            for &byte in bytes {
+                bus.write32(SSI_BASE + SSI_DR0, u32::from(byte));
+                let _ = bus.read32(SSI_BASE + SSI_DR0);
+            }
+            bus.write32(SSI_BASE + SSI_SSIENR, 0);
+        };
+
+        tx(&mut bus, &[0x06]); // WREN
+        tx(&mut bus, &[0x20, 0x00, 0x00, 0x00]); // sector erase
+        assert_eq!(bus.read8(0x1000_0000), 0xFF);
+        assert!(
+            bus.flash_mutation_errors().is_empty(),
+            "errors: {:?}",
+            bus.flash_mutation_errors()
+        );
+
+        tx(&mut bus, &[0x06]);
+        tx(&mut bus, &[0x02, 0x00, 0x00, 0x00, 0xA5]);
+        assert_eq!(bus.read8(0x1000_0000), 0xA5);
+        assert!(
+            bus.flash_mutation_errors().is_empty(),
+            "errors: {:?}",
+            bus.flash_mutation_errors()
+        );
+
+        tx(&mut bus, &[0x06]);
+        tx(&mut bus, &[0x02, 0x00, 0x00, 0x00, 0xFF]);
+        assert_eq!(bus.read8(0x1000_0000), 0xA5);
+        assert!(
+            bus.flash_mutation_errors()
+                .iter()
+                .any(|error| error.starts_with("program_attempted_0_to_1"))
+        );
     }
 
     #[test]

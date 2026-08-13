@@ -10,6 +10,8 @@
 //! `rp2040-emu` is not worth it. Validated against `sha256sum` in the
 //! unit tests below.
 
+use std::io::{self, Read};
+
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -54,6 +56,63 @@ pub fn sha256_hex(data: &[u8]) -> String {
         out.push_str(&format!("{word:08x}"));
     }
     out
+}
+
+/// SHA-256 of a reader, consumed in bounded chunks.  This is used for
+/// RAW SD provenance so a 32 GB image is never materialised in memory.
+pub fn sha256_reader_hex<R: Read>(mut reader: R) -> io::Result<String> {
+    let mut h = H0;
+    let mut block = [0u8; 64];
+    let mut buffered = 0usize;
+    let mut total = 0u64;
+    let mut input = [0u8; 64 * 1024];
+
+    loop {
+        let read = reader.read(&mut input)?;
+        if read == 0 {
+            break;
+        }
+        total = total.wrapping_add(read as u64);
+        let mut cursor = 0usize;
+        if buffered != 0 {
+            let take = (64 - buffered).min(read);
+            block[buffered..buffered + take].copy_from_slice(&input[..take]);
+            buffered += take;
+            cursor += take;
+            if buffered == 64 {
+                compress(&mut h, &block);
+                buffered = 0;
+            }
+        }
+        while cursor + 64 <= read {
+            compress(
+                &mut h,
+                input[cursor..cursor + 64]
+                    .try_into()
+                    .expect("64-byte block"),
+            );
+            cursor += 64;
+        }
+        if cursor < read {
+            buffered = read - cursor;
+            block[..buffered].copy_from_slice(&input[cursor..read]);
+        }
+    }
+
+    block[buffered..].fill(0);
+    block[buffered] = 0x80;
+    if buffered >= 56 {
+        compress(&mut h, &block);
+        block = [0u8; 64];
+    }
+    block[56..64].copy_from_slice(&total.wrapping_mul(8).to_be_bytes());
+    compress(&mut h, &block);
+
+    let mut out = String::with_capacity(64);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    Ok(out)
 }
 
 fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
@@ -110,7 +169,8 @@ fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
 
 #[cfg(test)]
 mod tests {
-    use super::sha256_hex;
+    use super::{sha256_hex, sha256_reader_hex};
+    use std::io::Cursor;
 
     #[test]
     fn known_vectors() {
@@ -136,6 +196,15 @@ mod tests {
         assert_eq!(
             sha256_hex(&data),
             "4e4c294b331f7a2099a379bec34b9f9fc03dc46ab465d998f4d683da53487e6d"
+        );
+    }
+
+    #[test]
+    fn reader_matches_slice() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(
+            sha256_reader_hex(Cursor::new(&data)).unwrap(),
+            sha256_hex(&data)
         );
     }
 }
