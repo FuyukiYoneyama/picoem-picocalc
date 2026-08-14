@@ -132,8 +132,10 @@ diagnostic stderr only, and `event=finish` carries the runner's authoritative `e
 `1=fail`, `2=cannot_judge`). WSL supervisors should check `finish` and the report before trusting an
 outer shell exit code. See the canonical [concurrent-run guidance](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/CONCURRENT_RUNS.md).
 
-For the fixed PicoCalc 48 kHz stereo PWM5_CC path, the runner can also write a separate
-deterministic level-analysis artifact and an optional unnormalised listening WAV:
+For the PicoCalc PWM5_CC path, the runner can also write a separate deterministic level-analysis
+artifact and an optional unnormalised listening WAV. The frozen NEXT-2 contracts remain the
+48 kHz stereo path; streams with another observed timer rate are emitted as
+the additive audio-analysis schema 2 instead of being forced into that historical contract:
 
 ```bash
 cargo run --release -p picocalc-harness --bin picocalc-run -- \

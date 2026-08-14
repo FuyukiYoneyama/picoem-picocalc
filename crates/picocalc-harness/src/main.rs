@@ -520,7 +520,7 @@ fn print_usage() {
          --audio-analysis <path> Write deterministic digital-level metrics reconstructed\n\
                                   from the 8-bit stereo PWM duty stream.\n\
          --audio-wav <path>      Write the same unnormalised reconstructed stream as\n\
-                                  48 kHz stereo signed-16 WAV for listening.\n\
+                                  an observed-rate stereo signed-16 WAV for listening.\n\
          --flash-image-out <path> Export the final 2 MiB XIP image after SSI erase/program.\n\\
          -h, --help               This message."
     );
@@ -3211,10 +3211,18 @@ impl AudioSinkReport {
         firmware_name: &str,
         firmware_sha256: &str,
     ) -> String {
+        // Schema 1 is the frozen NEXT-2 48 kHz artifact. A non-48 kHz
+        // stream uses the additive generic schema 2. Block lengths remain
+        // visible in the report's audio_sink projection.
+        let schema_version = if self.snapshot.sample_rate_hz == 48_000 {
+            1
+        } else {
+            2
+        };
         format!(
             concat!(
                 "{{\n",
-                "  \"schema_version\": 1,\n",
+                "  \"schema_version\": {},\n",
                 "  \"boundary\": \"dma_to_pwm5_cc\",\n",
                 "  \"interpretation\": \"digital_level_only_not_speaker_loudness\",\n",
                 "  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n",
@@ -3242,6 +3250,7 @@ impl AudioSinkReport {
                 "  \"rail_interpretation\": \"post_quantizer_pwm_rail_usage_not_source_clip_count\"\n",
                 "}}\n"
             ),
+            schema_version,
             json_string(backend_commit),
             backend_dirty,
             json_string(firmware_name),
@@ -3300,10 +3309,13 @@ impl AudioSinkReport {
                 "    \"timer_index\": {},\n",
                 "    \"treq\": {},\n",
                 "    \"timer_fraction\": \"{}/{}\",\n",
+                "    \"sample_rate_hz\": {},\n",
                 "    \"timer_event_count\": {},\n",
                 "    \"timer_miss_count\": {},\n",
                 "    \"timer_due_cycle_sha256\": {},\n",
                 "    \"block_start_count\": {},\n",
+                "    \"block_frame_min\": {},\n",
+                "    \"block_frame_max\": {},\n",
                 "    \"malformed_block_count\": {},\n",
                 "    \"block_boundary_gap_count\": {},\n",
                 "    \"block_boundary_gap_min_cycles\": {},\n",
@@ -3336,10 +3348,13 @@ impl AudioSinkReport {
             self.snapshot.treq,
             self.snapshot.timer_fraction_x,
             self.snapshot.timer_fraction_y,
+            self.snapshot.sample_rate_hz,
             self.snapshot.timer_event_count,
             self.snapshot.timer_miss_count,
             json_string(&self.snapshot.timer_due_cycle_sha256),
             self.snapshot.block_start_count,
+            option_u64(self.snapshot.block_frame_min),
+            option_u64(self.snapshot.block_frame_max),
             self.snapshot.malformed_block_count,
             self.snapshot.block_boundary_gap_count,
             option_u64(self.snapshot.block_boundary_gap_min_cycles),
@@ -3355,15 +3370,21 @@ impl AudioSinkReport {
     }
 }
 
-fn write_audio_wav(path: &Path, samples: &[i16]) -> Result<(), String> {
+fn write_audio_wav(path: &Path, samples: &[i16], sample_rate_hz: u32) -> Result<(), String> {
     if !samples.len().is_multiple_of(2) {
         return Err("audio PCM capture is not interleaved stereo".to_string());
+    }
+    if sample_rate_hz == 0 {
+        return Err("audio PCM capture has no observed sample rate".to_string());
     }
     let data_size = u32::try_from(samples.len().saturating_mul(2))
         .map_err(|_| "audio WAV exceeds the RIFF 32-bit size limit".to_string())?;
     let riff_size = 36u32
         .checked_add(data_size)
         .ok_or_else(|| "audio WAV exceeds the RIFF 32-bit size limit".to_string())?;
+    let byte_rate = sample_rate_hz
+        .checked_mul(4)
+        .ok_or_else(|| "audio WAV sample rate exceeds the RIFF byte-rate limit".to_string())?;
     let file = std::fs::File::create(path)
         .map_err(|e| format!("creating audio WAV {}: {e}", path.display()))?;
     let mut output = BufWriter::new(file);
@@ -3374,8 +3395,8 @@ fn write_audio_wav(path: &Path, samples: &[i16]) -> Result<(), String> {
         .and_then(|_| output.write_all(&16u32.to_le_bytes()))
         .and_then(|_| output.write_all(&1u16.to_le_bytes()))
         .and_then(|_| output.write_all(&2u16.to_le_bytes()))
-        .and_then(|_| output.write_all(&48_000u32.to_le_bytes()))
-        .and_then(|_| output.write_all(&(48_000u32 * 4).to_le_bytes()))
+        .and_then(|_| output.write_all(&sample_rate_hz.to_le_bytes()))
+        .and_then(|_| output.write_all(&byte_rate.to_le_bytes()))
         .and_then(|_| output.write_all(&4u16.to_le_bytes()))
         .and_then(|_| output.write_all(&16u16.to_le_bytes()))
         .and_then(|_| output.write_all(b"data"))
@@ -4379,7 +4400,10 @@ fn run() -> Result<Verdict, String> {
             .bus
             .take_audio_pcm_capture()
             .expect("--audio-wav enabled PCM capture before the run");
-        write_audio_wav(path, &samples)?;
+        let sample_rate_hz = audio_sink_report
+            .as_ref()
+            .map_or(0, |report| report.snapshot.sample_rate_hz);
+        write_audio_wav(path, &samples, sample_rate_hz)?;
     }
 
     let pio_report = (args.board == Board::PicoCalc).then(|| PioReport::collect(&mut emu.bus));
@@ -4516,7 +4540,7 @@ mod tests {
         StopReason, Verdict, apply_audio_sink_expectation, dispatch_machine_request,
         fatal_exception_name, json_escape, judge_run, run_loop, snapshot_machine,
         validate_backend_identity, validate_progress_interval, validate_run_id,
-        validate_sd_selection,
+        validate_sd_selection, write_audio_wav,
     };
     use picocalc_board::{Keyboard, SdFormat, St7365p};
     use rp2040_emu::AudioSinkSnapshot;
@@ -4980,6 +5004,8 @@ mod tests {
             timer_miss_count: 0,
             timer_due_cycle_sha256: String::new(),
             block_start_count: 1,
+            block_frame_min: Some(3),
+            block_frame_max: Some(3),
             malformed_block_count: 0,
             block_boundary_gap_count: 0,
             block_boundary_gap_min_cycles: None,
@@ -5045,10 +5071,54 @@ mod tests {
             "pass"
         );
 
+        let report = AudioSinkReport {
+            snapshot: snapshot.clone(),
+            expected_count: None,
+            expected_sha256: None,
+            status: "pass",
+        };
+        let frozen_analysis =
+            report.analysis_json("a".repeat(40).as_str(), false, "app.bin", &"b".repeat(64));
+        assert!(frozen_analysis.contains("\"schema_version\": 1"));
+        assert!(frozen_analysis.contains("\"sample_rate_hz\": 48000"));
+
+        let mut parameterized = snapshot.clone();
+        parameterized.sample_rate_hz = 22_050;
+        let report = AudioSinkReport {
+            snapshot: parameterized,
+            expected_count: None,
+            expected_sha256: None,
+            status: "pass",
+        };
+        let parameterized_analysis =
+            report.analysis_json("a".repeat(40).as_str(), false, "app.bin", &"b".repeat(64));
+        assert!(parameterized_analysis.contains("\"schema_version\": 2"));
+        assert!(parameterized_analysis.contains("\"sample_rate_hz\": 22050"));
+
         assert_eq!(
             AudioSinkReport::status_for_expected(&snapshot, Some(3), None),
             "fail"
         );
+    }
+
+    #[test]
+    fn audio_wav_header_uses_the_observed_sample_rate() {
+        let path = std::env::temp_dir().join(format!(
+            "picocalc-audio-wav-rate-{}-{}.wav",
+            std::process::id(),
+            22_050
+        ));
+        write_audio_wav(&path, &[0, 0, 1, -1], 22_050).expect("WAV write");
+        let bytes = std::fs::read(&path).expect("WAV read");
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            22_050
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            22_050 * 4
+        );
+        std::fs::remove_file(path).expect("WAV cleanup");
     }
 
     #[test]
@@ -5081,6 +5151,8 @@ mod tests {
                 timer_miss_count: 0,
                 timer_due_cycle_sha256: String::new(),
                 block_start_count: 1,
+                block_frame_min: Some(3),
+                block_frame_max: Some(3),
                 malformed_block_count: 0,
                 block_boundary_gap_count: 0,
                 block_boundary_gap_min_cycles: None,

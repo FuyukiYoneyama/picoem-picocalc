@@ -380,7 +380,14 @@ impl Dma {
 
     /// Snapshot the digital PicoCalc audio sample sink.
     pub fn audio_sink_snapshot(&self) -> AudioSinkSnapshot {
-        let mut snapshot = self.audio_sink.snapshot();
+        self.audio_sink_snapshot_at_clock(250_000_000)
+    }
+
+    /// Snapshot the sink using the live `clk_sys` frequency from the bus.
+    /// The standalone method above remains available for callers that only
+    /// exercise the DMA unit and use the historical 250 MHz audio clock.
+    pub(crate) fn audio_sink_snapshot_at_clock(&self, sys_clk_hz: u32) -> AudioSinkSnapshot {
+        let mut snapshot = self.audio_sink.snapshot_at_clock(sys_clk_hz);
         snapshot.timer_event_count = self.timer_event_count[PICOCALC_AUDIO_TIMER_INDEX];
         snapshot.timer_miss_count = self.timer_miss_count[PICOCALC_AUDIO_TIMER_INDEX];
         snapshot
@@ -861,12 +868,13 @@ impl Dma {
             2 => bus.write16(write_addr, value as u16),
             _ => bus.write32(write_addr, value),
         }
-        self.audio_sink.observe_dma_write(
+        self.audio_sink.observe_dma_write_at_clock(
             write_addr,
             size,
             value,
             treq,
             timer_fraction,
+            bus.clock_tree.sys_clk_hz,
             timer_due_cycle,
             service_cycle,
             block_start,

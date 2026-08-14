@@ -999,7 +999,8 @@ impl Bus {
 
     /// Snapshot DMA-origin writes to the PicoCalc PWM audio sink.
     pub fn audio_sink_snapshot(&self) -> crate::AudioSinkSnapshot {
-        self.dma.audio_sink_snapshot()
+        self.dma
+            .audio_sink_snapshot_at_clock(self.clock_tree.sys_clk_hz)
     }
 
     /// Enable optional PCM retention for a later diagnostic WAV export.

@@ -13,7 +13,15 @@ pub(crate) const PICOCALC_AUDIO_PWM_CC: u32 =
     PWM_BASE + PICOCALC_AUDIO_PWM_SLICE as u32 * 0x14 + 0x0c;
 pub(crate) const PICOCALC_AUDIO_TIMER_INDEX: usize = 0;
 pub(crate) const PICOCALC_AUDIO_TIMER_TREQ: u8 = 59;
+/// Historical NEXT-2 block size.  It remains a useful fixture for the
+/// frozen 48 kHz contract, but it is not a limitation of the sink.
+#[cfg(test)]
 pub(crate) const PICOCALC_AUDIO_HALF_FRAMES: u64 = 128;
+
+/// The default clock used by the standalone sink unit tests.  Firmware runs
+/// through the clock tree and the bus supplies the live value to snapshots.
+#[cfg(test)]
+const DEFAULT_AUDIO_SYS_CLK_HZ: u32 = 250_000_000;
 
 const EDGE_WORDS: usize = 8;
 const PWM_MAX_DUTY: u16 = 255;
@@ -42,6 +50,8 @@ pub struct AudioSinkSnapshot {
     pub timer_miss_count: u64,
     pub timer_due_cycle_sha256: String,
     pub block_start_count: u64,
+    pub block_frame_min: Option<u64>,
+    pub block_frame_max: Option<u64>,
     pub malformed_block_count: u64,
     pub block_boundary_gap_count: u64,
     pub block_boundary_gap_min_cycles: Option<u64>,
@@ -91,6 +101,8 @@ pub(crate) struct AudioSink {
     last_due_cycle: Option<u64>,
     block_start_count: u64,
     block_word_count: u64,
+    block_frame_min: Option<u64>,
+    block_frame_max: Option<u64>,
     malformed_block_count: u64,
     block_boundary_gap_count: u64,
     block_boundary_gap_min_cycles: Option<u64>,
@@ -102,6 +114,7 @@ pub(crate) struct AudioSink {
     service_latency_max_cycles: Option<u64>,
     timer_fraction_x: u16,
     timer_fraction_y: u16,
+    sample_rate_hz: u32,
     analysis_frame_count: u64,
     peak_abs_left: u32,
     peak_abs_right: u32,
@@ -139,6 +152,8 @@ impl Default for AudioSink {
             last_due_cycle: None,
             block_start_count: 0,
             block_word_count: 0,
+            block_frame_min: None,
+            block_frame_max: None,
             malformed_block_count: 0,
             block_boundary_gap_count: 0,
             block_boundary_gap_min_cycles: None,
@@ -150,6 +165,7 @@ impl Default for AudioSink {
             service_latency_max_cycles: None,
             timer_fraction_x: 0,
             timer_fraction_y: 0,
+            sample_rate_hz: 0,
             analysis_frame_count: 0,
             peak_abs_left: 0,
             peak_abs_right: 0,
@@ -186,6 +202,7 @@ impl AudioSink {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn observe_dma_write(
         &mut self,
         address: u32,
@@ -193,6 +210,32 @@ impl AudioSink {
         value: u32,
         treq: u8,
         timer_fraction: Option<(u16, u16)>,
+        timer_due_cycle: Option<u64>,
+        service_cycle: u64,
+        block_start: bool,
+    ) {
+        self.observe_dma_write_at_clock(
+            address,
+            width_bytes,
+            value,
+            treq,
+            timer_fraction,
+            DEFAULT_AUDIO_SYS_CLK_HZ,
+            timer_due_cycle,
+            service_cycle,
+            block_start,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_dma_write_at_clock(
+        &mut self,
+        address: u32,
+        width_bytes: u32,
+        value: u32,
+        treq: u8,
+        timer_fraction: Option<(u16, u16)>,
+        sys_clk_hz: u32,
         timer_due_cycle: Option<u64>,
         service_cycle: u64,
         block_start: bool,
@@ -212,8 +255,12 @@ impl AudioSink {
 
         self.dma_write_count = self.dma_write_count.saturating_add(1);
         if block_start {
-            if self.block_start_count != 0 && self.block_word_count != PICOCALC_AUDIO_HALF_FRAMES {
-                self.malformed_block_count = self.malformed_block_count.saturating_add(1);
+            if self.block_start_count != 0 {
+                if self.block_word_count == 0 {
+                    self.malformed_block_count = self.malformed_block_count.saturating_add(1);
+                } else {
+                    self.observe_block_length(self.block_word_count);
+                }
             }
             self.block_start_count = self.block_start_count.saturating_add(1);
             self.block_word_count = 0;
@@ -221,9 +268,6 @@ impl AudioSink {
             self.malformed_block_count = self.malformed_block_count.saturating_add(1);
         }
         self.block_word_count = self.block_word_count.saturating_add(1);
-        if self.block_word_count == PICOCALC_AUDIO_HALF_FRAMES + 1 {
-            self.malformed_block_count = self.malformed_block_count.saturating_add(1);
-        }
         self.pcm.update(value.to_le_bytes());
         self.observe_audio_frame(value);
         if self.first_words.len() < EDGE_WORDS {
@@ -240,6 +284,7 @@ impl AudioSink {
         if let Some((x, y)) = timer_fraction {
             self.timer_fraction_x = x;
             self.timer_fraction_y = y;
+            self.sample_rate_hz = sample_rate_hz(sys_clk_hz, x, y);
         }
         let Some(due_cycle) = timer_due_cycle else {
             self.missing_due_cycle_count = self.missing_due_cycle_count.saturating_add(1);
@@ -261,12 +306,16 @@ impl AudioSink {
                         .map_or(gap, |current| current.max(gap)),
                 );
             } else {
-                match gap {
-                    5208 => self.gap_5208_count = self.gap_5208_count.saturating_add(1),
-                    5209 => self.gap_5209_count = self.gap_5209_count.saturating_add(1),
-                    _ => {
-                        self.unexpected_gap_count = self.unexpected_gap_count.saturating_add(1);
+                if self.timer_fraction_x == 3 && self.timer_fraction_y == 15625 {
+                    match gap {
+                        5208 => self.gap_5208_count = self.gap_5208_count.saturating_add(1),
+                        5209 => self.gap_5209_count = self.gap_5209_count.saturating_add(1),
+                        _ => {
+                            self.unexpected_gap_count = self.unexpected_gap_count.saturating_add(1);
+                        }
                     }
+                } else if !timer_gap_is_valid(gap, self.timer_fraction_x, self.timer_fraction_y) {
+                    self.unexpected_gap_count = self.unexpected_gap_count.saturating_add(1);
                 }
             }
         }
@@ -284,7 +333,13 @@ impl AudioSink {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> AudioSinkSnapshot {
+        self.snapshot_at_clock(DEFAULT_AUDIO_SYS_CLK_HZ)
+    }
+
+    pub(crate) fn snapshot_at_clock(&self, sys_clk_hz: u32) -> AudioSinkSnapshot {
+        let (block_frame_min, block_frame_max) = self.observed_block_frame_bounds();
         let structurally_valid = self.dma_write_count > 0
             && self.target_write_attempt_count == self.dma_write_count
             && self.wrong_width_count == 0
@@ -292,14 +347,9 @@ impl AudioSink {
             && self.missing_due_cycle_count == 0
             && self.unexpected_gap_count == 0
             && self.malformed_block_count == 0
-            && self.block_word_count == PICOCALC_AUDIO_HALF_FRAMES
-            && self
-                .block_start_count
-                .saturating_mul(PICOCALC_AUDIO_HALF_FRAMES)
-                == self.dma_write_count
+            && self.block_start_count > 0
+            && self.block_word_count > 0
             && self.block_boundary_gap_count == self.block_start_count.saturating_sub(1)
-            && self.timer_fraction_x == 3
-            && self.timer_fraction_y == 15625
             && self.out_of_range_duty_sample_count == 0;
         let status = if self.target_write_attempt_count == 0 {
             "inactive"
@@ -338,6 +388,8 @@ impl AudioSink {
             timer_miss_count: 0,
             timer_due_cycle_sha256: hex(self.due_cycles.clone().finalize().as_slice()),
             block_start_count: self.block_start_count,
+            block_frame_min,
+            block_frame_max,
             malformed_block_count: self.malformed_block_count,
             block_boundary_gap_count: self.block_boundary_gap_count,
             block_boundary_gap_min_cycles: self.block_boundary_gap_min_cycles,
@@ -350,7 +402,11 @@ impl AudioSink {
             service_latency_max_cycles: self.service_latency_max_cycles,
             service_latency_sha256: hex(self.service_latencies.clone().finalize().as_slice()),
             analysis_frame_count: self.analysis_frame_count,
-            sample_rate_hz: 48_000,
+            sample_rate_hz: if self.sample_rate_hz != 0 {
+                self.sample_rate_hz
+            } else {
+                sample_rate_hz(sys_clk_hz, self.timer_fraction_x, self.timer_fraction_y)
+            },
             channel_count: PCM_CHANNELS as u8,
             reconstructed_pcm_format: "stereo_s16le_from_pwm8_duty",
             analysis_window_frames: ANALYSIS_WINDOW_FRAMES,
@@ -375,6 +431,37 @@ impl AudioSink {
             max_consecutive_rail_frames: self.max_consecutive_rail_frames,
             out_of_range_duty_sample_count: self.out_of_range_duty_sample_count,
         }
+    }
+
+    fn observed_block_frame_bounds(&self) -> (Option<u64>, Option<u64>) {
+        let mut minimum = self.block_frame_min;
+        let mut maximum = self.block_frame_max;
+        // Prefer completed descriptors.  A run stopped mid-DMA must not make
+        // a configured 32/128-frame block look like a one-off short block;
+        // if no descriptor completed yet, expose the current partial length.
+        if minimum.is_none() && self.block_word_count > 0 {
+            minimum = Some(minimum.map_or(self.block_word_count, |current| {
+                current.min(self.block_word_count)
+            }));
+            maximum = Some(maximum.map_or(self.block_word_count, |current| {
+                current.max(self.block_word_count)
+            }));
+        }
+        (minimum, maximum)
+    }
+
+    fn observe_block_length(&mut self, length: u64) {
+        if length == 0 {
+            return;
+        }
+        self.block_frame_min = Some(
+            self.block_frame_min
+                .map_or(length, |current| current.min(length)),
+        );
+        self.block_frame_max = Some(
+            self.block_frame_max
+                .map_or(length, |current| current.max(length)),
+        );
     }
 
     fn observe_audio_frame(&mut self, value: u32) {
@@ -476,6 +563,34 @@ fn ratio_ppm(numerator: u64, denominator: u64) -> u64 {
     }
 }
 
+/// Return the integer sample-rate represented by a DMA timer fraction.
+///
+/// DMA timer pacing is `x / y` events per `clk_sys` cycle.  Rounding to the
+/// nearest hertz keeps the report and RIFF header useful for common rates
+/// such as 22,050 Hz while preserving the exact fraction in the report.
+fn sample_rate_hz(sys_clk_hz: u32, x: u16, y: u16) -> u32 {
+    if sys_clk_hz == 0 || x == 0 || y == 0 {
+        return 0;
+    }
+    let numerator = u128::from(sys_clk_hz) * u128::from(x);
+    let rounded = (numerator + u128::from(y / 2)) / u128::from(y);
+    rounded.min(u128::from(u32::MAX)) as u32
+}
+
+/// Check a non-boundary inter-sample gap against the currently programmed
+/// timer fraction.  The fractional accumulator can produce either floor or
+/// ceil(`y / x`) system-clock gaps; no particular audio rate is privileged.
+fn timer_gap_is_valid(gap: u64, x: u16, y: u16) -> bool {
+    if x == 0 || y == 0 {
+        return false;
+    }
+    let x = u64::from(x);
+    let y = u64::from(y);
+    let minimum = y / x;
+    let maximum = minimum.saturating_add(u64::from(y % x != 0));
+    gap == minimum || gap == maximum
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -532,6 +647,36 @@ mod tests {
         assert_eq!(snapshot.gap_5209_count, 0);
         assert_eq!(snapshot.service_latency_min_cycles, Some(1));
         assert_eq!(snapshot.service_latency_max_cycles, Some(2));
+    }
+
+    #[test]
+    fn accepts_parameterized_22050hz_streams_and_reports_the_observed_block() {
+        let mut sink = AudioSink::default();
+        // 5/56689 is the RP2040 DMA timer fraction used for the
+        // approximately 22,050 Hz NESco stream at a 250 MHz sys clock.
+        let mut due = 11338u64;
+        for index in 0..32u64 {
+            sink.observe_dma_write(
+                PICOCALC_AUDIO_PWM_CC,
+                4,
+                0x0080_0080,
+                PICOCALC_AUDIO_TIMER_TREQ,
+                Some((5, 56689)),
+                Some(due),
+                due,
+                index == 0,
+            );
+            // The fractional timer legitimately alternates floor/ceil
+            // gaps; both must be accepted for a non-48 kHz stream.
+            due += if index % 5 == 4 { 11337 } else { 11338 };
+        }
+
+        let snapshot = sink.snapshot();
+        assert_eq!(snapshot.status, "pass");
+        assert_eq!(snapshot.sample_rate_hz, 22_050);
+        assert_eq!(snapshot.block_frame_min, Some(32));
+        assert_eq!(snapshot.block_frame_max, Some(32));
+        assert_eq!(snapshot.unexpected_gap_count, 0);
     }
 
     #[test]
