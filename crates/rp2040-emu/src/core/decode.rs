@@ -176,15 +176,14 @@ impl CortexM0Plus {
         // only clears entries; therefore the experimental OPT4-A path can
         // omit the repeated region predicate and rely on the full tag
         // comparison. A non-cacheable PC can share a slot with a cached
-        // entry, but it cannot share its full tag. The empty-entry sentinel
-        // must also be excluded explicitly: u32::MAX is not a valid
-        // halfword-aligned fetch PC, but an invalid/faulting PC may still
-        // carry that value through the core during fault delivery.
+        // entry, but it cannot share its full tag. The entry helper also
+        // excludes the representation-specific empty/fault sentinel: an
+        // invalid/faulting PC must not skip its bus access during delivery.
         #[cfg(feature = "unconditional-cache-lookup-prototype")]
         let entry = {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
             let e = self.decode_cache[slot];
-            if e.tag != u32::MAX && e.tag == pc {
+            if e.matches_pc(pc, slot) {
                 Some(e)
             } else {
                 None
@@ -194,7 +193,7 @@ impl CortexM0Plus {
         let entry = if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
             let e = self.decode_cache[slot];
-            if e.tag == pc { Some(e) } else { None }
+            if e.matches_pc(pc, slot) { Some(e) } else { None }
         } else {
             None
         };
@@ -252,12 +251,7 @@ impl CortexM0Plus {
             // Fetch fault — return a non-cacheable sentinel entry so
             // the caller can dispatch and the post-step fault delivery
             // runs.
-            return DecodedOp {
-                tag: u32::MAX,
-                hw0,
-                hw1: 0,
-                flags: 0,
-            };
+            return DecodedOp::fault_result(hw0, 0, false);
         }
 
         let wide = is_wide(hw0);
@@ -267,25 +261,10 @@ impl CortexM0Plus {
             0
         };
         if wide && bus.bus_fault() {
-            return DecodedOp {
-                tag: u32::MAX,
-                hw0,
-                hw1,
-                flags: DecodedOp::FLAG_WIDE,
-            };
+            return DecodedOp::fault_result(hw0, hw1, true);
         }
 
-        let mut flags = 0u8;
-        if wide {
-            flags |= DecodedOp::FLAG_WIDE;
-        }
-
-        let entry = DecodedOp {
-            tag: pc,
-            hw0,
-            hw1,
-            flags,
-        };
+        let entry = DecodedOp::from_parts(pc, hw0, hw1, wide);
 
         if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;

@@ -27,6 +27,8 @@ unconditional-cache-lookup-prototype = ["rp2040-emu/unconditional-cache-lookup-p
 # OPT4-B experimental NVIC pending bitmap scan. Not part of the default
 # conformance runner until its exactness/performance evidence is recorded.
 nvic-bitmap-scan-prototype = ["rp2040-emu/nvic-bitmap-scan-prototype"]
+# OPT4-C experimental packed 8-byte decode-cache entries.
+decoded-op-8byte-prototype = ["rp2040-emu/decoded-op-8byte-prototype"]
 
 [lints]
 workspace = true

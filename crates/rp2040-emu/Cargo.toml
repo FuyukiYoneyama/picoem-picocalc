@@ -58,6 +58,11 @@ unconditional-cache-lookup-prototype = []
 # promoted baseline has an exactness and performance record for the set-bit
 # traversal; the default priority scan remains unchanged.
 nvic-bitmap-scan-prototype = []
+# OPT4-C experimental 8-byte decoded-op representation. The packed tag
+# retains the full PC when combined with the direct-mapped slot; default
+# layout remains the reference path until exactness/performance evidence is
+# accepted.
+decoded-op-8byte-prototype = []
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }

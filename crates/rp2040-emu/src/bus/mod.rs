@@ -221,26 +221,32 @@ pub const XIP_SRAM_SIZE: usize = 16 * 1024;
 
 /// Number of entries in the per-core PC-keyed decoded-op cache.
 /// Direct-mapped, indexed by `(pc >> 1) & (DECODE_CACHE_SIZE - 1)`.
-/// 8192 entries × 12 B = 96 KB per core. Modelled on the RP2350 cache
+/// 8192 entries × 12 B = 96 KB per core (8 B in the
+/// `decoded-op-8byte-prototype` experiment). Modelled on the RP2350 cache
 /// (rp2350_emu commit 0c31479) but sized down: RP2040 hot loops are well
 /// under 1 KB and total executable space (16 KB ROM + 16 KB XIP-SRAM +
 /// 264 KB SRAM + 2 MB XIP flash) hashes to 8K slots without meaningful
 /// conflict pressure for the workloads we measure.
 pub(crate) const DECODE_CACHE_SIZE: usize = 8192;
 
-/// One decoded ARMv6-M instruction. 12 bytes (4 + 2 + 2 + 1 + 3 pad),
-/// `Copy`.
+/// One decoded ARMv6-M instruction, `Copy`.
 ///
 /// Populated lazily on a cache miss by
-/// [`crate::core::CortexM0Plus::populate_decode_cache`]. An entry with
-/// `tag == u32::MAX` is empty (that value is odd and cannot match a
-/// halfword-aligned PC).
+/// [`crate::core::CortexM0Plus::populate_decode_cache`]. In the default
+/// representation an entry with `tag == u32::MAX` is empty; the packed
+/// representation uses its valid bit instead.
+///
+/// The `decoded-op-8byte-prototype` representation stores the upper 18 PC
+/// bits and the wide flag in one `u32`; the direct-mapped slot supplies the
+/// lower PC bits. This preserves the full tag while reducing the entry from
+/// 12 to 8 bytes. The default representation remains unchanged.
 ///
 /// Differs from the rp2350_emu [`crate::bus::DecodedOp`] equivalent by
 /// dropping `fetch_wait` (RP2040 has no `extra_wait_states` accumulator
 /// — `Bus::read16` writes `last_access_cycles` but the core path does
 /// not consume it) and `is_thumb16_flag_only` (ARMv6-M has no IT
 /// blocks).
+#[cfg(not(feature = "decoded-op-8byte-prototype"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DecodedOp {
     /// PC this entry is valid for. Full tag (no shift). `u32::MAX` =
@@ -256,11 +262,42 @@ pub(crate) struct DecodedOp {
     pub flags: u8,
 }
 
+#[cfg(feature = "decoded-op-8byte-prototype")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DecodedOp {
+    /// Bits [17:0] contain `pc >> 14`; bit 18 is `is_wide`; bit 19 is the
+    /// valid bit. A zero valid bit is the empty/fault sentinel, allowing a
+    /// fault result to retain its wide classification without becoming a
+    /// cache hit.
+    tag_flags: u32,
+    /// First halfword (the one at PC).
+    pub hw0: u16,
+    /// Second halfword (at PC+2). Zero for narrow instructions.
+    pub hw1: u16,
+}
+
 impl DecodedOp {
+    #[cfg(not(feature = "decoded-op-8byte-prototype"))]
     pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
+
+    #[cfg(feature = "decoded-op-8byte-prototype")]
+    const TAG_MASK: u32 = (1 << 18) - 1;
+    #[cfg(feature = "decoded-op-8byte-prototype")]
+    const WIDE_MASK: u32 = 1 << 18;
+    #[cfg(feature = "decoded-op-8byte-prototype")]
+    const VALID_MASK: u32 = 1 << 19;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
+        #[cfg(feature = "decoded-op-8byte-prototype")]
+        {
+            return Self {
+                tag_flags: 0,
+                hw0: 0,
+                hw1: 0,
+            };
+        }
+        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
         Self {
             tag: u32::MAX,
             hw0: 0,
@@ -271,9 +308,153 @@ impl DecodedOp {
 
     #[inline(always)]
     pub(crate) fn is_wide(&self) -> bool {
-        self.flags & Self::FLAG_WIDE != 0
+        #[cfg(feature = "decoded-op-8byte-prototype")]
+        {
+            return self.tag_flags & Self::WIDE_MASK != 0;
+        }
+        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
+        {
+            self.flags & Self::FLAG_WIDE != 0
+        }
+    }
+
+    /// Build a valid decoded entry for a halfword-aligned PC.
+    #[inline(always)]
+    pub(crate) fn from_parts(pc: u32, hw0: u16, hw1: u16, wide: bool) -> Self {
+        #[cfg(feature = "decoded-op-8byte-prototype")]
+        {
+            let mut tag_flags = Self::VALID_MASK | ((pc >> 14) & Self::TAG_MASK);
+            if wide {
+                tag_flags |= Self::WIDE_MASK;
+            }
+            Self { tag_flags, hw0, hw1 }
+        }
+        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
+        {
+            Self {
+                tag: pc,
+                hw0,
+                hw1,
+                flags: if wide { Self::FLAG_WIDE } else { 0 },
+            }
+        }
+    }
+
+    /// Build an uncached fetch result while retaining its decoded halfwords.
+    #[inline(always)]
+    pub(crate) fn fault_result(hw0: u16, hw1: u16, wide: bool) -> Self {
+        #[cfg(feature = "decoded-op-8byte-prototype")]
+        {
+            let mut result = Self::empty();
+            result.hw0 = hw0;
+            result.hw1 = hw1;
+            if wide {
+                result.tag_flags = Self::WIDE_MASK;
+            }
+            result
+        }
+        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
+        {
+            Self {
+                tag: u32::MAX,
+                hw0,
+                hw1,
+                flags: if wide { Self::FLAG_WIDE } else { 0 },
+            }
+        }
+    }
+
+    /// Does this entry represent `pc` in the supplied direct-mapped slot?
+    #[inline(always)]
+    pub(crate) fn matches_pc(&self, pc: u32, _slot: usize) -> bool {
+        #[cfg(feature = "decoded-op-8byte-prototype")]
+        {
+            !self.is_empty()
+                && (self.tag_flags & Self::TAG_MASK) == ((pc >> 14) & Self::TAG_MASK)
+                && (_slot as u32 & ((DECODE_CACHE_SIZE as u32) - 1))
+                    == ((pc >> 1) & ((DECODE_CACHE_SIZE as u32) - 1))
+                && pc & 1 == 0
+        }
+        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
+        {
+            self.tag == pc
+        }
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        #[cfg(feature = "decoded-op-8byte-prototype")]
+        {
+            self.tag_flags & Self::VALID_MASK == 0
+        }
+        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
+        {
+            self.tag == u32::MAX
+        }
+    }
+
+    /// Reconstruct the full PC for diagnostics/tests from this entry and its
+    /// direct-mapped slot. Returns `u32::MAX` for an empty entry.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn tag_for_slot(&self, slot: usize) -> u32 {
+        #[cfg(feature = "decoded-op-8byte-prototype")]
+        {
+            if self.is_empty() {
+                u32::MAX
+            } else {
+                ((self.tag_flags & Self::TAG_MASK) << 14)
+                    | (((slot as u32) & ((DECODE_CACHE_SIZE as u32) - 1)) << 1)
+            }
+        }
+        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
+        {
+            let _ = slot;
+            self.tag
+        }
+    }
+
+    /// Set the full tag for a test/diagnostic cache fixture, retaining the
+    /// current wide bit in the experimental packed representation.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn set_tag_for_slot(&mut self, slot: usize, pc: u32) {
+        #[cfg(feature = "decoded-op-8byte-prototype")]
+        {
+            let _ = slot;
+            let wide = self.tag_flags & Self::WIDE_MASK;
+            self.tag_flags = Self::VALID_MASK | ((pc >> 14) & Self::TAG_MASK) | wide;
+        }
+        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
+        {
+            let _ = slot;
+            self.tag = pc;
+        }
+    }
+
+    /// Original address-region nibble used by region-scoped invalidation.
+    #[inline(always)]
+    pub(crate) fn region_nibble(&self) -> u8 {
+        #[cfg(feature = "decoded-op-8byte-prototype")]
+        {
+            if self.is_empty() {
+                0xF
+            } else {
+                ((self.tag_flags >> 14) & 0xF) as u8
+            }
+        }
+        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
+        {
+            (self.tag >> 28) as u8
+        }
     }
 }
+
+#[cfg(feature = "decoded-op-8byte-prototype")]
+const _: () = assert!(core::mem::size_of::<DecodedOp>() == 8);
+#[cfg(not(feature = "decoded-op-8byte-prototype"))]
+const _: () = assert!(core::mem::size_of::<DecodedOp>() == 12);
 
 /// True if `pc` lies in an executable region the cache may index.
 /// Only ROM (`0x0`), XIP / XIP-SRAM (`0x1`), and SRAM (`0x2`) qualify.

@@ -495,11 +495,11 @@ impl CortexM0Plus {
         }
         // Region-scoped sweep: the region of a cached tag is
         // `(tag >> 28) as u8` (ROM = 0, XIP = 1, SRAM = 2). Bit `n` of
-        // `regions` matches region `n`. Empty slots
-        // (`tag == u32::MAX`, nibble = 0xF) never match a valid region
-        // bit, so they're skipped without special-casing.
+        // `regions` matches region `n`. The entry helper maps empty slots
+        // to a non-cacheable nibble, so they are skipped without
+        // special-casing in either cache representation.
         for slot in self.decode_cache.iter_mut() {
-            let nibble = (slot.tag >> 28) as u8;
+            let nibble = slot.region_nibble();
             if nibble < 8 && regions & (1 << nibble) != 0 {
                 *slot = empty;
             }
