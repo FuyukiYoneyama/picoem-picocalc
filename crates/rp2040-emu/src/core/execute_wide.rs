@@ -86,7 +86,7 @@ impl CortexM0Plus {
 
     /// Dispatch the misc-control group (hw1[15:14] = 10).
     #[inline]
-    fn thumb32_misc_control(&mut self, hw0: u16, hw1: u16) -> u32 {
+    pub(crate) fn thumb32_misc_control(&mut self, hw0: u16, hw1: u16) -> u32 {
         // Barriers — DDI 0419 §A6.7.14: hw0 == 0xF3BF, hw1[15:12] == 0x8,
         // hw1[11:8] == 0xF.
         if hw0 == 0xF3BF && (hw1 & 0xFF00) == 0x8F00 {

@@ -11868,6 +11868,28 @@ mod stage4_core_residue_v2 {
         assert_eq!(cpu.regs.pc(), pc + 8);
     }
 
+    /// The compact key must preserve the bit-10 split between data
+    /// processing and special-data/BX encodings on an actual cache hit.
+    #[cfg(feature = "compact-dispatch-key-prototype")]
+    #[test]
+    fn cache_hit_narrow_special_data_dispatches_from_compact_key() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::default();
+        let pc = 0x2000_0000u32;
+        let target = 0x2000_0020u32;
+
+        bus.write16(pc, 0x4710); // BX r2
+        bus.write16(target, 0xBF00); // NOP at the branch target
+        cpu.regs.r[2] = target | 1;
+
+        cpu.regs.set_pc(pc);
+        cpu.decode_execute(&mut bus); // populate
+        cpu.regs.set_pc(pc);
+        cpu.decode_execute(&mut bus); // compact-key cache hit
+
+        assert_eq!(cpu.regs.pc(), target);
+    }
+
     /// L178 — cache slot lookup MISS path with cacheable PC. The slot
     /// already holds a different tag, so the `e.tag == pc` check fails
     /// and `populate_decode_cache` runs.

@@ -33,6 +33,15 @@ use std::io::Write;
 use tracing::debug;
 
 use picoem_common::PioBlock;
+
+#[cfg(all(
+    feature = "compact-dispatch-key-prototype",
+    feature = "decoded-op-8byte-prototype"
+))]
+compile_error!(
+    "compact-dispatch-key-prototype is incompatible with decoded-op-8byte-prototype; enable one cache representation at a time"
+);
+
 use picoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 
 use crate::core::Nvic;
@@ -280,6 +289,17 @@ impl DecodedOp {
     #[cfg(not(feature = "decoded-op-8byte-prototype"))]
     pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
 
+    #[cfg(all(
+        feature = "compact-dispatch-key-prototype",
+        not(feature = "decoded-op-8byte-prototype")
+    ))]
+    pub(crate) const FLAG_DISPATCH_KEY_MASK: u8 = 0b0111_1110;
+    #[cfg(all(
+        feature = "compact-dispatch-key-prototype",
+        not(feature = "decoded-op-8byte-prototype")
+    ))]
+    pub(crate) const FLAG_DISPATCH_KEY_SHIFT: u8 = 1;
+
     #[cfg(feature = "decoded-op-8byte-prototype")]
     const TAG_MASK: u32 = (1 << 18) - 1;
     #[cfg(feature = "decoded-op-8byte-prototype")]
@@ -316,6 +336,30 @@ impl DecodedOp {
         {
             self.flags & Self::FLAG_WIDE != 0
         }
+    }
+
+    /// Compact handler class stored in the otherwise-unused default flags.
+    /// The OPT4-C packed entry is explicitly incompatible with this feature.
+    #[cfg(all(
+        feature = "compact-dispatch-key-prototype",
+        not(feature = "decoded-op-8byte-prototype")
+    ))]
+    #[inline(always)]
+    pub(crate) fn dispatch_key(&self) -> u8 {
+        (self.flags & Self::FLAG_DISPATCH_KEY_MASK) >> Self::FLAG_DISPATCH_KEY_SHIFT
+    }
+
+    #[cfg(all(
+        feature = "compact-dispatch-key-prototype",
+        not(feature = "decoded-op-8byte-prototype")
+    ))]
+    #[inline(always)]
+    pub(crate) fn with_dispatch_key(mut self, wide: bool, key: u8) -> Self {
+        debug_assert!(key <= (Self::FLAG_DISPATCH_KEY_MASK >> Self::FLAG_DISPATCH_KEY_SHIFT));
+        self.flags = (self.flags & !(Self::FLAG_WIDE | Self::FLAG_DISPATCH_KEY_MASK))
+            | (if wide { Self::FLAG_WIDE } else { 0 })
+            | ((key << Self::FLAG_DISPATCH_KEY_SHIFT) & Self::FLAG_DISPATCH_KEY_MASK);
+        self
     }
 
     /// Build a valid decoded entry for a halfword-aligned PC.

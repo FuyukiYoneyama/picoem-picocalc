@@ -31,6 +31,8 @@ nvic-bitmap-scan-prototype = ["rp2040-emu/nvic-bitmap-scan-prototype"]
 decoded-op-8byte-prototype = ["rp2040-emu/decoded-op-8byte-prototype"]
 # OPT4-D experimental compile-out of ordinary instruction PC attribution.
 diagnostic-pc-compile-out-prototype = ["rp2040-emu/diagnostic-pc-compile-out-prototype"]
+# OPT4-E experimental compact dispatch key in the default decoded-op flags.
+compact-dispatch-key-prototype = ["rp2040-emu/compact-dispatch-key-prototype"]
 
 [lints]
 workspace = true
