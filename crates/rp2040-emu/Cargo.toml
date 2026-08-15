@@ -49,6 +49,11 @@ event-horizon-profiler = ["idle-profiler", "behavior-trace"]
 # builds so the performance path contains neither a disabled branch nor a
 # hash state. The optional dependency exists only in diagnostic binaries.
 behavior-trace = []
+# OPT4-A experimental decode-cache lookup. The cache only accepts entries
+# from cacheable executable regions, so production lookup can compare the
+# full tag without repeating that region predicate. Kept opt-in until the
+# current promoted baseline has a fresh exactness/performance record.
+unconditional-cache-lookup-prototype = []
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }

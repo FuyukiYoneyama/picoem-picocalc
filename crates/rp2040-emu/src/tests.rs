@@ -9259,6 +9259,41 @@ mod decode_cache {
     }
 
     #[test]
+    fn non_cacheable_pc_does_not_hit_a_colliding_cache_entry() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::new();
+        let cache_pc = 0x2000_0000u32;
+        bus.write16(cache_pc, 0x3001); // ADDS r0, r0, #1
+        cpu.regs.set_pc(cache_pc);
+        cpu.decode_execute(&mut bus);
+
+        // Region 0xE is not cacheable, but this address deliberately hashes
+        // to the same slot as cache_pc. OPT4-A must compare the full tag and
+        // take the slow path rather than execute the cached SRAM operation.
+        let non_cacheable_pc = 0xE000_0000u32;
+        let slot = ((cache_pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        assert_eq!(
+            slot,
+            ((non_cacheable_pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize
+        );
+        cpu.regs.set_pc(non_cacheable_pc);
+        let _ = cpu.decode_execute(&mut bus);
+        assert_eq!(cpu.decode_cache[slot].tag, cache_pc);
+    }
+
+    #[test]
+    fn empty_sentinel_does_not_match_faulting_pc() {
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::new();
+        // The empty entry uses u32::MAX as its tag.  An invalid fetch PC can
+        // carry the same value, so OPT4-A must not mistake the empty entry
+        // for a decoded operation and skip the faulting bus access.
+        cpu.regs.set_pc(u32::MAX);
+        let _ = cpu.decode_execute(&mut bus);
+        assert!(bus.bus_fault());
+    }
+
+    #[test]
     fn wide_instruction_caches_both_halfwords() {
         let mut cpu = CortexM0Plus::new();
         let mut bus = Bus::new();

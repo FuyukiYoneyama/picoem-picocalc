@@ -171,7 +171,26 @@ impl CortexM0Plus {
         bus.set_active_pc(pc);
 
         // Cache lookup — `DecodedOp: Copy`, so no borrow on `bus`
-        // survives into dispatch.
+        // survives into dispatch. Every cache write is guarded by
+        // `is_cacheable_pc` in `populate_decode_cache`, and invalidation
+        // only clears entries; therefore the experimental OPT4-A path can
+        // omit the repeated region predicate and rely on the full tag
+        // comparison. A non-cacheable PC can share a slot with a cached
+        // entry, but it cannot share its full tag. The empty-entry sentinel
+        // must also be excluded explicitly: u32::MAX is not a valid
+        // halfword-aligned fetch PC, but an invalid/faulting PC may still
+        // carry that value through the core during fault delivery.
+        #[cfg(feature = "unconditional-cache-lookup-prototype")]
+        let entry = {
+            let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
+            let e = self.decode_cache[slot];
+            if e.tag != u32::MAX && e.tag == pc {
+                Some(e)
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "unconditional-cache-lookup-prototype"))]
         let entry = if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
             let e = self.decode_cache[slot];
