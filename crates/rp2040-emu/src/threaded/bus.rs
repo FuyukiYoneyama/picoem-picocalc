@@ -1117,6 +1117,18 @@ impl CoreBus for WorkerBus {
         self.active_pc = pc;
     }
 
+    #[inline(always)]
+    fn set_active_pc_for_instruction(&mut self, pc: u32) {
+        #[cfg(feature = "diagnostic-pc-compile-out-prototype")]
+        {
+            let _ = pc;
+        }
+        #[cfg(not(feature = "diagnostic-pc-compile-out-prototype"))]
+        {
+            self.active_pc = pc;
+        }
+    }
+
     // --- Bus fault ----------------------------------------------------
 
     fn bus_fault(&self) -> bool {

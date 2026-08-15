@@ -2740,6 +2740,18 @@ impl CoreBus for Bus {
     }
 
     #[inline(always)]
+    fn set_active_pc_for_instruction(&mut self, pc: u32) {
+        #[cfg(feature = "diagnostic-pc-compile-out-prototype")]
+        {
+            let _ = pc;
+        }
+        #[cfg(not(feature = "diagnostic-pc-compile-out-prototype"))]
+        {
+            Bus::set_active_pc(self, pc);
+        }
+    }
+
+    #[inline(always)]
     fn bus_fault(&self) -> bool {
         Bus::bus_fault(self)
     }
@@ -3214,6 +3226,21 @@ mod tests {
         bus.write32(0x2000_0200, 0xCAFE_F00D);
         let _ = bus.read32(0x2000_0200);
         assert!(capture.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn instruction_pc_publication_respects_opt4d_boundary() {
+        use crate::core::CoreBus;
+
+        let mut bus = Bus::new();
+        bus.set_active_core(0);
+        bus.set_active_pc(0x1111_0000);
+        CoreBus::set_active_pc_for_instruction(&mut bus, 0x2222_0000);
+
+        #[cfg(not(feature = "diagnostic-pc-compile-out-prototype"))]
+        assert_eq!(bus.active_pc[0], 0x2222_0000);
+        #[cfg(feature = "diagnostic-pc-compile-out-prototype")]
+        assert_eq!(bus.active_pc[0], 0x1111_0000);
     }
 
     #[test]

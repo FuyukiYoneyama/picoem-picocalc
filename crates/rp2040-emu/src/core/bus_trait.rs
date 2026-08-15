@@ -65,6 +65,26 @@ pub trait CoreBus {
     /// per-core; the active core is set via `Bus::set_active_core`.
     fn set_active_pc(&mut self, pc: u32);
 
+    /// Publish the PC at an ordinary instruction boundary.
+    ///
+    /// OPT4-D uses a compile-time no-op here to remove the per-instruction
+    /// diagnostic store from the performance candidate. Explicit diagnostic
+    /// paths (exception entry/return and callers that request trace data)
+    /// continue to use [`Self::set_active_pc`] directly, so this opt-in
+    /// feature never silently changes the diagnostic API into a valid
+    /// correctness result.
+    #[inline(always)]
+    #[cfg(feature = "diagnostic-pc-compile-out-prototype")]
+    fn set_active_pc_for_instruction(&mut self, _pc: u32) {}
+
+    /// Reference/default implementation: preserve the existing per-core
+    /// active-PC update in normal builds.
+    #[inline(always)]
+    #[cfg(not(feature = "diagnostic-pc-compile-out-prototype"))]
+    fn set_active_pc_for_instruction(&mut self, pc: u32) {
+        self.set_active_pc(pc);
+    }
+
     // --- Bus fault ----------------------------------------------------
 
     /// True if a synchronous bus fault is pending. Single sticky flag

@@ -29,6 +29,8 @@ unconditional-cache-lookup-prototype = ["rp2040-emu/unconditional-cache-lookup-p
 nvic-bitmap-scan-prototype = ["rp2040-emu/nvic-bitmap-scan-prototype"]
 # OPT4-C experimental packed 8-byte decode-cache entries.
 decoded-op-8byte-prototype = ["rp2040-emu/decoded-op-8byte-prototype"]
+# OPT4-D experimental compile-out of ordinary instruction PC attribution.
+diagnostic-pc-compile-out-prototype = ["rp2040-emu/diagnostic-pc-compile-out-prototype"]
 
 [lints]
 workspace = true

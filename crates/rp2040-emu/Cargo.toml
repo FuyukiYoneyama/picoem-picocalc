@@ -63,6 +63,10 @@ nvic-bitmap-scan-prototype = []
 # layout remains the reference path until exactness/performance evidence is
 # accepted.
 decoded-op-8byte-prototype = []
+# OPT4-D experimental compile-out of the ordinary instruction-boundary
+# active-PC diagnostic store. Explicit diagnostic/exception paths retain
+# `set_active_pc`; this feature is for trace/proof-off performance screening.
+diagnostic-pc-compile-out-prototype = []
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }

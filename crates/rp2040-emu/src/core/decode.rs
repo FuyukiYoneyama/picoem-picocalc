@@ -168,7 +168,7 @@ impl CortexM0Plus {
         // (HLD V7 §4.3) can report it for every access this instruction
         // performs. Set before the fetch so the I-fetch itself is tagged
         // with its own PC.
-        bus.set_active_pc(pc);
+        bus.set_active_pc_for_instruction(pc);
 
         // Cache lookup — `DecodedOp: Copy`, so no borrow on `bus`
         // survives into dispatch. Every cache write is guarded by
