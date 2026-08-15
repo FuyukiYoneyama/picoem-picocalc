@@ -203,24 +203,52 @@ impl Nvic {
         if candidates == 0 {
             return None;
         }
-        let mut best_irq: u8 = 0;
-        let mut best_prio: u8 = 0xFF;
-        let mut found = false;
-        for irq in 0u8..32 {
-            if candidates & (1u32 << irq) == 0 {
-                continue;
+
+        // OPT4-B prototype: visit only set bits in ascending IRQ order.
+        // `trailing_zeros` yields the lowest remaining IRQ, so the existing
+        // equal-priority tie-break is preserved exactly.  Do not enable this
+        // in the default build until the candidate has an independent
+        // exactness/performance record.
+        #[cfg(feature = "nvic-bitmap-scan-prototype")]
+        {
+            let mut remaining = candidates;
+            let mut best_irq = 0u8;
+            let mut best_prio = 0xFFu8;
+            let mut found = false;
+            while remaining != 0 {
+                let irq = remaining.trailing_zeros() as u8;
+                let p = self.priority[irq as usize];
+                if !found || p < best_prio {
+                    best_irq = irq;
+                    best_prio = p;
+                    found = true;
+                }
+                remaining &= remaining - 1;
             }
-            let p = self.priority[irq as usize];
-            if !found || p < best_prio {
-                best_irq = irq;
-                best_prio = p;
-                found = true;
-            }
+            return found.then_some((best_irq, best_prio));
         }
-        if found {
-            Some((best_irq, best_prio))
-        } else {
-            None
+
+        #[cfg(not(feature = "nvic-bitmap-scan-prototype"))]
+        {
+            let mut best_irq: u8 = 0;
+            let mut best_prio: u8 = 0xFF;
+            let mut found = false;
+            for irq in 0u8..32 {
+                if candidates & (1u32 << irq) == 0 {
+                    continue;
+                }
+                let p = self.priority[irq as usize];
+                if !found || p < best_prio {
+                    best_irq = irq;
+                    best_prio = p;
+                    found = true;
+                }
+            }
+            return if found {
+                Some((best_irq, best_prio))
+            } else {
+                None
+            };
         }
     }
 }
@@ -386,5 +414,22 @@ mod tests {
         let mut n = Nvic::new();
         n.set_enabled(8);
         assert_eq!(n.pending_and_enabled(), 0);
+    }
+
+    #[cfg(feature = "nvic-bitmap-scan-prototype")]
+    #[test]
+    fn bitmap_scan_visits_sparse_candidates_in_irq_order() {
+        let mut n = Nvic::new();
+        // Sparse candidates exercise clearing the lowest set bit and the
+        // lowest-IRQ tie break.  The priority winner is deliberately not
+        // the first candidate visited.
+        for irq in [1, 17, 25] {
+            n.set_pending(irq);
+            n.set_enabled(irq);
+        }
+        n.set_priority(1, 0x80);
+        n.set_priority(17, 0x40);
+        n.set_priority(25, 0x40);
+        assert_eq!(n.highest_priority_pending(), Some((17, 0x40)));
     }
 }

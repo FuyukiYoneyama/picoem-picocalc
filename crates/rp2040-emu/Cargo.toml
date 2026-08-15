@@ -54,6 +54,10 @@ behavior-trace = []
 # full tag without repeating that region predicate. Kept opt-in until the
 # current promoted baseline has a fresh exactness/performance record.
 unconditional-cache-lookup-prototype = []
+# OPT4-B experimental NVIC pending bitmap scan.  Kept opt-in until the
+# promoted baseline has an exactness and performance record for the set-bit
+# traversal; the default priority scan remains unchanged.
+nvic-bitmap-scan-prototype = []
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }

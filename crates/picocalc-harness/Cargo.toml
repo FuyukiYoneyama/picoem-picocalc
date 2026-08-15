@@ -24,6 +24,9 @@ event-horizon-profiler = ["idle-profiler", "behavior-trace", "rp2040-emu/event-h
 behavior-trace = ["rp2040-emu/behavior-trace"]
 # OPT4-A experimental decode-cache lookup. Not part of the default runner.
 unconditional-cache-lookup-prototype = ["rp2040-emu/unconditional-cache-lookup-prototype"]
+# OPT4-B experimental NVIC pending bitmap scan. Not part of the default
+# conformance runner until its exactness/performance evidence is recorded.
+nvic-bitmap-scan-prototype = ["rp2040-emu/nvic-bitmap-scan-prototype"]
 
 [lints]
 workspace = true
