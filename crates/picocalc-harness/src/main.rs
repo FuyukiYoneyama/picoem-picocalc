@@ -4686,6 +4686,8 @@ mod tests {
     use super::build_running_event_profile_report;
     #[cfg(feature = "event-horizon-profiler")]
     use rp2040_emu::RunningEventProfileSnapshot;
+    #[cfg(feature = "event-horizon-profiler")]
+    use rp2040_emu::bus::UART0_BASE;
     #[cfg(feature = "behavior-trace")]
     use rp2040_emu::{BehaviorEventDomain, BehaviorTraceDomainSnapshot, BehaviorTraceSnapshot};
 
@@ -5658,5 +5660,51 @@ mod tests {
             &profile,
         );
         assert_eq!(report.as_bytes(), report2.as_bytes());
+    }
+
+    #[cfg(feature = "event-horizon-profiler")]
+    #[test]
+    fn deferred_event_marker_is_recognised_across_uart_drains() {
+        let emu = EmulatorBuilder::new(Config::default())
+            .build()
+            .expect("serial emulator build");
+        let mut machine = MachineSession::new(emu, BoardHandles::default());
+        machine.arm_event_profile_after_uart("READY".to_string());
+        // The UART log is drained by the same method used by the run loop.
+        // Write the marker in two separate batches so no single drain sees
+        // the complete marker; the persistent accumulation must still match.
+        machine.emu.bus.write32(0x4000_f000, 1 << 22); // release UART0
+        machine.emu.bus.write32(UART0_BASE + 0x30, 0x101); // UARTEN | TXE
+        for byte in b"REA" {
+            machine.emu.bus.write8(UART0_BASE, *byte);
+        }
+        machine.drain_uart();
+        assert!(machine.event_profile_after_uart.is_some());
+        assert!(machine.event_profile_start_cycle.is_none());
+
+        for byte in b"DY" {
+            machine.emu.bus.write8(UART0_BASE, *byte);
+        }
+        let drain_cycle = machine.cycles();
+        machine.drain_uart();
+        assert!(machine.event_profile_after_uart.is_none());
+        assert_eq!(machine.event_profile_start_cycle, Some(drain_cycle));
+        assert!(machine.emu.running_event_profile_snapshot().is_some());
+    }
+
+    #[cfg(feature = "event-horizon-profiler")]
+    #[test]
+    fn deferred_event_marker_remains_unactivated_at_run_boundary() {
+        for stop_reason in [StopReason::ScenarioDone, StopReason::CycleLimit] {
+            let emu = EmulatorBuilder::new(Config::default())
+                .build()
+                .expect("serial emulator build");
+            let mut machine = MachineSession::new(emu, BoardHandles::default());
+            machine.arm_event_profile_after_uart("NEVER".to_string());
+            let _outcome = machine.finish(stop_reason, None, None);
+            assert!(machine.event_profile_after_uart.is_some());
+            assert!(machine.event_profile_start_cycle.is_none());
+            assert!(machine.emu.running_event_profile_snapshot().is_none());
+        }
     }
 }
