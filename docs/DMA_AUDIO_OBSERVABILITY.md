@@ -111,8 +111,10 @@ cargo test -p rp2040-emu --test dma_quantum_invariance
 ```
 
 The workloads cover FORCE transfer, timer-paced transfer, two-channel FORCE
-competition, chain plus read-ring operation, and a fixed-destination timer-paced
-PWM audio fixture. The test directly compares destination data, channel
+competition, chain plus read-ring operation, a fixed-destination timer-paced
+PWM audio fixture, and five HIGH_PRIORITY／timer contention cases (including
+same-cycle timer tie-break, audio-versus-FORCE, and chain-induced priority-tier
+change). The test directly compares destination data, channel
 addresses/count/control/busy state, DMA interrupt/NVIC state, timer registers and
 accumulators, cumulative event/miss classifications, and the complete audio
 PCM/due-cycle/block/latency observation. Chain and read-ring behaviour are
@@ -123,7 +125,7 @@ the final tick window is partitioned differently at different quanta. The test
 checks their internal consistency (including due-cycle presence when a window
 contains events) rather than falsely requiring those last-window values to be
 equal. Audio-selected due cycles remain a cumulative digest and are compared
-exactly. The 5/5 workload comparison is a local validation result; it does not
+exactly. The 10/10 workload comparison is a local validation result; it does not
 yet make the backend eligible for a promoted PicoCalc target pin.
 
 Passing this test means that the tested model is invariant for those workloads

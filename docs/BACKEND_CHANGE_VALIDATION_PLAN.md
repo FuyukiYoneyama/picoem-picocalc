@@ -15,6 +15,8 @@ Clippy gate、CLI end-to-end、firmware再回帰は未完了なので、promotio
 - `rp2040-emu` unit test 1246件は合格する。
 - DMA quantum-invariance integration test 5件は合格する。
 - `picocalc-harness --features event-horizon-profiler`のunit test 67件は合格する。
+- HIGH_PRIORITY／timer競合の量子幅integration test 5件を追加し、DMA quantum-invarianceは
+  合計10/10で合格する。
 - 量子幅比較は`Emulator::run`の実行サイクルが命令境界でovershootする契約を考慮し、
   1／16／64の全実行を実際の共通198 master-cycle境界で比較する。
 - 最終tick窓だけを表す`timer_due_cycle`／`timer_window_*`は量子幅で窓の分割が変わるため、
@@ -74,7 +76,7 @@ fixed-destination PWM audio fixtureを追加し、FORCE、timer、競合、chain
 比較すると誤検出になるため、テストは共通の実行境界を明示し、window-localな観測値は
 「量子幅不変な累積契約」と混同しないよう整合性だけを検査する。
 
-### 3. HIGH_PRIORITYとtimer競合を局所試験する
+### 3. HIGH_PRIORITYとtimer競合を局所試験する — 完了 2026-08-16
 
 量子`1`、`16`、`64`で少なくとも次を比較する。
 
@@ -86,6 +88,11 @@ fixed-destination PWM audio fixtureを追加し、FORCE、timer、競合、chain
 - chain後にready setまたはpriority tierが変わるケース
 
 最終メモリだけでなく、選択channel、timer消費、IRQ、audio観測も一致条件へ含める。
+
+backend commit `00b05f5`で5件を追加した。高優先度FORCE対normal FORCE、高優先度timer対
+normal FORCE、同一timer周期のlowest-channel tie-break、PicoCalc audio timer対normal FORCE、
+chain後のpriority tier変化を、量子1／16／64で実行した。転送結果・channel残量・timer event／
+miss分類・IRQ・audio sinkを比較し、10/10 workloadが合格した。
 
 ### 4. report／CLIのend-to-end試験を追加する
 
