@@ -263,6 +263,8 @@ struct Args {
     behavior_trace: Option<PathBuf>,
     #[cfg(feature = "event-horizon-profiler")]
     event_horizon_profile: Option<PathBuf>,
+    #[cfg(feature = "event-horizon-profiler")]
+    event_horizon_profile_after_uart: Option<String>,
 }
 
 const PROGRESS_CLOCK_CHECK_DISPATCHES: u64 = 256;
@@ -518,9 +520,11 @@ fn print_usage() {
          --expect-audio-sink-sha256 <hex>\n\
                                   Require the little-endian PWM5_CC stream SHA-256.\n\
          --audio-analysis <path> Write deterministic digital-level metrics reconstructed\n\
-                                  from the 8-bit stereo PWM duty stream.\n\
+                                  from the 8-bit stereo PWM duty stream; may be used without\n\
+                                  --board picocalc for audio-only capture.\n\
          --audio-wav <path>      Write the same unnormalised reconstructed stream as\n\
-                                  an observed-rate stereo signed-16 WAV for listening.\n\
+                                  an observed-rate stereo signed-16 WAV for listening; may be\n\
+                                  used without --board picocalc for audio-only capture.\n\
          --flash-image-out <path> Export the final 2 MiB XIP image after SSI erase/program.\n\\
          -h, --help               This message."
     );
@@ -538,6 +542,12 @@ fn print_usage() {
         "         --event-horizon-profile <path>\n\
                                           OPT2-D running-boundary/decode opportunity profile.\n\
                                           Not valid for wall-time measurement."
+    );
+    #[cfg(feature = "event-horizon-profiler")]
+    eprintln!(
+        "         --event-horizon-profile-after-uart <text>\n\
+                                          Defer OPT2-D until this UART marker is observed.\n\
+                                          Requires --event-horizon-profile."
     );
 }
 
@@ -591,6 +601,8 @@ fn parse_args() -> Result<Args, String> {
     let mut behavior_trace: Option<PathBuf> = None;
     #[cfg(feature = "event-horizon-profiler")]
     let mut event_horizon_profile: Option<PathBuf> = None;
+    #[cfg(feature = "event-horizon-profiler")]
+    let mut event_horizon_profile_after_uart: Option<String> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -734,6 +746,15 @@ fn parse_args() -> Result<Args, String> {
             "--event-horizon-profile" => {
                 event_horizon_profile = Some(PathBuf::from(value("--event-horizon-profile")?))
             }
+            #[cfg(feature = "event-horizon-profiler")]
+            "--event-horizon-profile-after-uart" => {
+                let marker = value("--event-horizon-profile-after-uart")?;
+                if marker.is_empty() {
+                    return Err("--event-horizon-profile-after-uart marker must not be empty"
+                        .to_string());
+                }
+                event_horizon_profile_after_uart = Some(marker);
+            }
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
                 psram_verify_range = Some(parse_range(&raw)?);
@@ -790,12 +811,6 @@ fn parse_args() -> Result<Args, String> {
                 .to_string(),
         );
     }
-    if expected_audio_sink_count.is_some() && board != Board::PicoCalc {
-        return Err("audio sink expectations require --board picocalc".to_string());
-    }
-    if (audio_analysis.is_some() || audio_wav.is_some()) && board != Board::PicoCalc {
-        return Err("audio analysis and WAV output require --board picocalc".to_string());
-    }
     match (&run_id, progress_interval) {
         (Some(_), None) => return Err("--run-id requires --progress-interval".to_string()),
         (None, Some(_)) => {
@@ -840,6 +855,13 @@ fn parse_args() -> Result<Args, String> {
     if machine_api && event_horizon_profile.is_some() {
         return Err("--machine-api cannot be combined with --event-horizon-profile".to_string());
     }
+    #[cfg(feature = "event-horizon-profiler")]
+    if machine_api && event_horizon_profile_after_uart.is_some() {
+        return Err(
+            "--machine-api cannot be combined with --event-horizon-profile-after-uart"
+                .to_string(),
+        );
+    }
     #[cfg(all(feature = "idle-profiler", feature = "behavior-trace"))]
     if idle_profile.is_some() && behavior_trace.is_some() {
         return Err(
@@ -851,6 +873,12 @@ fn parse_args() -> Result<Args, String> {
         return Err(
             "--event-horizon-profile is a separate diagnostic mode from --idle-profile/--behavior-trace"
                 .to_string(),
+        );
+    }
+    #[cfg(feature = "event-horizon-profiler")]
+    if event_horizon_profile_after_uart.is_some() && event_horizon_profile.is_none() {
+        return Err(
+            "--event-horizon-profile-after-uart requires --event-horizon-profile".to_string(),
         );
     }
 
@@ -892,6 +920,8 @@ fn parse_args() -> Result<Args, String> {
         behavior_trace,
         #[cfg(feature = "event-horizon-profiler")]
         event_horizon_profile,
+        #[cfg(feature = "event-horizon-profiler")]
+        event_horizon_profile_after_uart,
     })
 }
 
@@ -1357,6 +1387,10 @@ struct MachineSession {
     dispatches: u64,
     board: BoardHandles,
     sticky_stop: Option<SessionStop>,
+    #[cfg(feature = "event-horizon-profiler")]
+    event_profile_after_uart: Option<String>,
+    #[cfg(feature = "event-horizon-profiler")]
+    event_profile_start_cycle: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1376,6 +1410,10 @@ impl MachineSession {
             dispatches: 0,
             board,
             sticky_stop: None,
+            #[cfg(feature = "event-horizon-profiler")]
+            event_profile_after_uart: None,
+            #[cfg(feature = "event-horizon-profiler")]
+            event_profile_start_cycle: None,
         }
     }
 
@@ -1413,6 +1451,31 @@ impl MachineSession {
     fn drain_uart(&mut self) {
         self.uart_bytes
             .extend_from_slice(&self.emu.drain_uart0_tx_log());
+        #[cfg(feature = "event-horizon-profiler")]
+        self.maybe_start_event_profile();
+    }
+
+    #[cfg(feature = "event-horizon-profiler")]
+    fn arm_event_profile_after_uart(&mut self, marker: String) {
+        self.event_profile_after_uart = Some(marker);
+    }
+
+    #[cfg(feature = "event-horizon-profiler")]
+    fn maybe_start_event_profile(&mut self) {
+        let Some(marker) = self.event_profile_after_uart.as_deref() else {
+            return;
+        };
+        if self
+            .uart_bytes
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+        {
+            self.emu
+                .enable_running_event_profiler()
+                .expect("deferred event profiler is enabled on Serial emulator");
+            self.event_profile_start_cycle = Some(self.cycles());
+            self.event_profile_after_uart = None;
+        }
     }
 
     fn poll_scenario(&mut self, engine: &mut scenario::Engine) {
@@ -2792,7 +2855,7 @@ fn decode_profile_json(value: &DecodeProfileSnapshot) -> String {
     )
 }
 
-#[cfg(feature = "event-horizon-profiler")]
+#[cfg(all(feature = "event-horizon-profiler", test))]
 #[allow(clippy::too_many_arguments)]
 fn build_running_event_profile_report(
     backend_commit: &str,
@@ -2803,8 +2866,42 @@ fn build_running_event_profile_report(
     outcome: &RunOutcome,
     profile: &RunningEventProfileSnapshot,
 ) -> String {
+    build_running_event_profile_report_with_activation(
+        backend_commit,
+        backend_dirty,
+        firmware_name,
+        firmware_sha,
+        step_quantum,
+        None,
+        None,
+        outcome,
+        profile,
+    )
+}
+
+#[cfg(feature = "event-horizon-profiler")]
+#[allow(clippy::too_many_arguments)]
+fn build_running_event_profile_report_with_activation(
+    backend_commit: &str,
+    backend_dirty: bool,
+    firmware_name: &str,
+    firmware_sha: &str,
+    step_quantum: u32,
+    activation_marker: Option<&str>,
+    activation_cycle: Option<u64>,
+    outcome: &RunOutcome,
+    profile: &RunningEventProfileSnapshot,
+) -> String {
     let boundary = &profile.boundary;
     let thresholds: [u64; IDLE_HISTOGRAM_BUCKETS] = std::array::from_fn(|i| 1u64 << i);
+    let activation = match activation_marker {
+        Some(marker) => format!(
+            "{{\"mode\":\"after_uart\",\"marker\":{},\"start_cycle\":{}}}",
+            json_string(marker),
+            activation_cycle.unwrap_or(0),
+        ),
+        None => "{\"mode\":\"from_start\"}".to_string(),
+    };
     format!(
         concat!(
             "{{\n",
@@ -2821,6 +2918,7 @@ fn build_running_event_profile_report(
             "  \"immutable_xip_hit_runs_are_speedup_prediction\": false,\n",
             "  \"conservative_horizon_complete_for_current_model\": true,\n",
             "  \"step_quantum\": {},\n",
+            "  \"activation\": {},\n",
             "  \"stop_reason\": {},\n",
             "  \"run_cycles\": {},\n",
             "  \"histogram_thresholds_cycles\": [{}],\n",
@@ -2850,6 +2948,7 @@ fn build_running_event_profile_report(
         json_string(firmware_name),
         json_string(firmware_sha),
         step_quantum,
+        activation,
         json_string(outcome.stop_reason.as_str()),
         outcome.cycles,
         u64_json_array(&thresholds),
@@ -3312,6 +3411,10 @@ impl AudioSinkReport {
                 "    \"sample_rate_hz\": {},\n",
                 "    \"timer_event_count\": {},\n",
                 "    \"timer_miss_count\": {},\n",
+                "    \"timer_miss_audio_not_busy\": {},\n",
+                "    \"timer_miss_other_dma_selected\": {},\n",
+                "    \"timer_miss_no_dma_selected\": {},\n",
+                "    \"timer_miss_multiple_due_in_window\": {},\n",
                 "    \"timer_due_cycle_sha256\": {},\n",
                 "    \"block_start_count\": {},\n",
                 "    \"block_frame_min\": {},\n",
@@ -3351,6 +3454,10 @@ impl AudioSinkReport {
             self.snapshot.sample_rate_hz,
             self.snapshot.timer_event_count,
             self.snapshot.timer_miss_count,
+            self.snapshot.timer_miss_audio_not_busy,
+            self.snapshot.timer_miss_other_dma_selected,
+            self.snapshot.timer_miss_no_dma_selected,
+            self.snapshot.timer_miss_multiple_due_in_window,
             json_string(&self.snapshot.timer_due_cycle_sha256),
             self.snapshot.block_start_count,
             option_u64(self.snapshot.block_frame_min),
@@ -4171,7 +4278,9 @@ fn run() -> Result<Verdict, String> {
         }
     }
     #[cfg(feature = "event-horizon-profiler")]
-    if args.event_horizon_profile.is_some() {
+    if args.event_horizon_profile.is_some()
+        && args.event_horizon_profile_after_uart.is_none()
+    {
         emu.enable_running_event_profiler()
             .map_err(|e| format!("enabling running event-horizon profiler: {e}"))?;
     }
@@ -4185,6 +4294,10 @@ fn run() -> Result<Verdict, String> {
         sd: sd_card.clone(),
     };
     let mut machine = MachineSession::new(emu, handles);
+    #[cfg(feature = "event-horizon-profiler")]
+    if let Some(marker) = args.event_horizon_profile_after_uart.clone() {
+        machine.arm_event_profile_after_uart(marker);
+    }
     if args.machine_api {
         run_machine_api(&mut machine, &args.snapshot_dir)?;
         return Ok(Verdict::Pass);
@@ -4200,6 +4313,8 @@ fn run() -> Result<Verdict, String> {
     );
     // Report generation still consumes the emulator after the shared
     // session ends. Moving it back out preserves the existing schema bytes.
+    #[cfg(feature = "event-horizon-profiler")]
+    let event_profile_start_cycle = machine.event_profile_start_cycle;
     let MachineSession { mut emu, .. } = machine;
 
     let flash_image = emu.bus.flash_image();
@@ -4255,13 +4370,18 @@ fn run() -> Result<Verdict, String> {
     if let Some(path) = &args.event_horizon_profile {
         let snapshot = emu
             .running_event_profile_snapshot()
-            .expect("--event-horizon-profile enabled the profiler before the run");
-        let profile_report = build_running_event_profile_report(
+            .ok_or_else(|| {
+                "--event-horizon-profile-after-uart marker was not observed before the run ended"
+                    .to_string()
+            })?;
+        let profile_report = build_running_event_profile_report_with_activation(
             BUILT_BACKEND_COMMIT,
             built_backend_dirty(),
             &basename(&args.bin),
             &firmware_sha,
             step_quantum,
+            args.event_horizon_profile_after_uart.as_deref(),
+            event_profile_start_cycle,
             &outcome,
             &snapshot,
         );
@@ -4378,7 +4498,15 @@ fn run() -> Result<Verdict, String> {
     // observable.
     let pwm_report = (args.board == Board::PicoCalc).then(|| PwmReport::collect(&emu.bus));
 
-    let audio_sink_report = (args.board == Board::PicoCalc).then(|| {
+    // PWM/DMA audio observation is independent of the LCD board model. Keep
+    // the report absent for ordinary board-less runs, but enable it whenever
+    // an audio expectation or capture output was requested so an audio-only
+    // run can omit the expensive PIO LCD observer. Screen assertions still
+    // require `--board picocalc` in the scenario layer above.
+    let audio_requested = args.expected_audio_sink_count.is_some()
+        || args.audio_analysis.is_some()
+        || args.audio_wav.is_some();
+    let audio_sink_report = audio_requested.then(|| {
         AudioSinkReport::collect(
             &emu.bus,
             args.expected_audio_sink_count,
@@ -5002,6 +5130,10 @@ mod tests {
             timer_fraction_y: 15625,
             timer_event_count: 0,
             timer_miss_count: 0,
+            timer_miss_audio_not_busy: 0,
+            timer_miss_other_dma_selected: 0,
+            timer_miss_no_dma_selected: 0,
+            timer_miss_multiple_due_in_window: 0,
             timer_due_cycle_sha256: String::new(),
             block_start_count: 1,
             block_frame_min: Some(3),
@@ -5149,6 +5281,10 @@ mod tests {
                 timer_fraction_y: 15625,
                 timer_event_count: 0,
                 timer_miss_count: 0,
+                timer_miss_audio_not_busy: 0,
+                timer_miss_other_dma_selected: 0,
+                timer_miss_no_dma_selected: 0,
+                timer_miss_multiple_due_in_window: 0,
                 timer_due_cycle_sha256: String::new(),
                 block_start_count: 1,
                 block_frame_min: Some(3),

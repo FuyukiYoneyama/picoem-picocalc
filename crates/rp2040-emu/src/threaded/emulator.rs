@@ -113,6 +113,10 @@ impl ThreadedEmulator {
             pio0_sm0_last_pc: _,
             #[cfg(feature = "idle-profiler")]
                 idle_profiler: _,
+            #[cfg(feature = "event-horizon-profiler")]
+                running_profiler: _,
+            #[cfg(feature = "behavior-trace")]
+                behavior_tracer: _,
             execution_model: _,
             threaded: _,
             panic_info: _,

@@ -1490,6 +1490,8 @@ impl Emulator {
             idle_profiler: None,
             #[cfg(feature = "event-horizon-profiler")]
             running_profiler: None,
+            #[cfg(feature = "behavior-trace")]
+            behavior_tracer: None,
             execution_model: ExecutionModel::Serial,
             threaded: None,
             panic_info: None,
