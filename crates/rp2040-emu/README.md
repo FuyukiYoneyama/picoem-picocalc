@@ -63,6 +63,12 @@ The Raspberry Pi RP2040 B2 bootrom is published by Raspberry Pi at
   reprogrammable at runtime.
 - **Two PIO blocks** with state machines, FIFOs, dividers.
 - **PPB** with sticky `bus_fault` flag escalating to HardFault.
+- **DMA** with 12 channels, FORCE/peripheral/timer DREQs, two-tier
+  `HIGH_PRIORITY` arbitration, chaining, rings, and DMA interrupt state. The
+  Serial path uses per-system-clock arbitration when a window can contain a
+  competing ready request; see the workspace's
+  [`DMA/audio observability contract`](../../docs/DMA_AUDIO_OBSERVABILITY.md)
+  for scope and limitations.
 
 ## Execution models
 

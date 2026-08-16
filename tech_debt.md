@@ -2,6 +2,28 @@
 
 Items discovered during development that need addressing in later phases.
 
+## RP2040 DMA timing and PicoCalc audio diagnostics (2026-08-16)
+
+**Status:** the Serial model now has a generic per-system-clock arbitration
+path for eligible DMA windows, RP2040 two-tier `HIGH_PRIORITY` selection, and
+quantum-invariance coverage for FORCE, timer-paced, competing, chained, and
+read-ring workloads. The PicoCalc harness exposes additive timer-miss
+classifications and can capture digital PWM audio without attaching the LCD
+board model.
+
+**Limitations:** the timer-miss counters describe the emulator's DREQ and DMA
+arbitration state; they are not firmware audio-ring underrun counters. The
+event-driven timer path does not infer a peripheral DREQ becoming ready inside
+an otherwise bulk-eligible window. The invariance tests cover the named
+synthetic workloads, not every firmware/device interaction or analogue audio
+quality.
+
+**Follow-up:** keep the model's Serial path as the correctness reference and
+add firmware-level and hardware comparison evidence before treating a new
+audio result as hardware-confirmed. Any change to these semantics must update
+`docs/DMA_AUDIO_OBSERVABILITY.md`, the public READMEs, the changelog, and the
+corresponding tests together.
+
 ## OneROM PIO ServingOracle fire-32-a servable sweep accepted (2026-05-04, Stage 4C)
 
 **Status:** resolved for servable pin-pattern byte correctness. Stage 4A added
@@ -1142,13 +1164,17 @@ design for Phase 4 and documented in the relevant DMA module.
   ignores it. No corpus firmware uses it.
 - **DMA `SNIFF_EN` and `SNIFF_CTRL`/`SNIFF_DATA` registers** —
   storage-only. CRC not implemented.
-- **DMA `HIGH_PRIORITY` tier arbitration** — stored in CTRL but
-  ignored; flat lowest-channel arbitration used. `audio_i2s` does not
-  rely on priority.
+- **DMA `HIGH_PRIORITY` tier arbitration** — resolved for the RP2040 Serial
+  model on 2026-08-16. High-priority channels now win before normal channels,
+  with the lowest channel number selected within a tier. The public
+  `dma_quantum_invariance` test covers the arbitration path.
 - **DMA XIP DREQ sources (37..39, XIP_STREAM / XIP_SSITX /
   XIP_SSIRX)** — not modelled (XIP MMIO stub predates Phase 4).
-- **DMA Timer pacing (`TIMER0..3` registers at `DMA_BASE + 0x440`)** —
-  storage-only, pacing not applied.
+- **DMA Timer pacing (`TIMER0..3`)** — resolved for the RP2040 Serial model
+  on 2026-08-16. Fractional timer events are scheduled and arbitrated through
+  the DMA path; timer-miss counters are diagnostic observations, not firmware
+  underrun counts. Peripheral DREQs that become ready inside an otherwise
+  event-eligible bulk window remain a documented limitation.
 - **Per-channel `DBG_CTDREQ` / `DBG_TCR` debug registers** — read as
   zero. No corpus consults them.
 - **`DmaChannel.trans_count_reload` field is redundant with
@@ -1626,15 +1652,13 @@ reads its own subsystem name in the function name; an `rg
 '#\[ignore = "narrow-audit'` against `tests_narrow.rs` yields the
 inventory.
 
-### T2 — RP2040 DMA flag-bit `#[allow(dead_code)]` mirror
+### T2 — RP2040 DMA deferred flag bits
 
-Same shape as the existing entry in this file's "DMA blocker / V1
-deferred features" section (RP2350) but on
-`crates/mdrp2040/src/dma.rs:73,99,115,118` —
-`CTRL_HIGH_PRIORITY`, `CTRL_BSWAP`, `CTRL_SNIFF_EN`,
-`CH_DBG_TCR_OFFSET`. Same regression-shape (the BUSY-bit-position
-assertion test the existing RP2350 entry prescribes has no RP2040
-equivalent).
+The RP2040 DMA model now uses `CTRL_HIGH_PRIORITY`; the remaining
+`#[allow(dead_code)]` flags are `CTRL_BSWAP`, `CTRL_SNIFF_EN`, and the
+debug-register offset in `crates/rp2040-emu/src/dma.rs`. They remain stored or
+read-only without behavioural support in V1. Add bit-position tests when any
+of these deferred features is promoted.
 
 ### T3 — OneROM serving oracle O(N²) per case acknowledged TODO
 

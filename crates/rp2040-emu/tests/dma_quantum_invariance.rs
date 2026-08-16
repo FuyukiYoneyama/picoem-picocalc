@@ -6,10 +6,10 @@
 //! an integration test: the test must use the public emulator surface and must
 //! not make the product model or its existing tests more permissive.
 //!
-//! The current RP2040 model arbitrates DMA once at the end of a bulk quantum.
-//! Therefore these tests are expected to expose a failure until a generic
-//! per-sysclk DMA model is implemented.  A failure is useful evidence: it
-//! identifies the workload and the first state that diverges from quantum 1.
+//! The RP2040 model now uses per-system-clock arbitration for the tested
+//! workloads, while retaining an event-driven path for eligible timer-only
+//! windows. A failure identifies the workload and the first state that
+//! diverges from the quantum-1 reference.
 
 use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 

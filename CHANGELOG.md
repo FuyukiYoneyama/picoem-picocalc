@@ -16,6 +16,14 @@ public release simply ships those current versions.
 
 ### Added
 
+- Add public DMA/audio observability documentation, a quantum-invariance
+  integration test covering FORCE, timer-paced, competing, chained, and
+  read-ring transfers, and additive timer-miss classifications in the
+  PicoCalc audio report. The classifications describe emulator-side DMA
+  observations and are not firmware underrun counts.
+- Allow audio analysis and unnormalised WAV capture without the LCD/keyboard
+  board model, and allow the diagnostic event-horizon profile to start after
+  a UART marker. Both paths remain opt-in diagnostics.
 - Add the R4 GitHub Actions backend quality gate with separate test/release-build, rustfmt, and
   Clippy jobs on pinned Ubuntu 24.04 and Rust 1.97.1. Formatting and linting are scoped to the
   PicoCalc-owned crates, while the RP2040 core remains covered by tests.

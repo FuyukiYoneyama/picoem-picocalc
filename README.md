@@ -152,6 +152,12 @@ contract: it rejects needlessly low level while allowing bounded saturation and 
 extreme rail occupancy. The WAV preserves the observed digital level; it is never normalised and
 does not model the amplifier, physical volume control, speaker, enclosure, or room.
 
+The DMA arbitration rules, timer-miss field meanings, board-less audio capture,
+and the limits of this digital observation are documented in
+[`docs/DMA_AUDIO_OBSERVABILITY.md`](docs/DMA_AUDIO_OBSERVABILITY.md). That
+document is part of the public emulator contract; it also records the
+quantum-invariance test and the diagnostic-only UART-marker profile option.
+
 NEXT-4 also exposes the same persistent machine session as a deterministic JSON Lines API.
 Artifact and device options are fixed at process startup; one stdin line produces one stdout line,
 while UART and diagnostics never contaminate stdout. `run` is always bounded and subscriptions are
