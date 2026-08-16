@@ -421,7 +421,7 @@ impl DecodedOp {
         }
         #[cfg(not(feature = "decoded-op-8byte-prototype"))]
         {
-            self.tag == pc
+            !self.is_empty() && self.tag == pc
         }
     }
 
