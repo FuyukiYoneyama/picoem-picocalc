@@ -2,17 +2,18 @@
 
 更新日: 2026-08-16
 
-> **現行計画。** `picoem-picocalc` の現行mainにあるDMA／audio観測変更と
+> **完了済み検証記録（2026-08-16）。** `picoem-picocalc` の現行mainにあるDMA／audio観測変更と
 > feature-gated OPT4候補を、既存のPicoCalc exactness契約へ安全に接続するための
-> 実行順序を定義する。完了するまでbackend pinやpromoted targetを更新しない。
+> 実行順序と、そのローカル受入結果を記録する。cycle差のあるtargetはholdとし、backend pinや
+> promoted targetは更新していない。
 
 ## 判定
 
-実装は継続可能であり、技術的な行き止まりはない。OPT4-Aのsentinel回帰、DMA／audioの
+実装と検証は完了しており、技術的な行き止まりはない。OPT4-Aのsentinel回帰、DMA／audioの
 quantum-invariance比較、CLI end-to-end、format／Clippy gateはローカル合格した。
 firmware再回帰の**実行は完了**したが、現行main (`a67e81c9…`) は既存の複数targetでUART／
-framebuffer／scenarioを保つ一方、旧pinのcycle指紋に小さな差を確認した。したがって
-exactness差分の扱いが決まるまでpromotion可能な状態ではない。
+framebuffer／scenarioを保つ一方、旧pinのcycle指紋に小さな差を確認した。差分targetはholdとし、
+旧pinを維持してpromotionしない受入判断まで完了している。
 
 - `rp2040-emu` unit test 1246件は合格する。
 - DMA quantum-invariance integration test 5件は合格する。
@@ -29,7 +30,7 @@ exactness差分の扱いが決まるまでpromotion可能な状態ではない�
   累積値とは分離して内部整合性を検査する。audio sinkのPCM／due-cycle／block／latency
   digestは完全一致を要求する。
 - CIと同じ範囲のfmt check、`-D warnings`のClippy、`picocalc_emu`のportable verify、
-  新backendでのfirmware exactnessは後続stepで閉じる。
+  新backendでのfirmware回帰は後続stepで実行し、2026-08-16にすべて完了した。
 
 ## 絶対条件
 
@@ -140,7 +141,7 @@ Step 4の実装範囲、fixtureの出所、実行コマンド、schema field、m
 `DMA_AUDIO_OBSERVABILITY.md`へ反映した。`--all-features`は相互排他featureを含むため、正式な
 gateには使わない。
 
-### 6. format／Clippy gateを閉じる
+### 6. format／Clippy gateを閉じる — 完了 2026-08-16
 
 機能変更とテスト追加が固まった後に一度だけ整形し、次をローカルで合格させる。
 
@@ -155,13 +156,13 @@ cargo clippy --locked -p rp2040-emu \
   --features event-horizon-profiler --lib -- -D warnings
 ```
 
-現時点で確認済みのClippy残件は`ssi_flash.rs`の`manual_is_multiple_of`と
-`nvic.rs`の`needless_return`である。直近DMA commit由来ではないが、現行HEADのgateとして閉じる。
+現行HEADで確認した`ssi_flash.rs`の`manual_is_multiple_of`と`nvic.rs`の`needless_return`を修正し、
+このgateをローカルで閉じた。直近DMA commit由来でない警告も含め、現行HEADの`-D warnings`を
+合格条件とした。
 
-### 7. 新backendで既存firmwareをローカル再回帰する
+### 7. 新backendで既存firmwareをローカル再回帰する — 完了 2026-08-16
 
-旧target recordを変更せず、新backend専用checkoutまたは新しいversioned validation候補で、
-少なくとも次を再実行する。
+旧target recordを変更せず、新backend専用checkoutで、少なくとも次を再実行した。
 
 - PicoTetris OPT1-B
 - PicoCalc audio
@@ -186,7 +187,7 @@ release runnerで行い、GitHub Actionsは使用していない。
 | `picocalc-audio-r1` | **pass** | `405,523,032` vs `405,523,032` | UART、framebuffer、scenario、DMA write `49,152`、PCM SHA、timer観測が一致。 |
 | `picocalc-multicore-r2` | **partial / hold** | `152,548,097` vs pinned `152,548,092` (**+5**) | UART `2c1ebc31…`、framebuffer `7a8c4e73…`、scenarioのsemantic判定は一致。 |
 | `picoedit-r1` | **partial / hold** | `827,799,818` vs pinned `827,799,822` (**-4**) | registryと同じdefault FAT32条件で実行。UART `2a37433c…`、framebuffer `18d0809e…`、SD `12/13` blocks、PSRAM `154/2471` bytes、scenarioのsemantic判定は一致。RAW image条件はこのtargetのhistorical条件ではないため、別試験として扱った。 |
-| `picocalc-helloworld-a` | **pass** | `9,500,000,000` vs pinned `9,500,000,000` | registry条件（`hwspi-rgb888`、keyboard `HI`、PSRAM 8 MiB verify）でexit 0。required UART marker 3件、PSRAM `8,388,608/0`、unknown MMIO 0、exception 0。 |
+| `picocalc-helloworld-a` | **registry-contract pass** | `9,500,000,000` vs pinned `9,500,000,000` | registry条件（`hwspi-rgb888`、keyboard `HI`、PSRAM 8 MiB verify）でexit 0。required UART marker 3件、PSRAM `8,388,608/0`、unknown MMIO 0、exception 0。 |
 
 この表の`partial / hold`は「最終出力が壊れた」という意味ではない。cycleはexactnessの
 絶対条件なので、他のdigestが一致していても、旧versioned validationを上書きせず、現行mainの
@@ -207,21 +208,34 @@ promotion根拠には使わない。差分の原因が意図したperipheral-mod
 | PicoEdit | `827,799,822` | `827,799,818` | SD／LCD等のdefault runtime更新帯に -4 |
 
 UART、framebuffer、scenario semantic判定、対象固有のSD／PSRAM／audio観測は各比較で一致した。
-したがって現時点の分類は「意図した周辺モデル更新に伴うcycle指紋差」であり、無関係なdomainの
-破綻ではない。ただしcycle exactnessの不一致を自動的に吸収せず、旧pinとpromoted targetは維持する。
+したがって現時点の**暫定分類**は「意図した周辺モデル更新に伴うcycle指紋差」であり、無関係なdomainの
+破綻ではない。ただし、責任を負う単一commitまたは具体的なdomainまでは確定していない。cycle exactnessの
+不一致を自動的に吸収せず、旧pinとpromoted targetは維持する。
+
+### 検証証拠の固定
+
+現行mainの5本の回帰report、補助UART／framebuffer artifact、948／00b境界probeは、
+`picocalc_emu/firmware-validation/evidence/opt4-current-main-20260816-01/`に固定した。
+`SHA256SUMS`で内容を検証できる。これはローカルの非promotion証拠であり、旧record、versioned
+validation、target pinを変更しない。
 
 ### 8. 結果を分類してからpromotionを判断する
 
 | 結果 | 処置 |
 |---|---|
 | 全ての挙動が一致 | 新しいversioned validation候補を作成できる。pin更新は別判断とする。 |
-| 意図したperipheral-model更新だけが変化 | 差分の発生commit・domain・再現条件を記録し、影響するtargetは必要に応じて実機相関する。cycle差を黙って吸収しない。 |
+| 意図したperipheral-model更新だけが変化 | **暫定分類**として差分の発生帯・再現条件を記録し、責任commit／domainを追加切り分けする。影響するtargetは必要に応じて実機相関する。cycle差を黙って吸収しない。 |
 | 無関係なdomainが変化 | promotionせず原因を修正する。 |
 | exactnessが不一致 | 性能や診断上の利点にかかわらず候補を不採用にする。 |
 
+2026-08-16の受入判断では、cycle差のあるPicoTetris／multicore／PicoEditをversioned validationへ
+昇格せず、旧pinを維持した。audioは登録契約項目に合格し、Helloもregistry受入項目に合格したが、
+これらの個別合格をOPT4-Aまたはmicro-opt bankのpromotionへ拡張していない。現時点で実機相関を
+開始する対象もなく、差分commit／domainの特定はOPT4再開時の後続課題とする。
+
 ## 正式なローカルgate
 
-最低限、次を全て合格させる。
+以下は完了済みのローカルgateであり、同じ検証を再実行する場合のコマンドでもある。
 
 ```bash
 cargo test --locked --workspace
@@ -233,8 +247,8 @@ cargo test --locked -p picocalc-harness --bin picocalc-run \
 これに加えて、各実験featureを単独または明示的に許可した組合せで実行する。
 相互排他featureをまとめる`cargo test --all-features`は合格条件にしない。
 `picocalc_emu`側では`python3 tools/picocalc.py verify`を合格させ、step 7のfirmware
-再回帰をportable verifyとは別に完了する。2026-08-16時点で、Helloを含む全対象の実行は完了し、
-上表のcycle差分類だけがstep 8の残件である。
+再回帰をportable verifyとは別に完了した。2026-08-16時点で、Helloを含む全対象の実行、証拠固定、
+cycle差の暫定分類、versioned validation／実機相関を開始しない受入判断まで完了している。
 
 ## 完了条件
 
@@ -242,9 +256,10 @@ cargo test --locked -p picocalc-harness --bin picocalc-run \
 - DMA／audio／UART markerの新しい公開挙動が直接テストされている。
 - source、公開文書、テストの主張が一致している。
 - default workspace、正式feature matrix、fmt、Clippyがローカルで全て合格する。
-- 新backendによる既存firmwareの挙動差が分類され、未説明の差がない（Hello fullは完了。cycle差の
-  versioned validation／必要な実機相関の判断が残件）。
+- 新backendによる既存firmwareの挙動差が**暫定分類**され、証拠と受入判断が固定されている
+  （Hello fullはregistry受入項目まで完了。cycle差の責任commit／domainの特定はOPT4再開時の
+  後続課題であり、現行pinを維持する）。
 - それまでは既存のpromoted backendとtarget pinを維持する。
 
-見積もりは通常2〜3作業日である。deterministic audio fixtureの作成やfirmware回帰で
-新しい挙動差が見つかった場合は、追加で1〜2作業日を見込む。
+この検証計画の実行は2026-08-16に完了した。今後のcycle差原因切り分け、versioned validation、
+実機相関、またはOPT4再開は別作業として新しい計画を作成する。
