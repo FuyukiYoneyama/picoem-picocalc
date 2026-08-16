@@ -9,8 +9,10 @@
 ## 判定
 
 実装は継続可能であり、技術的な行き止まりはない。OPT4-Aのsentinel回帰、DMA／audioの
-quantum-invariance比較、CLI end-to-endはローカル合格した。ただし、format／Clippy gateと
-firmware再回帰は未完了なので、promotion可能な状態ではない。
+quantum-invariance比較、CLI end-to-end、format／Clippy gateはローカル合格した。
+firmware再回帰は**部分完了**で、現行main (`a67e81c9…`) は既存の複数targetでUART／
+framebuffer／scenarioを保つ一方、旧pinのcycle指紋に小さな差を確認した。したがって
+promotion可能な状態ではない。
 
 - `rp2040-emu` unit test 1246件は合格する。
 - DMA quantum-invariance integration test 5件は合格する。
@@ -173,12 +175,30 @@ backend identityを含む`normalized_report_sha256`は新commitで変わるた�
 判定しない。cycle、virtual time、timeline、UART、framebuffer、PSRAM、scenario、
 behavior SHA、event-domain digest、audio PCM／due-cycle／block情報を比較する。
 
+#### 2026-08-16 local result (current main `a67e81c9ad89fee548d4c3a9c96fe91c03438ad9`)
+
+source checkoutとBIN／UF2はregistryのpinからcleanに再生成した。実行は全てローカルの
+release runnerで行い、GitHub Actionsは使用していない。
+
+| target | result | cycle comparison | other observations |
+|---|---|---:|---|
+| `picotetris-opt1b` | **partial / hold** | `927,528,659` vs pinned `927,528,660` (**-1**) | UART `bff1f245…`、framebuffer `f63b598f…`、scenarioの85/85 semantic判定は一致。旧promoted backend `e985a9d…`ではcycle `660`、音声DMA sink導入直後のprobe (`94818f8…`)では`658`となり、音声／DMAモデル導入以降の差であることを切り分けた。 |
+| `picocalc-audio-r1` | **pass** | `405,523,032` vs `405,523,032` | UART、framebuffer、scenario、DMA write `49,152`、PCM SHA、timer観測が一致。 |
+| `picocalc-multicore-r2` | **partial / hold** | `152,548,097` vs pinned `152,548,092` (**+5**) | UART `2c1ebc31…`、framebuffer `7a8c4e73…`、scenarioのsemantic判定は一致。 |
+| `picoedit-r1` | **partial / hold** | `827,799,818` vs pinned `827,799,822` (**-4**) | registryと同じdefault FAT32条件で実行。UART `2a37433c…`、framebuffer `18d0809e…`、SD `12/13` blocks、PSRAM `154/2471` bytes、scenarioのsemantic判定は一致。RAW image条件はこのtargetのhistorical条件ではないため、別試験として扱った。 |
+| `picocalc-helloworld-a` | **screening only** | 1B-cycle screening completed; 9.5B acceptance not completed | 100M／1B-cycle窓はcycle-limit PASSで進行を確認したが、required UART markersと8MiB verifyを含む9.5B-cycle runは14分超で停止した。full exactnessは未確定であり、合格扱いにしない。 |
+
+この表の`partial / hold`は「最終出力が壊れた」という意味ではない。cycleはexactnessの
+絶対条件なので、他のdigestが一致していても、旧versioned validationを上書きせず、現行mainの
+promotion根拠には使わない。差分の原因が意図したperipheral-model更新である可能性は高いが、
+未説明のまま許容しない。Helloのfull runも、短縮screeningを正式受入の代替にしない。
+
 ### 8. 結果を分類してからpromotionを判断する
 
 | 結果 | 処置 |
 |---|---|
 | 全ての挙動が一致 | 新しいversioned validation候補を作成できる。pin更新は別判断とする。 |
-| 意図したDMA改善だけが変化 | 根拠を記録し、影響するaudio／DMA targetは必要に応じて実機相関する。 |
+| 意図したperipheral-model更新だけが変化 | 差分の発生commit・domain・再現条件を記録し、影響するtargetは必要に応じて実機相関する。cycle差を黙って吸収しない。 |
 | 無関係なdomainが変化 | promotionせず原因を修正する。 |
 | exactnessが不一致 | 性能や診断上の利点にかかわらず候補を不採用にする。 |
 
@@ -204,7 +224,7 @@ cargo test --locked -p picocalc-harness --bin picocalc-run \
 - DMA／audio／UART markerの新しい公開挙動が直接テストされている。
 - source、公開文書、テストの主張が一致している。
 - default workspace、正式feature matrix、fmt、Clippyがローカルで全て合格する。
-- 新backendによる既存firmwareの挙動差が分類され、未説明の差がない。
+- 新backendによる既存firmwareの挙動差が分類され、未説明の差がない（現時点ではcycle差とHello full runが残件）。
 - それまでは既存のpromoted backendとtarget pinを維持する。
 
 見積もりは通常2〜3作業日である。deterministic audio fixtureの作成やfirmware回帰で
