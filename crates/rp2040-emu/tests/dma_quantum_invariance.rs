@@ -32,6 +32,7 @@ const CH_CTRL_TRIG: u32 = 0x0c;
 const CH_AL1_CTRL: u32 = 0x10;
 
 const CTRL_EN: u32 = 1 << 0;
+const CTRL_HIGH_PRIORITY: u32 = 1 << 1;
 const CTRL_DATA_SIZE_32: u32 = 2 << 2;
 const CTRL_INCR_READ: u32 = 1 << 4;
 const CTRL_INCR_WRITE: u32 = 1 << 5;
@@ -113,6 +114,10 @@ fn ctrl(treq: u8, chain_to: u8, ring_size: u8, ring_on_write: bool) -> u32 {
         value |= CTRL_RING_SEL;
     }
     value
+}
+
+fn high_priority(control: u32) -> u32 {
+    control | CTRL_HIGH_PRIORITY
 }
 
 fn program_channel(
@@ -490,5 +495,258 @@ fn dma_audio_timer_paced_observation_is_quantum_invariant() {
         assert_eq!(state.scheduler.audio_sink.dma_write_count, 4, "quantum={quantum}");
         assert_eq!(state.scheduler.audio_sink.pcm_sha256.len(), 64, "quantum={quantum}");
         assert_eq!(state.scheduler.audio_sink.block_start_count, 1, "quantum={quantum}");
+    }
+}
+
+#[test]
+fn dma_high_priority_force_beats_normal_force() {
+    let setup = |emu: &mut Emulator| {
+        emu.bus.write32(SRAM_BASE + 0xc00, 0xe000_0000);
+        emu.bus.write32(SRAM_BASE + 0xc04, 0xe100_0000);
+        let destination = SRAM_BASE + 0xd00;
+        // Both channels write the same fixed destination. The high-priority
+        // channel must issue first; the normal channel then overwrites it.
+        program_channel(
+            emu,
+            0,
+            SRAM_BASE + 0xc00,
+            destination,
+            1,
+            high_priority(ctrl(DREQ_FORCE, 0, 0, false) & !CTRL_INCR_WRITE),
+            true,
+        );
+        program_channel(
+            emu,
+            1,
+            SRAM_BASE + 0xc04,
+            destination,
+            1,
+            ctrl(DREQ_FORCE, 1, 0, false) & !CTRL_INCR_WRITE,
+            true,
+        );
+    };
+    let states = [1, 16, 64]
+        .into_iter()
+        .map(|quantum| {
+            (
+                quantum,
+                run_and_snapshot(quantum, setup, SRAM_BASE + 0xd00, 1, &[0, 1]),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_invariant("HIGH_PRIORITY versus FORCE", &states);
+    for (quantum, state) in &states {
+        assert_eq!(state.destination_words, vec![0xe100_0000], "quantum={quantum}");
+        assert_eq!(state.channels[0].trans_count, 0, "quantum={quantum}");
+        assert_eq!(state.channels[1].trans_count, 0, "quantum={quantum}");
+    }
+}
+
+#[test]
+fn dma_high_priority_timer_beats_normal_force_at_due_event() {
+    let setup = |emu: &mut Emulator| {
+        emu.bus.write32(SRAM_BASE + 0xc20, 0xe200_0000);
+        emu.bus.write32(SRAM_BASE + 0xc24, 0xe300_0000);
+        emu.bus.write32(DMA_BASE + REG_TIMER0, (1 << 16) | 8);
+        let destination = SRAM_BASE + 0xd20;
+        program_channel(
+            emu,
+            0,
+            SRAM_BASE + 0xc20,
+            destination,
+            1,
+            high_priority(ctrl(DREQ_TIMER0, 0, 0, false) & !CTRL_INCR_WRITE),
+            true,
+        );
+        // Keep a normal FORCE channel ready beyond the timer event. At the
+        // first timer pulse the high-priority timer must win arbitration.
+        program_channel(
+            emu,
+            1,
+            SRAM_BASE + 0xc24,
+            destination,
+            198,
+            ctrl(DREQ_FORCE, 1, 0, false) & !CTRL_INCR_WRITE,
+            true,
+        );
+    };
+    let states = [1, 16, 64]
+        .into_iter()
+        .map(|quantum| {
+            (
+                quantum,
+                run_and_snapshot(quantum, setup, SRAM_BASE + 0xd20, 1, &[0, 1]),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_invariant("HIGH_PRIORITY timer versus FORCE", &states);
+    for (quantum, state) in &states {
+        assert_eq!(state.channels[0].trans_count, 0, "quantum={quantum}");
+        assert_eq!(state.channels[1].trans_count, 1, "quantum={quantum}");
+        assert_eq!(state.scheduler.timer_event_count[0], 24, "quantum={quantum}");
+        assert_eq!(state.scheduler.timer_miss_count[0], 23, "quantum={quantum}");
+    }
+}
+
+#[test]
+fn dma_same_cycle_timer_tie_uses_lowest_channel() {
+    let setup = |emu: &mut Emulator| {
+        emu.bus.write32(SRAM_BASE + 0xc40, 0xe400_0000);
+        emu.bus.write32(SRAM_BASE + 0xc44, 0xe500_0000);
+        emu.bus.write32(DMA_BASE + REG_TIMER0, (1 << 16) | 8);
+        emu.bus.write32(DMA_BASE + (REG_TIMER0 + 4), (1 << 16) | 8);
+        let destination = SRAM_BASE + 0xd40;
+        program_channel(
+            emu,
+            0,
+            SRAM_BASE + 0xc40,
+            destination,
+            4,
+            ctrl(DREQ_TIMER0, 0, 0, false) & !CTRL_INCR_READ,
+            true,
+        );
+        program_channel(
+            emu,
+            1,
+            SRAM_BASE + 0xc44,
+            destination,
+            4,
+            ctrl(DREQ_TIMER0 + 1, 1, 0, false) & !CTRL_INCR_READ,
+            true,
+        );
+    };
+    let states = [1, 16, 64]
+        .into_iter()
+        .map(|quantum| {
+            (
+                quantum,
+                run_and_snapshot(quantum, setup, SRAM_BASE + 0xd40, 4, &[0, 1]),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_invariant("same-cycle timer tie", &states);
+    for (quantum, state) in &states {
+        assert_eq!(
+            state.destination_words,
+            vec![0xe500_0000; 4],
+            "quantum={quantum}"
+        );
+        assert_eq!(state.channels[0].trans_count, 0, "quantum={quantum}");
+        assert_eq!(state.channels[1].trans_count, 0, "quantum={quantum}");
+        assert_eq!(state.scheduler.timer_event_count[0], 24, "quantum={quantum}");
+        assert_eq!(state.scheduler.timer_event_count[1], 24, "quantum={quantum}");
+        assert_eq!(state.scheduler.timer_miss_count[0], 20, "quantum={quantum}");
+        assert_eq!(state.scheduler.timer_miss_count[1], 20, "quantum={quantum}");
+    }
+}
+
+#[test]
+fn dma_audio_timer_competes_with_normal_force() {
+    let setup = |emu: &mut Emulator| {
+        for (i, value) in [0x0080_0080, 0x00c0_0040, 0x0040_00c0, 0x0088_0078]
+            .into_iter()
+            .enumerate()
+        {
+            emu.bus.write32(SRAM_BASE + 0xc60 + i as u32 * 4, value);
+        }
+        emu.bus.write32(SRAM_BASE + 0xca0, 0xe600_0000);
+        emu.bus.write32(DMA_BASE + REG_TIMER0, (1 << 16) | 8);
+        program_channel(
+            emu,
+            0,
+            SRAM_BASE + 0xc60,
+            AUDIO_PWM_CC,
+            4,
+            ctrl(DREQ_TIMER0, 0, 0, false) & !CTRL_INCR_WRITE,
+            true,
+        );
+        // The lower-numbered audio channel wins on timer cycles; this FORCE
+        // channel remains ready on all other cycles and records the
+        // competition without touching the PWM sink.
+        program_channel(
+            emu,
+            1,
+            SRAM_BASE + 0xca0,
+            SRAM_BASE + 0xcb0,
+            198,
+            ctrl(DREQ_FORCE, 1, 0, false),
+            true,
+        );
+    };
+    let states = [1, 16, 64]
+        .into_iter()
+        .map(|quantum| {
+            (
+                quantum,
+                run_and_snapshot(quantum, setup, AUDIO_PWM_CC, 1, &[0, 1]),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_invariant("audio timer versus FORCE", &states);
+    for (quantum, state) in &states {
+        let audio = &state.scheduler.audio_sink;
+        assert_eq!(audio.dma_write_count, 4, "quantum={quantum}");
+        assert_eq!(audio.timer_event_count, 24, "quantum={quantum}");
+        assert_eq!(audio.timer_miss_count, 20, "quantum={quantum}");
+        assert_eq!(audio.timer_miss_audio_not_busy, 20, "quantum={quantum}");
+        assert_eq!(audio.timer_miss_other_dma_selected, 0, "quantum={quantum}");
+        assert_eq!(state.channels[1].trans_count, 4, "quantum={quantum}");
+    }
+}
+
+#[test]
+fn dma_chain_changes_ready_priority_tier() {
+    let setup = |emu: &mut Emulator| {
+        emu.bus.write32(SRAM_BASE + 0xcc0, 0xe700_0000);
+        emu.bus.write32(SRAM_BASE + 0xcc4, 0xe800_0000);
+        emu.bus.write32(SRAM_BASE + 0xcc8, 0xe900_0000);
+        let destination = SRAM_BASE + 0xdc0;
+        let fixed = |control| control & !CTRL_INCR_WRITE;
+
+        // Channel 2 is armed by channel 0's completion. It is high priority,
+        // so it must displace the long-running normal FORCE channel 1 as soon
+        // as the chain makes it ready.
+        program_channel(
+            emu,
+            2,
+            SRAM_BASE + 0xcc8,
+            destination,
+            1,
+            fixed(high_priority(ctrl(DREQ_FORCE, 2, 0, false))),
+            false,
+        );
+        program_channel(
+            emu,
+            1,
+            SRAM_BASE + 0xcc4,
+            destination,
+            198,
+            fixed(ctrl(DREQ_FORCE, 1, 0, false)),
+            true,
+        );
+        program_channel(
+            emu,
+            0,
+            SRAM_BASE + 0xcc0,
+            destination,
+            1,
+            fixed(high_priority(ctrl(DREQ_FORCE, 2, 0, false))),
+            true,
+        );
+    };
+    let states = [1, 16, 64]
+        .into_iter()
+        .map(|quantum| {
+            (
+                quantum,
+                run_and_snapshot(quantum, setup, SRAM_BASE + 0xdc0, 1, &[0, 1, 2]),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_invariant("chain priority tier", &states);
+    for (quantum, state) in &states {
+        assert_eq!(state.channels[0].trans_count, 0, "quantum={quantum}");
+        assert_eq!(state.channels[2].trans_count, 0, "quantum={quantum}");
+        assert_eq!(state.channels[1].trans_count, 2, "quantum={quantum}");
     }
 }
