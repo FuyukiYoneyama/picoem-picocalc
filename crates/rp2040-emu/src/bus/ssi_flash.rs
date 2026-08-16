@@ -255,7 +255,7 @@ impl SsiFlash {
             self.errors.push("erase_without_wren".into());
             return;
         }
-        if self.address % len != 0 {
+        if !self.address.is_multiple_of(len) {
             self.errors.push("erase_address_not_aligned".into());
             return;
         }

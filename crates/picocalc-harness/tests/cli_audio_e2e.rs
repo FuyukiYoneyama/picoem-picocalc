@@ -71,7 +71,7 @@ impl ThumbProgram {
         // Stop execution before the literal pool.  The branch target is the
         // branch itself (PC+2 plus signed zero in this encoding).
         self.words.push(0xe7fe);
-        while self.words.len() % 2 != 0 {
+        while !self.words.len().is_multiple_of(2) {
             self.words.push(0x46c0); // NOP
         }
         let pool_offset = CODE_OFFSET + self.words.len() * 2;

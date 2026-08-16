@@ -853,9 +853,8 @@ impl Dma {
         }
 
         let selected = selected_high.or(selected_normal);
-        let selected_timer_idx = selected.and_then(|idx| {
-            Self::timer_index_from_treq(self.channels[idx].treq_sel())
-        });
+        let selected_timer_idx =
+            selected.and_then(|idx| Self::timer_index_from_treq(self.channels[idx].treq_sel()));
         (selected, selected_timer_idx)
     }
 
@@ -882,12 +881,7 @@ impl Dma {
     /// Returns `true` when the window was eligible for this path.  The event
     /// positions are derived from the same fixed-point accumulator used by
     /// `advance_timer_pacing`, so service timestamps remain deterministic.
-    fn tick_timer_event_path(
-        &mut self,
-        bus: &mut Bus,
-        window_start: u64,
-        window_end: u64,
-    ) -> bool {
+    fn tick_timer_event_path(&mut self, bus: &mut Bus, window_start: u64, window_end: u64) -> bool {
         if !self.can_use_timer_event_path(bus) {
             return false;
         }
@@ -987,21 +981,17 @@ impl Dma {
                     continue;
                 }
                 if !audio_busy_at_cycle_start {
-                    self.timer_miss_audio_not_busy[i] = self
-                        .timer_miss_audio_not_busy[i]
-                        .saturating_add(missed);
+                    self.timer_miss_audio_not_busy[i] =
+                        self.timer_miss_audio_not_busy[i].saturating_add(missed);
                 } else if events_at_cycle[i] + consumed_timers[i] > 1 && consumed_timers[i] != 0 {
-                    self.timer_miss_multiple_due_in_window[i] = self
-                        .timer_miss_multiple_due_in_window[i]
-                        .saturating_add(missed);
+                    self.timer_miss_multiple_due_in_window[i] =
+                        self.timer_miss_multiple_due_in_window[i].saturating_add(missed);
                 } else if selected.is_some() && selected_timer_idx != Some(i) {
-                    self.timer_miss_other_dma_selected[i] = self
-                        .timer_miss_other_dma_selected[i]
-                        .saturating_add(missed);
+                    self.timer_miss_other_dma_selected[i] =
+                        self.timer_miss_other_dma_selected[i].saturating_add(missed);
                 } else {
-                    self.timer_miss_no_dma_selected[i] = self
-                        .timer_miss_no_dma_selected[i]
-                        .saturating_add(missed);
+                    self.timer_miss_no_dma_selected[i] =
+                        self.timer_miss_no_dma_selected[i].saturating_add(missed);
                 }
             }
         }
@@ -1053,12 +1043,10 @@ impl Dma {
                 self.timer_window_misses = original_events;
                 for i in 0..4 {
                     let missed = original_events[i];
-                    self.timer_miss_count[i] =
-                        self.timer_miss_count[i].saturating_add(missed);
+                    self.timer_miss_count[i] = self.timer_miss_count[i].saturating_add(missed);
                     if missed != 0 {
-                        self.timer_miss_audio_not_busy[i] = self
-                            .timer_miss_audio_not_busy[i]
-                            .saturating_add(missed);
+                        self.timer_miss_audio_not_busy[i] =
+                            self.timer_miss_audio_not_busy[i].saturating_add(missed);
                     }
                 }
                 continue;
@@ -1089,21 +1077,17 @@ impl Dma {
                 self.timer_miss_count[i] = self.timer_miss_count[i].saturating_add(missed);
                 if missed != 0 && i == PICOCALC_AUDIO_TIMER_INDEX {
                     if !audio_busy_at_cycle_start {
-                        self.timer_miss_audio_not_busy[i] = self
-                            .timer_miss_audio_not_busy[i]
-                            .saturating_add(missed);
+                        self.timer_miss_audio_not_busy[i] =
+                            self.timer_miss_audio_not_busy[i].saturating_add(missed);
                     } else if original_events[i] > 1 && consumed != 0 {
-                        self.timer_miss_multiple_due_in_window[i] = self
-                            .timer_miss_multiple_due_in_window[i]
-                            .saturating_add(missed);
+                        self.timer_miss_multiple_due_in_window[i] =
+                            self.timer_miss_multiple_due_in_window[i].saturating_add(missed);
                     } else if selected.is_some() && selected_timer_idx != Some(i) {
-                        self.timer_miss_other_dma_selected[i] = self
-                            .timer_miss_other_dma_selected[i]
-                            .saturating_add(missed);
+                        self.timer_miss_other_dma_selected[i] =
+                            self.timer_miss_other_dma_selected[i].saturating_add(missed);
                     } else {
-                        self.timer_miss_no_dma_selected[i] = self
-                            .timer_miss_no_dma_selected[i]
-                            .saturating_add(missed);
+                        self.timer_miss_no_dma_selected[i] =
+                            self.timer_miss_no_dma_selected[i].saturating_add(missed);
                     }
                 }
             }
@@ -1146,8 +1130,7 @@ impl Dma {
         // the audio timer when the LCD owns a lower-numbered DMA channel.
         let audio_busy_at_window_start = self.channels.iter().any(|ch| {
             ch.busy
-                && Self::timer_index_from_treq(ch.treq_sel())
-                    == Some(PICOCALC_AUDIO_TIMER_INDEX)
+                && Self::timer_index_from_treq(ch.treq_sel()) == Some(PICOCALC_AUDIO_TIMER_INDEX)
         });
         let (selected, selected_timer_idx) =
             self.select_ready_channel(bus, &window_events, None, false);
@@ -1172,21 +1155,17 @@ impl Dma {
                     self.timer_miss_audio_not_busy[i] =
                         self.timer_miss_audio_not_busy[i].saturating_add(missed);
                 } else if self.timer_window_events[i] > 1 && consumed != 0 {
-                    self.timer_miss_multiple_due_in_window[i] = self
-                        .timer_miss_multiple_due_in_window[i]
-                        .saturating_add(missed);
+                    self.timer_miss_multiple_due_in_window[i] =
+                        self.timer_miss_multiple_due_in_window[i].saturating_add(missed);
                 } else if selected.is_some() && selected_timer_idx != Some(i) {
-                    self.timer_miss_other_dma_selected[i] = self
-                        .timer_miss_other_dma_selected[i]
-                        .saturating_add(missed);
+                    self.timer_miss_other_dma_selected[i] =
+                        self.timer_miss_other_dma_selected[i].saturating_add(missed);
                 } else {
-                    self.timer_miss_no_dma_selected[i] = self
-                        .timer_miss_no_dma_selected[i]
-                        .saturating_add(missed);
+                    self.timer_miss_no_dma_selected[i] =
+                        self.timer_miss_no_dma_selected[i].saturating_add(missed);
                 }
             }
         }
-
     }
 
     fn issue_transfer(&mut self, ch_idx: usize, bus: &mut Bus) {

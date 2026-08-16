@@ -750,8 +750,9 @@ fn parse_args() -> Result<Args, String> {
             "--event-horizon-profile-after-uart" => {
                 let marker = value("--event-horizon-profile-after-uart")?;
                 if marker.is_empty() {
-                    return Err("--event-horizon-profile-after-uart marker must not be empty"
-                        .to_string());
+                    return Err(
+                        "--event-horizon-profile-after-uart marker must not be empty".to_string(),
+                    );
                 }
                 event_horizon_profile_after_uart = Some(marker);
             }
@@ -858,8 +859,7 @@ fn parse_args() -> Result<Args, String> {
     #[cfg(feature = "event-horizon-profiler")]
     if machine_api && event_horizon_profile_after_uart.is_some() {
         return Err(
-            "--machine-api cannot be combined with --event-horizon-profile-after-uart"
-                .to_string(),
+            "--machine-api cannot be combined with --event-horizon-profile-after-uart".to_string(),
         );
     }
     #[cfg(all(feature = "idle-profiler", feature = "behavior-trace"))]
@@ -4278,9 +4278,7 @@ fn run() -> Result<Verdict, String> {
         }
     }
     #[cfg(feature = "event-horizon-profiler")]
-    if args.event_horizon_profile.is_some()
-        && args.event_horizon_profile_after_uart.is_none()
-    {
+    if args.event_horizon_profile.is_some() && args.event_horizon_profile_after_uart.is_none() {
         emu.enable_running_event_profiler()
             .map_err(|e| format!("enabling running event-horizon profiler: {e}"))?;
     }
@@ -4368,12 +4366,10 @@ fn run() -> Result<Verdict, String> {
     }
     #[cfg(feature = "event-horizon-profiler")]
     if let Some(path) = &args.event_horizon_profile {
-        let snapshot = emu
-            .running_event_profile_snapshot()
-            .ok_or_else(|| {
-                "--event-horizon-profile-after-uart marker was not observed before the run ended"
-                    .to_string()
-            })?;
+        let snapshot = emu.running_event_profile_snapshot().ok_or_else(|| {
+            "--event-horizon-profile-after-uart marker was not observed before the run ended"
+                .to_string()
+        })?;
         let profile_report = build_running_event_profile_report_with_activation(
             BUILT_BACKEND_COMMIT,
             built_backend_dirty(),

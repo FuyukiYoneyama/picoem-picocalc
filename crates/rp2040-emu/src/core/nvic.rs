@@ -244,11 +244,11 @@ impl Nvic {
                     found = true;
                 }
             }
-            return if found {
+            if found {
                 Some((best_irq, best_prio))
             } else {
                 None
-            };
+            }
         }
     }
 }
