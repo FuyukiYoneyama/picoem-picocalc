@@ -1228,6 +1228,12 @@ impl Bus {
             .audio_sink_snapshot_at_clock(self.clock_tree.sys_clk_hz)
     }
 
+    /// Snapshot DMA timer pacing and digital audio observation state.
+    pub fn dma_scheduler_snapshot(&self) -> crate::DmaSchedulerSnapshot {
+        self.dma
+            .scheduler_snapshot_at_clock(self.clock_tree.sys_clk_hz)
+    }
+
     /// Enable optional PCM retention for a later diagnostic WAV export.
     pub fn enable_audio_pcm_capture(&mut self) {
         self.dma.enable_audio_pcm_capture();

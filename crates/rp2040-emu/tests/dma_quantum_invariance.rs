@@ -1,8 +1,8 @@
 //! DMA quantum-invariance workloads.
 //!
-//! `quantum=1` is the reference execution.  Every workload below is run for
-//! the same requested number of master cycles at quantum 1, 16, and 64, and
-//! the externally observable DMA state is compared.  This file is deliberately
+//! `quantum=1` is the reference execution. Every workload below is run to the
+//! same actual master-cycle boundary at quantum 1, 16, and 64, and the
+//! externally observable DMA state is compared. This file is deliberately
 //! an integration test: the test must use the public emulator surface and must
 //! not make the product model or its existing tests more permissive.
 //!
@@ -11,7 +11,7 @@
 //! windows. A failure identifies the workload and the first state that
 //! diverges from the quantum-1 reference.
 
-use rp2040_emu::{Config, Emulator, EmulatorBuilder};
+use rp2040_emu::{Config, DmaSchedulerSnapshot, Emulator, EmulatorBuilder};
 
 const DMA_BASE: u32 = 0x5000_0000;
 const RESETS_BASE: u32 = 0x4000_c000;
@@ -41,9 +41,16 @@ const CTRL_CHAIN_TO_SHIFT: u32 = 11;
 const CTRL_TREQ_SEL_SHIFT: u32 = 15;
 const DREQ_FORCE: u8 = 0x3f;
 const DREQ_TIMER0: u8 = 59;
+const AUDIO_PWM_CC: u32 = 0x4005_0070;
 
 const SRAM_BASE: u32 = 0x2000_0000;
-const RUN_CYCLES: u64 = 256;
+// The public `Emulator::run` contract is "at least N cycles" and may
+// overshoot at an instruction boundary. The b . loop below consumes two
+// cycles per instruction, so the three tested quanta (1, 16, 64) consume
+// 2, 18, and 66 cycles per serial step respectively. 198 is their least
+// common multiple; every run therefore stops at the same actual master-cycle
+// boundary instead of comparing scheduler state at different times.
+const RUN_CYCLES: u64 = 198;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChannelState {
@@ -57,6 +64,7 @@ struct ChannelState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DmaState {
+    actual_cycles: u64,
     destination_words: Vec<u32>,
     channels: Vec<ChannelState>,
     intr: u32,
@@ -66,6 +74,7 @@ struct DmaState {
     ints1: u32,
     nvic_dma_irq0_pending: u32,
     nvic_dma_irq1_pending: u32,
+    scheduler: DmaSchedulerSnapshot,
 }
 
 fn emulator(quantum: u32) -> Emulator {
@@ -125,7 +134,13 @@ fn program_channel(
     }
 }
 
-fn snapshot(emu: &mut Emulator, destination: u32, word_count: u32, channels: &[u32]) -> DmaState {
+fn snapshot(
+    emu: &mut Emulator,
+    actual_cycles: u64,
+    destination: u32,
+    word_count: u32,
+    channels: &[u32],
+) -> DmaState {
     let destination_words = (0..word_count)
         .map(|i| emu.bus.read32(destination + i * 4))
         .collect();
@@ -144,6 +159,7 @@ fn snapshot(emu: &mut Emulator, destination: u32, word_count: u32, channels: &[u
         })
         .collect();
     DmaState {
+        actual_cycles,
         destination_words,
         channels,
         intr: emu.bus.read32(DMA_BASE + REG_INTR),
@@ -154,6 +170,7 @@ fn snapshot(emu: &mut Emulator, destination: u32, word_count: u32, channels: &[u
         // DMA IRQ 0/1 are NVIC lines 11/12. Reading ISPR is non-destructive.
         nvic_dma_irq0_pending: emu.bus.read32(0xe000_e200) & (1 << 11),
         nvic_dma_irq1_pending: emu.bus.read32(0xe000_e200) & (1 << 12),
+        scheduler: emu.bus.dma_scheduler_snapshot(),
     }
 }
 
@@ -170,18 +187,128 @@ where
     let mut emu = emulator(quantum);
     release_dma(&mut emu);
     setup(&mut emu);
-    emu.run(RUN_CYCLES)
+    let executed = emu
+        .run(RUN_CYCLES)
         .unwrap_or_else(|error| panic!("DMA workload failed at quantum {quantum}: {error:?}"));
-    snapshot(&mut emu, destination, words, channels)
+    snapshot(&mut emu, executed, destination, words, channels)
 }
 
 fn assert_invariant(name: &str, states: &[(u32, DmaState)]) {
     let reference = &states[0].1;
     for (quantum, actual) in &states[1..] {
         assert_eq!(
-            reference, actual,
-            "{name}: quantum=1 reference differs from quantum={quantum}"
+            reference.actual_cycles, actual.actual_cycles,
+            "{name}: quantum=1 and quantum={quantum} stopped at different actual cycles"
         );
+        assert_eq!(
+            reference.destination_words, actual.destination_words,
+            "{name}: destination differs at quantum={quantum}"
+        );
+        assert_eq!(
+            reference.channels, actual.channels,
+            "{name}: channel state differs at quantum={quantum}"
+        );
+        assert_eq!(
+            (
+                reference.intr,
+                reference.inte0,
+                reference.ints0,
+                reference.inte1,
+                reference.ints1,
+                reference.nvic_dma_irq0_pending,
+                reference.nvic_dma_irq1_pending,
+            ),
+            (
+                actual.intr,
+                actual.inte0,
+                actual.ints0,
+                actual.inte1,
+                actual.ints1,
+                actual.nvic_dma_irq0_pending,
+                actual.nvic_dma_irq1_pending,
+            ),
+            "{name}: DMA IRQ state differs at quantum={quantum}"
+        );
+        assert_scheduler_invariant(
+            name,
+            &reference.scheduler,
+            &actual.scheduler,
+            *quantum,
+            actual.actual_cycles,
+        );
+    }
+}
+
+fn assert_scheduler_invariant(
+    name: &str,
+    reference: &DmaSchedulerSnapshot,
+    actual: &DmaSchedulerSnapshot,
+    quantum: u32,
+    actual_cycles: u64,
+) {
+    // These are cumulative or final hardware-visible observations and must
+    // be identical when the actual master-cycle boundary is identical.
+    assert_eq!(reference.timer, actual.timer, "{name}: timer registers at quantum={quantum}");
+    assert_eq!(
+        reference.timer_accum, actual.timer_accum,
+        "{name}: timer accumulators at quantum={quantum}"
+    );
+    assert_eq!(
+        reference.timer_event_count, actual.timer_event_count,
+        "{name}: timer event counts at quantum={quantum}"
+    );
+    assert_eq!(
+        reference.timer_miss_count, actual.timer_miss_count,
+        "{name}: timer miss counts at quantum={quantum}"
+    );
+    assert_eq!(
+        reference.timer_miss_audio_not_busy, actual.timer_miss_audio_not_busy,
+        "{name}: audio-not-busy classifications at quantum={quantum}"
+    );
+    assert_eq!(
+        reference.timer_miss_other_dma_selected, actual.timer_miss_other_dma_selected,
+        "{name}: arbitration-loss classifications at quantum={quantum}"
+    );
+    assert_eq!(
+        reference.timer_miss_no_dma_selected, actual.timer_miss_no_dma_selected,
+        "{name}: no-selection classifications at quantum={quantum}"
+    );
+    assert_eq!(
+        reference.timer_miss_multiple_due_in_window, actual.timer_miss_multiple_due_in_window,
+        "{name}: coalesced-event classifications at quantum={quantum}"
+    );
+    assert_eq!(
+        reference.audio_sink, actual.audio_sink,
+        "{name}: audio sink observation at quantum={quantum}"
+    );
+
+    // `timer_due_cycle`, `last_selected_timer_due_cycle`, and the window
+    // counters describe the *last tick window*, whose partition necessarily
+    // changes with step quantum. They are still checked for internal
+    // consistency rather than incorrectly compared as if they were cumulative
+    // state. Audio-selected due cycles are compared above by the sink's digest.
+    for (index, snapshot) in [reference, actual].into_iter().enumerate() {
+        for timer in 0..4 {
+            assert!(
+                snapshot.timer_window_events[timer] <= snapshot.timer_event_count[timer],
+                "{name}: invalid timer window event count for {timer} in snapshot {index}"
+            );
+            assert!(
+                snapshot.timer_window_misses[timer] <= snapshot.timer_miss_count[timer],
+                "{name}: invalid timer window miss count for {timer} in snapshot {index}"
+            );
+            if snapshot.timer_window_events[timer] == 0 {
+                assert_eq!(
+                    snapshot.timer_due_cycle[timer], 0,
+                    "{name}: due cycle without a window event for timer {timer} in snapshot {index}"
+                );
+            } else {
+                assert!(snapshot.timer_due_cycle[timer] > 0);
+            }
+        }
+        if let Some(cycle) = snapshot.last_selected_timer_due_cycle {
+            assert!(cycle <= actual_cycles);
+        }
     }
 }
 
@@ -319,4 +446,49 @@ fn dma_chain_read_ring_is_quantum_invariant() {
         })
         .collect::<Vec<_>>();
     assert_invariant("chain/read-ring", &states);
+}
+
+#[test]
+fn dma_audio_timer_paced_observation_is_quantum_invariant() {
+    let setup = |emu: &mut Emulator| {
+        // Valid stereo PWM8 duty words.  The destination is the PicoCalc
+        // PWM5 CC register so the public audio sink observes every DMA write.
+        for (i, value) in [0x0080_0080, 0x00c0_0040, 0x0040_00c0, 0x0088_0078]
+            .into_iter()
+            .enumerate()
+        {
+            emu.bus
+                .write32(SRAM_BASE + 0xb00 + i as u32 * 4, value);
+        }
+        // One timer event every eight master cycles; four writes form one
+        // complete observed block and exercise due-cycle/PCM/block digests.
+        emu.bus.write32(DMA_BASE + REG_TIMER0, (1 << 16) | 8);
+        program_channel(
+            emu,
+            0,
+            SRAM_BASE + 0xb00,
+            AUDIO_PWM_CC,
+            4,
+            // Audio samples are written to one fixed PWM CC register. The
+            // normal SRAM-to-SRAM helper increments the destination, but a
+            // timer-paced PWM sink must keep the write address fixed.
+            ctrl(DREQ_TIMER0, 0, 0, false) & !CTRL_INCR_WRITE,
+            true,
+        );
+    };
+    let states = [1, 16, 64]
+        .into_iter()
+        .map(|quantum| {
+            (
+                quantum,
+                run_and_snapshot(quantum, setup, AUDIO_PWM_CC, 1, &[0]),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_invariant("audio timer-paced observation", &states);
+    for (quantum, state) in &states {
+        assert_eq!(state.scheduler.audio_sink.dma_write_count, 4, "quantum={quantum}");
+        assert_eq!(state.scheduler.audio_sink.pcm_sha256.len(), 64, "quantum={quantum}");
+        assert_eq!(state.scheduler.audio_sink.block_start_count, 1, "quantum={quantum}");
+    }
 }

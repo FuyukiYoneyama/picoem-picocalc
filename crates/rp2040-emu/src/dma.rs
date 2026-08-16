@@ -312,6 +312,29 @@ pub struct Dma {
     sniff_data: u32,
 }
 
+/// Deterministic DMA scheduler state used by quantum-invariance diagnostics.
+///
+/// This is an observation surface only: taking a snapshot does not alter DMA
+/// state or scheduling.  It deliberately includes timer pacing and the
+/// digital audio sink so a destination-memory match cannot hide a timing or
+/// PCM divergence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DmaSchedulerSnapshot {
+    pub timer: [u32; 4],
+    pub timer_accum: [u64; 4],
+    pub timer_event_count: [u64; 4],
+    pub timer_miss_count: [u64; 4],
+    pub timer_miss_audio_not_busy: [u64; 4],
+    pub timer_miss_other_dma_selected: [u64; 4],
+    pub timer_miss_no_dma_selected: [u64; 4],
+    pub timer_miss_multiple_due_in_window: [u64; 4],
+    pub timer_due_cycle: [u64; 4],
+    pub last_selected_timer_due_cycle: Option<u64>,
+    pub timer_window_events: [u64; 4],
+    pub timer_window_misses: [u64; 4],
+    pub audio_sink: AudioSinkSnapshot,
+}
+
 impl Default for Dma {
     fn default() -> Self {
         Self::new()
@@ -389,6 +412,27 @@ impl Dma {
     /// Snapshot the digital PicoCalc audio sample sink.
     pub fn audio_sink_snapshot(&self) -> AudioSinkSnapshot {
         self.audio_sink_snapshot_at_clock(250_000_000)
+    }
+
+    /// Snapshot timer pacing, miss diagnostics, and the digital audio sink.
+    /// The live system clock is supplied by the bus wrapper so observed sample
+    /// rates remain consistent with the configured emulator clock tree.
+    pub(crate) fn scheduler_snapshot_at_clock(&self, sys_clk_hz: u32) -> DmaSchedulerSnapshot {
+        DmaSchedulerSnapshot {
+            timer: self.timer,
+            timer_accum: self.timer_accum,
+            timer_event_count: self.timer_event_count,
+            timer_miss_count: self.timer_miss_count,
+            timer_miss_audio_not_busy: self.timer_miss_audio_not_busy,
+            timer_miss_other_dma_selected: self.timer_miss_other_dma_selected,
+            timer_miss_no_dma_selected: self.timer_miss_no_dma_selected,
+            timer_miss_multiple_due_in_window: self.timer_miss_multiple_due_in_window,
+            timer_due_cycle: self.timer_due_cycle,
+            last_selected_timer_due_cycle: self.last_selected_timer_due_cycle,
+            timer_window_events: self.timer_window_events,
+            timer_window_misses: self.timer_window_misses,
+            audio_sink: self.audio_sink_snapshot_at_clock(sys_clk_hz),
+        }
     }
 
     /// Snapshot the sink using the live `clk_sys` frequency from the bus.

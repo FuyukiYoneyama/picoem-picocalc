@@ -26,6 +26,7 @@ pub mod memory;
 pub mod peripherals;
 
 pub use audio_sink::AudioSinkSnapshot;
+pub use dma::DmaSchedulerSnapshot;
 
 mod idle_profile;
 
