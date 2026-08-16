@@ -157,6 +157,11 @@ and the limits of this digital observation are documented in
 [`docs/DMA_AUDIO_OBSERVABILITY.md`](docs/DMA_AUDIO_OBSERVABILITY.md). That
 document is part of the public emulator contract; it also records the
 quantum-invariance test and the diagnostic-only UART-marker profile option.
+The current implementation and validation order for these backend changes,
+including the feature-gated OPT4 regression found during review, is fixed in
+[`docs/BACKEND_CHANGE_VALIDATION_PLAN.md`](docs/BACKEND_CHANGE_VALIDATION_PLAN.md).
+Do not update a promoted PicoCalc backend pin until that plan's local gates and
+firmware regressions are complete.
 
 NEXT-4 also exposes the same persistent machine session as a deterministic JSON Lines API.
 Artifact and device options are fixed at process startup; one stdin line produces one stdout line,

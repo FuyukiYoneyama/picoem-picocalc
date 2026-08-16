@@ -92,8 +92,11 @@ cargo run --release -p picocalc-harness --features event-horizon-profiler -- \
 ```
 
 The report records the activation mode, marker, and virtual start cycle. The
-feature is diagnostic-only and must not be used as a wall-clock performance
-result. It cannot be combined with the JSON machine API.
+start cycle is the cycle at which the runner recognises the marker in drained
+UART bytes and enables the profile; it is not an assertion of the exact cycle
+at which firmware wrote the final UART byte. The feature is diagnostic-only
+and must not be used as a wall-clock performance result. It cannot be combined
+with the JSON machine API.
 
 ## Quantum-invariance test
 
@@ -105,9 +108,14 @@ cargo test -p rp2040-emu --test dma_quantum_invariance
 ```
 
 The workloads cover FORCE transfer, timer-paced transfer, two-channel FORCE
-competition, and chain plus read-ring operation. The test compares externally
-visible state: destination data, channel addresses/count/control/busy state,
-DMA interrupt state, chain state, timer DREQ state, and read-ring results.
+competition, and chain plus read-ring operation. The current test directly
+compares destination data, channel addresses/count/control/busy state, and DMA
+interrupt/NVIC state. Chain and read-ring behaviour are exercised through
+those end-state assertions. Timer internals, timer-miss classifications, and
+audio PCM/due-cycle/block observations are not yet part of this comparison;
+their addition is required by
+[`BACKEND_CHANGE_VALIDATION_PLAN.md`](BACKEND_CHANGE_VALIDATION_PLAN.md) before
+the new backend is eligible for a promoted PicoCalc target pin.
 
 Passing this test means that the tested model is invariant for those workloads
 under the tested scheduler quanta. It does not certify the complete PicoCalc

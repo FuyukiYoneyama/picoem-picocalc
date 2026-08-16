@@ -1,0 +1,168 @@
+# Backend change validation plan
+
+更新日: 2026-08-16
+
+> **現行計画。** `picoem-picocalc` の現行mainにあるDMA／audio観測変更と
+> feature-gated OPT4候補を、既存のPicoCalc exactness契約へ安全に接続するための
+> 実行順序を定義する。完了するまでbackend pinやpromoted targetを更新しない。
+
+## 判定
+
+実装は継続可能であり、技術的な行き止まりはない。ただし、2026-08-16にレビューした
+backend code commit `b94e550` はpromotion可能な状態ではない。
+
+- defaultの`cargo test --locked --workspace`は合格する。
+- DMA quantum-invariance integration test 4件は合格する。
+- `unconditional-cache-lookup-prototype`では
+  `empty_sentinel_does_not_match_faulting_pc`が失敗する。
+- CIと同じ範囲のfmt checkは、今回変更した`picocalc-harness/main.rs`と
+  `rp2040-emu/dma.rs`で失敗する。
+- `-D warnings`のClippyは、現行branchに残る2件のwarningで失敗する。
+- `picocalc_emu`のportable verify 84/84は合格するが、target registryは旧backendを
+  pinしているため、新しいDMA通常経路のfirmware exactnessを証明していない。
+
+## 絶対条件
+
+1. exactnessを性能、診断の便利さ、実装済み工数より優先する。
+2. 旧versioned validationと時点証拠を書き換えない。
+3. feature-gated候補をdefault buildやactive targetへ自動的に昇格しない。
+4. GitHub Actionsを通常の修正・試行錯誤に使用しない。検証はローカルで行う。
+5. `--all-features`を正式な検証コマンドにしない。cache表現には意図的に相互排他な
+   featureがあるため、有効なfeature組合せを個別に試験する。
+6. backend commitを含むnormalized reportの変化と、firmware挙動の変化を区別する。
+
+## 実行順序
+
+### 1. OPT4-A empty-sentinel回帰を閉じる
+
+`DecodedOp`の通常12-byte表現でも、empty entryがfaulting PC `u32::MAX`へ一致しないようにする。
+少なくとも次を確認する。
+
+- default representationでempty sentinelを除外する。
+- `decoded-op-8byte-prototype`でも同じ意味を維持する。
+- faulting PCがcache hit扱いされず、bus faultを発生させる。
+- cacheable PCの通常hit、non-cacheable PCのmiss、invalidationを退行させない。
+- `unconditional-cache-lookup-prototype`単独の`rp2040-emu`／harness testを合格させる。
+
+この修正が閉じるまで、OPT4-Aをexactness合格済みbank候補として扱わない。過去の隔離commitで
+得た性能・firmware記録は履歴証拠として保持するが、現行mainの合格根拠には流用しない。
+
+### 2. DMA quantum-invarianceの比較状態を拡張する
+
+現在のintegration testが比較するdestination data、channel state、DMA IRQ stateに加え、
+今回の通常経路変更が影響し得る次の状態を比較する。
+
+- DMA timer register／fixed-point accumulator
+- timer event count、miss countと分類別counter
+- selected timer due-cycleとwindow内event状態
+- audio sink DMA write count、PCM digest
+- block boundary、unexpected gap、service latency
+- chain／ringの結果を専用fieldまたは明示assertionで確認する
+
+公開文書に列挙する比較対象は、テストが実際にassertするfieldだけとする。
+
+### 3. HIGH_PRIORITYとtimer競合を局所試験する
+
+量子`1`、`16`、`64`で少なくとも次を比較する。
+
+- high-priority対normalのFORCE転送
+- high-priority timer対normal FORCE
+- 複数timer DREQの同cycle競合
+- PicoCalc audio timerと別DMA channelの競合
+- 同一priority tier内のlowest-channel tie-break
+- chain後にready setまたはpriority tierが変わるケース
+
+最終メモリだけでなく、選択channel、timer消費、IRQ、audio観測も一致条件へ含める。
+
+### 4. report／CLIのend-to-end試験を追加する
+
+次の公開経路をhelper単体ではなく、runnerの引数解析からartifact生成まで通す。
+
+- 非ゼロのtimer miss値がschema-8 reportへ正しいfield名で伝播する。
+- `--board none --audio-analysis --audio-wav`でDMA→PWM fixtureを実行する。
+- observed sample rate、WAV header、audio sink report、PCM digestを照合する。
+- UART markerが複数回のdrainへ分割されてもprofileを開始する。
+- marker未観測、scenario終了、cycle limitとの境界をfail-closedで扱う。
+
+board-less audio用fixtureは外部workspaceへ依存させない。source、ライセンス、生成方法を
+repository内で固定し、バイナリだけを根拠にしない。
+
+### 5. 文書を実装とテストへ同期する
+
+- event profileの`start_cycle`はfirmwareのUART送信cycleではなく、runnerがdrainしたUART列から
+  markerを認識しprofileを有効化したcycleであることを明記する。
+- quantum-invariance testの比較fieldを実装と同じ一覧にする。
+- 有効なfeature test matrixと、`--all-features`が不適切な理由を記録する。
+- 未使用の`tick_bulk`を参照実装として保持するなら役割を記録し、役割がなければ後続変更で削除する。
+
+### 6. format／Clippy gateを閉じる
+
+機能変更とテスト追加が固まった後に一度だけ整形し、次をローカルで合格させる。
+
+```bash
+cargo fmt -p picocalc-board -p picocalc-harness --check
+rustfmt --edition 2024 --check \
+  crates/rp2040-emu/src/dma.rs \
+  crates/rp2040-emu/src/audio_sink.rs
+cargo clippy --locked -p picocalc-board -p picocalc-harness \
+  --all-targets -- -D warnings
+cargo clippy --locked -p rp2040-emu \
+  --features event-horizon-profiler --lib -- -D warnings
+```
+
+現時点で確認済みのClippy残件は`ssi_flash.rs`の`manual_is_multiple_of`と
+`nvic.rs`の`needless_return`である。直近DMA commit由来ではないが、現行HEADのgateとして閉じる。
+
+### 7. 新backendで既存firmwareをローカル再回帰する
+
+旧target recordを変更せず、新backend専用checkoutまたは新しいversioned validation候補で、
+少なくとも次を再実行する。
+
+- PicoTetris OPT1-B
+- PicoCalc audio
+- multicore
+- PSRAM
+- SD／FAT32
+- PicoEdit
+- 代表的なofficial Hello／template firmware
+
+backend identityを含む`normalized_report_sha256`は新commitで変わるため、それだけを挙動差と
+判定しない。cycle、virtual time、timeline、UART、framebuffer、PSRAM、scenario、
+behavior SHA、event-domain digest、audio PCM／due-cycle／block情報を比較する。
+
+### 8. 結果を分類してからpromotionを判断する
+
+| 結果 | 処置 |
+|---|---|
+| 全ての挙動が一致 | 新しいversioned validation候補を作成できる。pin更新は別判断とする。 |
+| 意図したDMA改善だけが変化 | 根拠を記録し、影響するaudio／DMA targetは必要に応じて実機相関する。 |
+| 無関係なdomainが変化 | promotionせず原因を修正する。 |
+| exactnessが不一致 | 性能や診断上の利点にかかわらず候補を不採用にする。 |
+
+## 正式なローカルgate
+
+最低限、次を全て合格させる。
+
+```bash
+cargo test --locked --workspace
+cargo test --locked -p rp2040-emu --test dma_quantum_invariance
+cargo test --locked -p picocalc-harness --bin picocalc-run \
+  --features event-horizon-profiler
+```
+
+これに加えて、各実験featureを単独または明示的に許可した組合せで実行する。
+相互排他featureをまとめる`cargo test --all-features`は合格条件にしない。
+`picocalc_emu`側では`python3 tools/picocalc.py verify`を合格させ、step 7のfirmware
+再回帰をportable verifyとは別に完了する。
+
+## 完了条件
+
+- OPT4-Aのsentinel regressionが再現しない。
+- DMA／audio／UART markerの新しい公開挙動が直接テストされている。
+- source、公開文書、テストの主張が一致している。
+- default workspace、正式feature matrix、fmt、Clippyがローカルで全て合格する。
+- 新backendによる既存firmwareの挙動差が分類され、未説明の差がない。
+- それまでは既存のpromoted backendとtarget pinを維持する。
+
+見積もりは通常2〜3作業日である。deterministic audio fixtureの作成やfirmware回帰で
+新しい挙動差が見つかった場合は、追加で1〜2作業日を見込む。
