@@ -101,21 +101,30 @@ with the JSON machine API.
 ## Quantum-invariance test
 
 The public integration test compares the same DMA workloads at quantum 1, 16,
-and 64 while keeping the requested master-cycle count fixed:
+and 64 while keeping the **actual** master-cycle boundary fixed. `Emulator::run`
+is specified as running for at least the requested number of cycles and may
+overshoot at an instruction boundary, so the fixture selects a common boundary
+for all three quanta rather than comparing state at different virtual times:
 
 ```bash
 cargo test -p rp2040-emu --test dma_quantum_invariance
 ```
 
 The workloads cover FORCE transfer, timer-paced transfer, two-channel FORCE
-competition, and chain plus read-ring operation. The current test directly
-compares destination data, channel addresses/count/control/busy state, and DMA
-interrupt/NVIC state. Chain and read-ring behaviour are exercised through
-those end-state assertions. Timer internals, timer-miss classifications, and
-audio PCM/due-cycle/block observations are not yet part of this comparison;
-their addition is required by
-[`BACKEND_CHANGE_VALIDATION_PLAN.md`](BACKEND_CHANGE_VALIDATION_PLAN.md) before
-the new backend is eligible for a promoted PicoCalc target pin.
+competition, chain plus read-ring operation, and a fixed-destination timer-paced
+PWM audio fixture. The test directly compares destination data, channel
+addresses/count/control/busy state, DMA interrupt/NVIC state, timer registers and
+accumulators, cumulative event/miss classifications, and the complete audio
+PCM/due-cycle/block/latency observation. Chain and read-ring behaviour are
+exercised through explicit end-state assertions.
+
+`timer_due_cycle` and `timer_window_*` are deliberately window-local fields:
+the final tick window is partitioned differently at different quanta. The test
+checks their internal consistency (including due-cycle presence when a window
+contains events) rather than falsely requiring those last-window values to be
+equal. Audio-selected due cycles remain a cumulative digest and are compared
+exactly. The 5/5 workload comparison is a local validation result; it does not
+yet make the backend eligible for a promoted PicoCalc target pin.
 
 Passing this test means that the tested model is invariant for those workloads
 under the tested scheduler quanta. It does not certify the complete PicoCalc

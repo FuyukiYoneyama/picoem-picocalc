@@ -8,18 +8,20 @@
 
 ## 判定
 
-実装は継続可能であり、技術的な行き止まりはない。ただし、2026-08-16にレビューした
-backend code commit `b94e550` はpromotion可能な状態ではない。
+実装は継続可能であり、技術的な行き止まりはない。OPT4-Aのsentinel回帰と、DMA／audioの
+quantum-invariance比較は、backend commit `6a675b1`でローカル合格した。ただし、format／
+Clippy gate、CLI end-to-end、firmware再回帰は未完了なので、promotion可能な状態ではない。
 
-- defaultの`cargo test --locked --workspace`は合格する。
-- DMA quantum-invariance integration test 4件は合格する。
-- `unconditional-cache-lookup-prototype`では
-  `empty_sentinel_does_not_match_faulting_pc`が失敗する。
-- CIと同じ範囲のfmt checkは、今回変更した`picocalc-harness/main.rs`と
-  `rp2040-emu/dma.rs`で失敗する。
-- `-D warnings`のClippyは、現行branchに残る2件のwarningで失敗する。
-- `picocalc_emu`のportable verify 84/84は合格するが、target registryは旧backendを
-  pinしているため、新しいDMA通常経路のfirmware exactnessを証明していない。
+- `rp2040-emu` unit test 1246件は合格する。
+- DMA quantum-invariance integration test 5件は合格する。
+- `picocalc-harness --features event-horizon-profiler`のunit test 67件は合格する。
+- 量子幅比較は`Emulator::run`の実行サイクルが命令境界でovershootする契約を考慮し、
+  1／16／64の全実行を実際の共通198 master-cycle境界で比較する。
+- 最終tick窓だけを表す`timer_due_cycle`／`timer_window_*`は量子幅で窓の分割が変わるため、
+  累積値とは分離して内部整合性を検査する。audio sinkのPCM／due-cycle／block／latency
+  digestは完全一致を要求する。
+- CIと同じ範囲のfmt check、`-D warnings`のClippy、`picocalc_emu`のportable verify、
+  新backendでのfirmware exactnessは後続stepで閉じる。
 
 ## 絶対条件
 
@@ -50,7 +52,7 @@ default、`unconditional-cache-lookup-prototype`、`decoded-op-8byte-prototype`�
 過去の隔離commitで得た性能・firmware記録は履歴証拠として保持するが、step 2以降の低レベル／
 CLI／firmware回帰を閉じるまで、現行mainをpromoted bank候補へ戻さない。
 
-### 2. DMA quantum-invarianceの比較状態を拡張する
+### 2. DMA quantum-invarianceの比較状態を拡張する — 完了 2026-08-16
 
 現在のintegration testが比較するdestination data、channel state、DMA IRQ stateに加え、
 今回の通常経路変更が影響し得る次の状態を比較する。
@@ -63,6 +65,14 @@ CLI／firmware回帰を閉じるまで、現行mainをpromoted bank候補へ戻�
 - chain／ringの結果を専用fieldまたは明示assertionで確認する
 
 公開文書に列挙する比較対象は、テストが実際にassertするfieldだけとする。
+
+backend commit `6a675b1`で、公開`DmaSchedulerSnapshot`を追加し、timer register／
+accumulator／event・miss分類、audio sinkのDMA write count、PCM digest、block境界、
+unexpected gap、service latencyをintegration testへ接続した。timer-paced transferと
+fixed-destination PWM audio fixtureを追加し、FORCE、timer、競合、chain／ringを量子
+1／16／64で比較して5/5合格した。`Emulator::run`のrequested-cycle overshootをそのまま
+比較すると誤検出になるため、テストは共通の実行境界を明示し、window-localな観測値は
+「量子幅不変な累積契約」と混同しないよう整合性だけを検査する。
 
 ### 3. HIGH_PRIORITYとtimer競合を局所試験する
 
@@ -94,7 +104,7 @@ repository内で固定し、バイナリだけを根拠にしない。
 
 - event profileの`start_cycle`はfirmwareのUART送信cycleではなく、runnerがdrainしたUART列から
   markerを認識しprofileを有効化したcycleであることを明記する。
-- quantum-invariance testの比較fieldを実装と同じ一覧にする。
+- quantum-invariance testの比較fieldを実装と同じ一覧にする（step 2で同期済み）。
 - 有効なfeature test matrixと、`--all-features`が不適切な理由を記録する。
 - 未使用の`tick_bulk`を参照実装として保持するなら役割を記録し、役割がなければ後続変更で削除する。
 
