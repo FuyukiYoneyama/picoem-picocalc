@@ -76,6 +76,46 @@ audio analysis. A stream using another timer rate is represented by the
 additive audio-analysis schema already described in the root README; it is not
 silently coerced to 48 kHz.
 
+### Repository-contained CLI fixture
+
+`crates/picocalc-harness/tests/cli_audio_e2e.rs` generates a small raw flash
+image from original Thumb-1 instructions at test time. It is not an external
+firmware checkout and no generated binary is committed. The fixture releases
+DMA/TIMER/UART0/PWM, emits `AUDIO_FIXTURE`, configures four timer-paced words
+to PWM5 CC, and then loops. The test starts the real `picocalc-run` binary
+with `--board none --audio-analysis --audio-wav`, then checks the schema-8
+report, timer-miss fields, observed rate, PCM digest, and RIFF/WAV header.
+
+Run it locally with:
+
+```bash
+cargo test --locked -p picocalc-harness --bin picocalc-run \
+  --features event-horizon-profiler --test cli_audio_e2e
+```
+
+The fixture source and its license/generation policy are documented beside the
+test in `crates/picocalc-harness/tests/fixtures/README.md`.
+
+### Repository-contained CLI fixture
+
+`crates/picocalc-harness/tests/cli_audio_e2e.rs` generates a small raw flash
+image from original Thumb-1 instructions at test time.  It is not an external
+firmware checkout and no generated binary is committed.  The fixture releases
+DMA/TIMER/UART0/PWM, emits `AUDIO_FIXTURE`, configures four timer-paced words
+to PWM5 CC, and then loops.  The test starts the real `picocalc-run` binary
+with `--board none --audio-analysis --audio-wav`, then checks the schema-8
+report, timer-miss fields, observed rate, PCM digest, and RIFF/WAV header.
+
+Run it locally with:
+
+```bash
+cargo test --locked -p picocalc-harness --bin picocalc-run \
+  --features event-horizon-profiler --test cli_audio_e2e
+```
+
+The fixture source and its license/generation policy are documented beside the
+test in `crates/picocalc-harness/tests/fixtures/README.md`.
+
 ## Starting an event-horizon profile after a firmware marker
 
 The diagnostic-only `event-horizon-profiler` feature can defer the running

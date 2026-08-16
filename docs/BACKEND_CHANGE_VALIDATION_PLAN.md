@@ -8,15 +8,19 @@
 
 ## 判定
 
-実装は継続可能であり、技術的な行き止まりはない。OPT4-Aのsentinel回帰と、DMA／audioの
-quantum-invariance比較は、backend commit `6a675b1`でローカル合格した。ただし、format／
-Clippy gate、CLI end-to-end、firmware再回帰は未完了なので、promotion可能な状態ではない。
+実装は継続可能であり、技術的な行き止まりはない。OPT4-Aのsentinel回帰、DMA／audioの
+quantum-invariance比較、CLI end-to-endはローカル合格した。ただし、format／Clippy gateと
+firmware再回帰は未完了なので、promotion可能な状態ではない。
 
 - `rp2040-emu` unit test 1246件は合格する。
 - DMA quantum-invariance integration test 5件は合格する。
 - `picocalc-harness --features event-horizon-profiler`のunit test 67件は合格する。
 - HIGH_PRIORITY／timer競合の量子幅integration test 5件を追加し、DMA quantum-invarianceは
   合計10/10で合格する。
+- board-less audio CLI E2Eは、repository内生成fixtureからaudio-analysis／WAV／schema-8
+  reportを生成し、非48 kHz observed rate、PCM digest、timer-miss分類を照合して合格する。
+- UART markerの分割drain、marker未観測、scenario／cycle-limit境界の未起動状態を、runnerの
+  `MachineSession`とCLIの両方でfail-closedに確認する。
 - 量子幅比較は`Emulator::run`の実行サイクルが命令境界でovershootする契約を考慮し、
   1／16／64の全実行を実際の共通198 master-cycle境界で比較する。
 - 最終tick窓だけを表す`timer_due_cycle`／`timer_window_*`は量子幅で窓の分割が変わるため、
@@ -94,7 +98,7 @@ normal FORCE、同一timer周期のlowest-channel tie-break、PicoCalc audio tim
 chain後のpriority tier変化を、量子1／16／64で実行した。転送結果・channel残量・timer event／
 miss分類・IRQ・audio sinkを比較し、10/10 workloadが合格した。
 
-### 4. report／CLIのend-to-end試験を追加する
+### 4. report／CLIのend-to-end試験を追加する — 完了 2026-08-16
 
 次の公開経路をhelper単体ではなく、runnerの引数解析からartifact生成まで通す。
 
@@ -107,13 +111,32 @@ miss分類・IRQ・audio sinkを比較し、10/10 workloadが合格した。
 board-less audio用fixtureは外部workspaceへ依存させない。source、ライセンス、生成方法を
 repository内で固定し、バイナリだけを根拠にしない。
 
-### 5. 文書を実装とテストへ同期する
+backend commit `e0eda1c`で、`crates/picocalc-harness/tests/cli_audio_e2e.rs`にThumb-1命令から
+raw flash imageを生成するfixtureを追加した。`picocalc-run`の実バイナリをサブプロセスで起動し、
+`--board none --audio-analysis --audio-wav --expect-stop cycle_limit --expect-uart AUDIO_FIXTURE`
+を通して、次を照合する。
+
+- schema-8 `audio_sink`の`dma_write_count=4`と、5つのtimer-miss fieldの整数値（fixtureでは非ゼロ）。
+- 48 kHzに固定されないobserved sample rateと、analysis／report間のPCM SHA-256一致。
+- RIFF/WAVE/fmt/data、sample-rate、4 stereo s16le frameのWAV header／payload。
+- `event-horizon-profiler`のmarker分割drain認識、未観測marker時のCLI non-zero終了。
+- `MachineSession::finish`でscenario／cycle-limit境界にprofileが未起動のまま残ること。
+
+fixtureのsource／ライセンス／生成方針は
+[`crates/picocalc-harness/tests/fixtures/README.md`](../crates/picocalc-harness/tests/fixtures/README.md)
+に固定し、生成バイナリは追跡しない。ローカル結果はCLI 2件、harness unit 69件が合格した。
+
+### 5. 文書を実装とテストへ同期する — 完了 2026-08-16
 
 - event profileの`start_cycle`はfirmwareのUART送信cycleではなく、runnerがdrainしたUART列から
   markerを認識しprofileを有効化したcycleであることを明記する。
 - quantum-invariance testの比較fieldを実装と同じ一覧にする（step 2で同期済み）。
 - 有効なfeature test matrixと、`--all-features`が不適切な理由を記録する。
 - 未使用の`tick_bulk`を参照実装として保持するなら役割を記録し、役割がなければ後続変更で削除する。
+
+Step 4の実装範囲、fixtureの出所、実行コマンド、schema field、markerの境界条件を本計画と
+`DMA_AUDIO_OBSERVABILITY.md`へ反映した。`--all-features`は相互排他featureを含むため、正式な
+gateには使わない。
 
 ### 6. format／Clippy gateを閉じる
 
