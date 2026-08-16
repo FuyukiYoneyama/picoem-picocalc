@@ -10,9 +10,9 @@
 
 実装は継続可能であり、技術的な行き止まりはない。OPT4-Aのsentinel回帰、DMA／audioの
 quantum-invariance比較、CLI end-to-end、format／Clippy gateはローカル合格した。
-firmware再回帰は**部分完了**で、現行main (`a67e81c9…`) は既存の複数targetでUART／
+firmware再回帰の**実行は完了**したが、現行main (`a67e81c9…`) は既存の複数targetでUART／
 framebuffer／scenarioを保つ一方、旧pinのcycle指紋に小さな差を確認した。したがって
-promotion可能な状態ではない。
+exactness差分の扱いが決まるまでpromotion可能な状態ではない。
 
 - `rp2040-emu` unit test 1246件は合格する。
 - DMA quantum-invariance integration test 5件は合格する。
@@ -186,12 +186,29 @@ release runnerで行い、GitHub Actionsは使用していない。
 | `picocalc-audio-r1` | **pass** | `405,523,032` vs `405,523,032` | UART、framebuffer、scenario、DMA write `49,152`、PCM SHA、timer観測が一致。 |
 | `picocalc-multicore-r2` | **partial / hold** | `152,548,097` vs pinned `152,548,092` (**+5**) | UART `2c1ebc31…`、framebuffer `7a8c4e73…`、scenarioのsemantic判定は一致。 |
 | `picoedit-r1` | **partial / hold** | `827,799,818` vs pinned `827,799,822` (**-4**) | registryと同じdefault FAT32条件で実行。UART `2a37433c…`、framebuffer `18d0809e…`、SD `12/13` blocks、PSRAM `154/2471` bytes、scenarioのsemantic判定は一致。RAW image条件はこのtargetのhistorical条件ではないため、別試験として扱った。 |
-| `picocalc-helloworld-a` | **screening only** | 1B-cycle screening completed; 9.5B acceptance not completed | 100M／1B-cycle窓はcycle-limit PASSで進行を確認したが、required UART markersと8MiB verifyを含む9.5B-cycle runは14分超で停止した。full exactnessは未確定であり、合格扱いにしない。 |
+| `picocalc-helloworld-a` | **pass** | `9,500,000,000` vs pinned `9,500,000,000` | registry条件（`hwspi-rgb888`、keyboard `HI`、PSRAM 8 MiB verify）でexit 0。required UART marker 3件、PSRAM `8,388,608/0`、unknown MMIO 0、exception 0。 |
 
 この表の`partial / hold`は「最終出力が壊れた」という意味ではない。cycleはexactnessの
 絶対条件なので、他のdigestが一致していても、旧versioned validationを上書きせず、現行mainの
 promotion根拠には使わない。差分の原因が意図したperipheral-model更新である可能性は高いが、
-未説明のまま許容しない。Helloのfull runも、短縮screeningを正式受入の代替にしない。
+未説明のまま許容しない。公式Helloのfull runは正式条件で完了し、短縮screeningの代替にはしていない。
+
+### cycle差分の境界分類
+
+現行mainの差分がfeature-gated OPT4候補そのものによるものかを切り分けるため、音声sink導入直後の
+`94818f8`と、低レベル検証commit `00b05f5`のrelease runnerを同じBIN／scenarioで比較した。
+`a67e81c9…`の結果は`00b05f5`と同じであり、後続のOPT4 feature matrix、診断計装、CLIテスト追加は
+このcycle差を増減させていない。
+
+| target | `94818f8` probe | `00b05f5` checkpoint | 変更帯の境界 |
+|---|---:|---:|---|
+| PicoTetris | `927,528,658` | `927,528,659` | audio／IRQ／LCD／SD等のdefault runtime更新後に +1 |
+| multicore | `152,548,095` | `152,548,097` | 同じ更新帯に +2 |
+| PicoEdit | `827,799,822` | `827,799,818` | SD／LCD等のdefault runtime更新帯に -4 |
+
+UART、framebuffer、scenario semantic判定、対象固有のSD／PSRAM／audio観測は各比較で一致した。
+したがって現時点の分類は「意図した周辺モデル更新に伴うcycle指紋差」であり、無関係なdomainの
+破綻ではない。ただしcycle exactnessの不一致を自動的に吸収せず、旧pinとpromoted targetは維持する。
 
 ### 8. 結果を分類してからpromotionを判断する
 
@@ -216,7 +233,8 @@ cargo test --locked -p picocalc-harness --bin picocalc-run \
 これに加えて、各実験featureを単独または明示的に許可した組合せで実行する。
 相互排他featureをまとめる`cargo test --all-features`は合格条件にしない。
 `picocalc_emu`側では`python3 tools/picocalc.py verify`を合格させ、step 7のfirmware
-再回帰をportable verifyとは別に完了する。
+再回帰をportable verifyとは別に完了する。2026-08-16時点で、Helloを含む全対象の実行は完了し、
+上表のcycle差分類だけがstep 8の残件である。
 
 ## 完了条件
 
@@ -224,7 +242,8 @@ cargo test --locked -p picocalc-harness --bin picocalc-run \
 - DMA／audio／UART markerの新しい公開挙動が直接テストされている。
 - source、公開文書、テストの主張が一致している。
 - default workspace、正式feature matrix、fmt、Clippyがローカルで全て合格する。
-- 新backendによる既存firmwareの挙動差が分類され、未説明の差がない（現時点ではcycle差とHello full runが残件）。
+- 新backendによる既存firmwareの挙動差が分類され、未説明の差がない（Hello fullは完了。cycle差の
+  versioned validation／必要な実機相関の判断が残件）。
 - それまでは既存のpromoted backendとtarget pinを維持する。
 
 見積もりは通常2〜3作業日である。deterministic audio fixtureの作成やfirmware回帰で
