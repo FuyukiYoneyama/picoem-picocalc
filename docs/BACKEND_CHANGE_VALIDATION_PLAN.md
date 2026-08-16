@@ -33,7 +33,7 @@ backend code commit `b94e550` はpromotion可能な状態ではない。
 
 ## 実行順序
 
-### 1. OPT4-A empty-sentinel回帰を閉じる
+### 1. OPT4-A empty-sentinel回帰を閉じる — 完了 2026-08-16
 
 `DecodedOp`の通常12-byte表現でも、empty entryがfaulting PC `u32::MAX`へ一致しないようにする。
 少なくとも次を確認する。
@@ -44,8 +44,11 @@ backend code commit `b94e550` はpromotion可能な状態ではない。
 - cacheable PCの通常hit、non-cacheable PCのmiss、invalidationを退行させない。
 - `unconditional-cache-lookup-prototype`単独の`rp2040-emu`／harness testを合格させる。
 
-この修正が閉じるまで、OPT4-Aをexactness合格済みbank候補として扱わない。過去の隔離commitで
-得た性能・firmware記録は履歴証拠として保持するが、現行mainの合格根拠には流用しない。
+source commit `37c50e6`で通常12-byte表現の`matches_pc`にもempty sentinel除外を追加した。
+default、`unconditional-cache-lookup-prototype`、`decoded-op-8byte-prototype`、
+`compact-dispatch-key-prototype`の各lib testと、unconditional harness testはローカルで合格した。
+過去の隔離commitで得た性能・firmware記録は履歴証拠として保持するが、step 2以降の低レベル／
+CLI／firmware回帰を閉じるまで、現行mainをpromoted bank候補へ戻さない。
 
 ### 2. DMA quantum-invarianceの比較状態を拡張する
 
