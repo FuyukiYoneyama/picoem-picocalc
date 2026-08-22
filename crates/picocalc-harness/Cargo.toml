@@ -11,7 +11,10 @@ publish = false
 build = "build.rs"
 
 [features]
-default = []
+# The production runner includes the SD-GEN-1 multi-block model.  Use
+# `--no-default-features` only for the legacy single-block differential
+# boundary; normal builds must exercise the promoted runtime.
+default = ["sd-gen1-multiblock"]
 # Diagnostic-only OPT0-A build. The normal conformance runner remains
 # byte-for-byte schema compatible and carries no profiler hot-path branch.
 idle-profiler = ["rp2040-emu/idle-profiler"]
@@ -33,9 +36,9 @@ decoded-op-8byte-prototype = ["rp2040-emu/decoded-op-8byte-prototype"]
 diagnostic-pc-compile-out-prototype = ["rp2040-emu/diagnostic-pc-compile-out-prototype"]
 # OPT4-E experimental compact dispatch key in the default decoded-op flags.
 compact-dispatch-key-prototype = ["rp2040-emu/compact-dispatch-key-prototype"]
-# P3 diagnostic runner: expose the feature-gated SD-GEN-1 multi-block model
-# and propagate its protocol errors into the verdict/report. Not enabled by
-# default, so existing target reports remain byte-compatible.
+# P3/P4 SD-GEN-1 multi-block model and protocol-error propagation. Existing
+# versioned target records remain immutable; a new runtime commit/record is
+# required when a target is revalidated.
 sd-gen1-multiblock = ["picocalc-board/sd-gen1-multiblock"]
 
 [lints]

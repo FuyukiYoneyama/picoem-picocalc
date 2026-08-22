@@ -10,8 +10,11 @@ rust-version.workspace = true
 publish = false
 
 [features]
-# Experimental SD-GEN-1 multi-block wire model. The default PicoCalc
-# runtime remains the existing single-block model until the P2/P3 gates pass.
+# SD-GEN-1 multi-block wire model. It is part of the production PicoCalc
+# runtime after the P4 representative-runtime regression gate.  The legacy
+# single-block boundary remains available with `--no-default-features` for
+# differential tests.
+default = ["sd-gen1-multiblock"]
 sd-gen1-multiblock = []
 
 [lints]

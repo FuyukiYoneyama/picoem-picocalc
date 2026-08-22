@@ -29,11 +29,12 @@
 //! # What is not modelled
 //!
 //! No card-removal or write-protect behaviour, no CSD/CID registers
-//! beyond what bring-up reads, no multi-block transfer (CMD18/CMD25),
-//! and no busy timing: writes complete immediately rather than holding
-//! MISO low for a programming delay. Nothing in the conformance track
-//! exercises those, and a half-modelled busy state would be harder to
-//! reason about than its absence.
+//! beyond what bring-up reads. The production build includes the SD-GEN-1
+//! multi-block transfer states (CMD18/CMD12/CMD23/CMD25); the pre-P4
+//! single-block boundary remains available only with
+//! `--no-default-features` for differential tests. Busy timing is still
+//! deterministic rather than wall-clock based: writes expose the explicit
+//! modelled busy state and complete without an analogue programming delay.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -534,7 +535,9 @@ pub struct SdCard {
     /// Commands this model does not implement, with their counts.
     pub unknown_commands: Vec<(u8, u32)>,
     /// Protocol violations observed by the experimental multi-block model.
-    /// This is diagnostic state only; the feature is not enabled by default.
+    /// This is the protocol diagnostic state exposed by the production
+    /// multi-block feature. The legacy single-block build returns an empty
+    /// slice and remains available with `--no-default-features`.
     #[cfg(feature = "sd-gen1-multiblock")]
     pub protocol_errors: Vec<String>,
     #[cfg(feature = "sd-gen1-multiblock")]
