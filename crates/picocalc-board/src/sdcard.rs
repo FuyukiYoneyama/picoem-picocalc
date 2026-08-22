@@ -40,6 +40,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::sha256::StreamingSha256;
+
 /// Bytes per block. SDHC addresses in blocks, not bytes.
 pub const BLOCK_SIZE: usize = 512;
 
@@ -123,6 +125,229 @@ enum Phase {
     WriteData { taken: usize },
     /// Data taken; the acceptance token goes out on the next transfer.
     DataResponse,
+}
+
+/// Schema version for the diagnostic SD protocol trace.  This is separate
+/// from the runner report schema because a trace is an optional observation
+/// artifact, not an acceptance input.
+pub const SD_TRACE_SCHEMA_VERSION: u32 = 1;
+const SD_TRACE_PREVIEW_LIMIT: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdTraceDirection {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdTraceData {
+    pub direction: SdTraceDirection,
+    pub block: u32,
+    pub token: u8,
+    pub length: usize,
+    pub crc: [u8; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SdTraceEvent {
+    Command {
+        sequence: u64,
+        cs_epoch: u64,
+        transfers: u64,
+        index: u8,
+        argument: u32,
+        crc: u8,
+        crc_valid: bool,
+        response: Vec<u8>,
+        data: Option<SdTraceData>,
+    },
+    BlockData {
+        sequence: u64,
+        cs_epoch: u64,
+        transfers: u64,
+        data: SdTraceData,
+    },
+    Deselect {
+        sequence: u64,
+        cs_epoch: u64,
+        transfers: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdTraceSnapshot {
+    pub schema_version: u32,
+    pub event_count: u64,
+    pub digest_sha256: String,
+    pub preview_truncated: bool,
+    pub preview: Vec<SdTraceEvent>,
+}
+
+#[derive(Clone)]
+struct SdTraceState {
+    digest: StreamingSha256,
+    event_count: u64,
+    preview: Vec<SdTraceEvent>,
+    preview_truncated: bool,
+    cs_epoch: u64,
+    cs_active: bool,
+    transfers: u64,
+}
+
+impl SdTraceState {
+    fn new() -> Self {
+        Self {
+            digest: StreamingSha256::new(),
+            event_count: 0,
+            preview: Vec::new(),
+            preview_truncated: false,
+            cs_epoch: 0,
+            cs_active: false,
+            transfers: 0,
+        }
+    }
+
+    fn select(&mut self) {
+        if !self.cs_active {
+            self.cs_epoch = self.cs_epoch.saturating_add(1);
+            self.cs_active = true;
+            self.transfers = 0;
+        }
+    }
+
+    fn transfer(&mut self) {
+        // Unit tests can exercise the card without the wire's pin callbacks.
+        // Treat their first byte as an implicit CS-low edge so the trace is
+        // still self-contained and deterministic.
+        self.select();
+        self.transfers = self.transfers.saturating_add(1);
+    }
+
+    fn record(&mut self, event: SdTraceEvent) {
+        let mut canonical = Vec::with_capacity(96);
+        match &event {
+            SdTraceEvent::Command {
+                sequence,
+                cs_epoch,
+                transfers,
+                index,
+                argument,
+                crc,
+                crc_valid,
+                response,
+                data,
+            } => {
+                canonical.push(1);
+                canonical.extend_from_slice(&sequence.to_be_bytes());
+                canonical.extend_from_slice(&cs_epoch.to_be_bytes());
+                canonical.extend_from_slice(&transfers.to_be_bytes());
+                canonical.push(*index);
+                canonical.extend_from_slice(&argument.to_be_bytes());
+                canonical.push(*crc);
+                canonical.push(u8::from(*crc_valid));
+                canonical.extend_from_slice(&(response.len() as u32).to_be_bytes());
+                canonical.extend_from_slice(response);
+                match data {
+                    Some(data) => {
+                        canonical.push(1);
+                        canonical.push(match data.direction {
+                            SdTraceDirection::Read => 0,
+                            SdTraceDirection::Write => 1,
+                        });
+                        canonical.extend_from_slice(&data.block.to_be_bytes());
+                        canonical.push(data.token);
+                        canonical.extend_from_slice(&(data.length as u64).to_be_bytes());
+                        canonical.extend_from_slice(&data.crc);
+                    }
+                    None => canonical.push(0),
+                }
+            }
+            SdTraceEvent::Deselect {
+                sequence,
+                cs_epoch,
+                transfers,
+            } => {
+                canonical.push(2);
+                canonical.extend_from_slice(&sequence.to_be_bytes());
+                canonical.extend_from_slice(&cs_epoch.to_be_bytes());
+                canonical.extend_from_slice(&transfers.to_be_bytes());
+            }
+            SdTraceEvent::BlockData {
+                sequence,
+                cs_epoch,
+                transfers,
+                data,
+            } => {
+                canonical.push(3);
+                canonical.extend_from_slice(&sequence.to_be_bytes());
+                canonical.extend_from_slice(&cs_epoch.to_be_bytes());
+                canonical.extend_from_slice(&transfers.to_be_bytes());
+                canonical.push(match data.direction {
+                    SdTraceDirection::Read => 0,
+                    SdTraceDirection::Write => 1,
+                });
+                canonical.extend_from_slice(&data.block.to_be_bytes());
+                canonical.push(data.token);
+                canonical.extend_from_slice(&(data.length as u64).to_be_bytes());
+                canonical.extend_from_slice(&data.crc);
+            }
+        }
+        self.digest.update(&canonical);
+        self.event_count = self.event_count.saturating_add(1);
+        if self.preview.len() < SD_TRACE_PREVIEW_LIMIT {
+            self.preview.push(event);
+        } else {
+            self.preview_truncated = true;
+        }
+    }
+
+    fn command(
+        &mut self,
+        index: u8,
+        argument: u32,
+        crc: u8,
+        crc_valid: bool,
+        response: Vec<u8>,
+        data: Option<SdTraceData>,
+    ) {
+        self.select();
+        let sequence = self.event_count;
+        self.record(SdTraceEvent::Command {
+            sequence,
+            cs_epoch: self.cs_epoch,
+            transfers: self.transfers,
+            index,
+            argument,
+            crc,
+            crc_valid,
+            response,
+            data,
+        });
+    }
+
+    fn deselect(&mut self) {
+        if !self.cs_active {
+            return;
+        }
+        let sequence = self.event_count;
+        self.record(SdTraceEvent::Deselect {
+            sequence,
+            cs_epoch: self.cs_epoch,
+            transfers: self.transfers,
+        });
+        self.cs_active = false;
+        self.transfers = 0;
+    }
+
+    fn snapshot(&self) -> SdTraceSnapshot {
+        SdTraceSnapshot {
+            schema_version: SD_TRACE_SCHEMA_VERSION,
+            event_count: self.event_count,
+            digest_sha256: self.digest.finalize_hex(),
+            preview_truncated: self.preview_truncated,
+            preview: self.preview.clone(),
+        }
+    }
 }
 
 struct RawBacking {
@@ -281,6 +506,9 @@ pub struct SdCard {
     write_pending: bool,
     /// Buffer for the block being written.
     write_buf: Vec<u8>,
+    /// CRC bytes supplied after a block-write payload.  General CRC is not
+    /// validated by this model, but the trace records the wire values.
+    write_crc: [u8; 2],
 
     // --- observation counters ---
     pub commands_seen: u64,
@@ -288,6 +516,7 @@ pub struct SdCard {
     pub blocks_written: u64,
     /// Commands this model does not implement, with their counts.
     pub unknown_commands: Vec<(u8, u32)>,
+    trace: Option<SdTraceState>,
 }
 
 impl Default for SdCard {
@@ -319,10 +548,12 @@ impl SdCard {
             write_block: 0,
             write_pending: false,
             write_buf: Vec::with_capacity(BLOCK_SIZE),
+            write_crc: [0; 2],
             commands_seen: 0,
             blocks_read: 0,
             blocks_written: 0,
             unknown_commands: Vec::new(),
+            trace: None,
         };
         match format {
             SdFormat::Fat16 => card.format_fat16(),
@@ -356,10 +587,12 @@ impl SdCard {
             write_block: 0,
             write_pending: false,
             write_buf: Vec::with_capacity(BLOCK_SIZE),
+            write_crc: [0; 2],
             commands_seen: 0,
             blocks_read: 0,
             blocks_written: 0,
             unknown_commands: Vec::new(),
+            trace: None,
         })
     }
 
@@ -387,6 +620,27 @@ impl SdCard {
     /// Initial filesystem profile selected for this card.
     pub const fn format(&self) -> SdFormat {
         self.format
+    }
+
+    /// Enable the bounded, structured SPI protocol trace used by the U4
+    /// loader investigation.  It is deliberately opt-in and does not alter
+    /// card replies, counters, or backing-store behaviour.
+    pub fn enable_trace(&mut self) {
+        self.trace = Some(SdTraceState::new());
+    }
+
+    /// Return the trace snapshot, if diagnostic tracing was enabled.
+    pub fn trace_snapshot(&self) -> Option<SdTraceSnapshot> {
+        self.trace.as_ref().map(SdTraceState::snapshot)
+    }
+
+    /// Notify the card that SPI chip-select went low.  The wire calls this
+    /// on the falling edge; direct card tests may omit it because the trace
+    /// state also infers a first selection from the first transfer.
+    pub fn trace_select(&mut self) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.select();
+        }
     }
 
     /// Lay down an empty FAT16 volume.
@@ -608,13 +862,20 @@ impl SdCard {
 
     /// Chip select released: abandon whatever was in flight.
     pub fn deselect(&mut self) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.deselect();
+        }
         self.phase = Phase::Idle;
         self.reply.clear();
         self.write_buf.clear();
+        self.write_crc = [0; 2];
     }
 
     /// One byte exchanged. Returns what the card puts on MISO.
     pub fn transfer(&mut self, byte: u8) -> u8 {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.transfer();
+        }
         match self.phase {
             Phase::Idle => {
                 // A command frame starts with 0b01xxxxxx.
@@ -665,6 +926,7 @@ impl SdCard {
                 if byte == TOKEN_START {
                     self.phase = Phase::WriteData { taken: 0 };
                     self.write_buf.clear();
+                    self.write_crc = [0; 2];
                 }
                 IDLE
             }
@@ -675,6 +937,7 @@ impl SdCard {
                     IDLE
                 } else if taken < BLOCK_SIZE + 1 {
                     // First CRC byte.
+                    self.write_crc[0] = byte;
                     self.phase = Phase::WriteData { taken: taken + 1 };
                     IDLE
                 } else {
@@ -682,6 +945,7 @@ impl SdCard {
                     // discarding what comes back, then reads the
                     // response on the *next* transfer -- so commit here
                     // and answer one byte later.
+                    self.write_crc[1] = byte;
                     self.commit_write();
                     self.phase = Phase::DataResponse;
                     IDLE
@@ -710,6 +974,20 @@ impl SdCard {
         };
         if committed {
             self.blocks_written += 1;
+            if let Some(trace) = self.trace.as_mut() {
+                trace.record(SdTraceEvent::BlockData {
+                    sequence: trace.event_count,
+                    cs_epoch: trace.cs_epoch,
+                    transfers: trace.transfers,
+                    data: SdTraceData {
+                        direction: SdTraceDirection::Write,
+                        block: block as u32,
+                        token: TOKEN_START,
+                        length: self.write_buf.len(),
+                        crc: self.write_crc,
+                    },
+                });
+            }
         }
         self.write_buf.clear();
         self.write_pending = false;
@@ -722,17 +1000,28 @@ impl SdCard {
     fn begin_reply(&mut self, index: u8, received_crc: u8) {
         self.commands_seen += 1;
         self.reply.clear();
+        let argument = self.arg_value();
+        let crc_valid = !matches!(index, 0 | 8) || received_crc == self.command_crc(index);
         // The card takes a byte or two to answer; the driver polls for
         // the first byte with bit 7 clear, so one idle byte in front is
         // both realistic and harmless.
         self.reply.push_back(IDLE);
 
-        if matches!(index, 0 | 8) && received_crc != self.command_crc(index) {
+        if matches!(index, 0 | 8) && !crc_valid {
             // A rejected command has no R3/R7 extension and must not
             // otherwise change card state. In particular, do not consume
             // a pending APP_CMD prefix for a frame that was never accepted.
             let state = if self.initialised { R1_READY } else { R1_IDLE };
-            self.reply.push_back(state | R1_COM_CRC_ERROR);
+            let response = state | R1_COM_CRC_ERROR;
+            self.reply.push_back(response);
+            self.trace_command(
+                index,
+                argument,
+                received_crc,
+                crc_valid,
+                vec![response],
+                None,
+            );
             self.phase = Phase::Reply;
             return;
         }
@@ -756,55 +1045,85 @@ impl SdCard {
                     self.reply.push_back(R1_READY);
                 }
             }
+            let response = self.reply.back().copied().unwrap_or(R1_READY);
+            self.trace_command(
+                index,
+                argument,
+                received_crc,
+                crc_valid,
+                vec![response],
+                None,
+            );
             self.phase = Phase::Reply;
             return;
         }
 
+        let mut response = Vec::new();
+        let mut data = None;
         match index {
             // GO_IDLE_STATE: enter SPI mode, report idle.
-            0 => self.reply.push_back(R1_IDLE),
+            0 => response.push(R1_IDLE),
             // SEND_IF_COND: R7 echoes the voltage nibble and check byte.
             8 => {
-                self.reply.push_back(R1_IDLE);
-                self.reply.push_back(0x00);
-                self.reply.push_back(0x00);
-                self.reply.push_back(0x01);
-                self.reply.push_back((self.arg_value() & 0xFF) as u8);
+                response.extend_from_slice(&[R1_IDLE, 0x00, 0x00, 0x01, (argument & 0xFF) as u8]);
             }
             // SET_BLOCKLEN: SDHC is fixed at 512, so just accept it.
-            16 => self.reply.push_back(R1_READY),
+            16 => response.push(R1_READY),
             // READ_SINGLE_BLOCK.
             17 => {
-                self.reply.push_back(R1_READY);
-                self.queue_block_read(self.arg_value());
+                response.push(R1_READY);
+                data = self.queue_block_read(argument);
             }
             // WRITE_BLOCK: acknowledge, then take the data phase.
             24 => {
-                self.reply.push_back(R1_READY);
-                self.write_block = self.arg_value();
+                response.push(R1_READY);
+                self.write_block = argument;
                 self.write_pending = true;
             }
             // APP_CMD: the next command is an ACMD.
             55 => {
                 self.app_cmd_pending = true;
-                self.reply
-                    .push_back(if self.initialised { R1_READY } else { R1_IDLE });
+                response.push(if self.initialised { R1_READY } else { R1_IDLE });
             }
             // READ_OCR: R3. Bit 30 of the first byte marks high capacity,
             // which is what makes the driver address in blocks.
             58 => {
-                self.reply.push_back(R1_READY);
-                self.reply.push_back(0xC0);
-                self.reply.push_back(0xFF);
-                self.reply.push_back(0x80);
-                self.reply.push_back(0x00);
+                response.extend_from_slice(&[R1_READY, 0xC0, 0xFF, 0x80, 0x00]);
             }
             other => {
                 self.note_unknown(other);
-                self.reply.push_back(R1_READY);
+                response.push(R1_READY);
             }
         }
+        // A block read queues its token and payload while the command is
+        // decoded.  The SPI protocol still returns the command response
+        // first (R1, then the data token/payload); keep the queued data
+        // behind that response.  Without this ordering, a real Petit
+        // FatFs host can mistake the first payload byte for R1 and retry
+        // the mount forever.
+        if data.is_some() {
+            let queued_data = self.reply.split_off(1);
+            self.reply.extend(response.iter().copied());
+            self.reply.extend(queued_data);
+        } else {
+            self.reply.extend(response.iter().copied());
+        }
+        self.trace_command(index, argument, received_crc, crc_valid, response, data);
         self.phase = Phase::Reply;
+    }
+
+    fn trace_command(
+        &mut self,
+        index: u8,
+        argument: u32,
+        crc: u8,
+        crc_valid: bool,
+        response: Vec<u8>,
+        data: Option<SdTraceData>,
+    ) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.command(index, argument, crc, crc_valid, response, data);
+        }
     }
 
     /// CRC byte for a command frame: CRC7 over command+argument, shifted
@@ -829,14 +1148,14 @@ impl SdCard {
         (crc << 1) | 1
     }
 
-    fn queue_block_read(&mut self, block: u32) {
+    fn queue_block_read(&mut self, block: u32) -> Option<SdTraceData> {
         let block = block as usize;
         let sector = match self.read_sector(block) {
             Ok(sector) => sector,
             Err(_) => {
                 // Out of range or unreadable: leave the host polling for a
                 // token that never comes rather than inventing data.
-                return;
+                return None;
             }
         };
         self.reply.push_back(TOKEN_START);
@@ -845,6 +1164,13 @@ impl SdCard {
         self.reply.push_back(0xFF);
         self.reply.push_back(0xFF);
         self.blocks_read += 1;
+        Some(SdTraceData {
+            direction: SdTraceDirection::Read,
+            block: block as u32,
+            token: TOKEN_START,
+            length: BLOCK_SIZE,
+            crc: [0xFF, 0xFF],
+        })
     }
 
     fn note_unknown(&mut self, code: u8) {
@@ -862,7 +1188,7 @@ impl SdCard {
 
 #[cfg(test)]
 mod format_tests {
-    use super::{SdCard, SdFormat, BLOCK_SIZE, DEFAULT_BLOCKS};
+    use super::{BLOCK_SIZE, DEFAULT_BLOCKS, SdCard, SdFormat};
     use std::path::PathBuf;
 
     fn temp_path(label: &str) -> PathBuf {
@@ -1020,9 +1346,11 @@ mod format_tests {
             assert!(raw.export_raw(&alias).is_err());
             std::fs::remove_file(&alias_dir).unwrap();
         }
-        assert!(SdCard::new_with_format(1024, SdFormat::Fat16)
-            .export_raw(temp_path("memory-output"))
-            .is_err());
+        assert!(
+            SdCard::new_with_format(1024, SdFormat::Fat16)
+                .export_raw(temp_path("memory-output"))
+                .is_err()
+        );
         let _ = std::fs::remove_file(input);
     }
 }

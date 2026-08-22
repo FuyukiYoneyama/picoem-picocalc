@@ -207,6 +207,41 @@ pub use self::bus::Bus;
 pub use self::core::CortexM0Plus;
 pub use self::memory::{Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 
+/// RP2040 SRAM address at which the boot2 stack is seeded by the runner.
+pub const RP2040_SRAM_TOP: u32 = 0x2004_2000;
+
+/// Deterministic provenance for a watchdog warm reset.  The event is
+/// produced at the scheduler boundary immediately after the triggering
+/// instruction retires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatchdogResetEvent {
+    pub epoch: u64,
+    pub cycle: u64,
+    pub core: u8,
+    pub pc: u32,
+    pub reason: u32,
+}
+
+/// Failure returned when a boot2 entry contract cannot be seeded safely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Boot2EntryError {
+    /// The supplied stack pointer is not aligned or is outside RP2040 SRAM.
+    InvalidStackPointer(u32),
+}
+
+impl std::fmt::Display for Boot2EntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidStackPointer(value) => write!(
+                f,
+                "boot2 stack pointer {value:#010x} is not a 4-byte-aligned RP2040 SRAM address"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Boot2EntryError {}
+
 pub use picoem_common::Pacer;
 pub use picoem_common::{Clock, PacerSnapshot, PacerStats};
 
@@ -275,6 +310,10 @@ pub struct Emulator {
     /// PC moved this tick. Initialised to a sentinel `0xFF` so the
     /// very first observation always counts as an advance.
     pub(crate) pio0_sm0_last_pc: u8,
+    /// Number of watchdog warm resets since the last cold reset.
+    pub watchdog_reset_count: u64,
+    /// Last watchdog reset event, consumed by the harness after a step.
+    watchdog_reset_event: Option<WatchdogResetEvent>,
     /// OPT0-A Serial idle profiler. Entirely absent from normal builds;
     /// diagnostic harnesses opt in through the `idle-profiler` feature.
     #[cfg(feature = "idle-profiler")]
@@ -432,6 +471,7 @@ impl Emulator {
         self.bus.xosc_regs.reset();
         self.bus.rosc_regs.reset();
         self.bus.watchdog_tick.reset();
+        self.bus.watchdog_reset_requested = false;
         self.bus.timer.reset();
         self.bus.uart0.reset();
         self.bus.uart1.reset();
@@ -485,12 +525,67 @@ impl Emulator {
         self.bus.end_core1_step();
 
         self.clock = Clock { cycles: 0 };
+        self.watchdog_reset_count = 0;
+        self.watchdog_reset_event = None;
 
         // Core 1 stays halted — bootrom on real silicon parks core 1 in
         // a wait-for-event loop until core 0 sends the wake sequence.
         // Routed through the wrapper so the SIO handshake FSM `armed`
         // flag stays in sync with core 1's halt state (HLD §2.1).
         self.halt_core1();
+    }
+
+    /// Consume the most recent watchdog warm-reset event, if one occurred.
+    pub fn take_watchdog_reset_event(&mut self) -> Option<WatchdogResetEvent> {
+        self.watchdog_reset_event.take()
+    }
+
+    /// Apply an RP2040-style MCU warm reset while retaining XIP flash,
+    /// attached SD backing/devices, watchdog scratch and the monotonic
+    /// master-cycle counter.  The caller selects the post-reset boot handoff
+    /// after observing the event.
+    fn apply_watchdog_warm_reset(&mut self, cycle: u64, core: usize, pc: u32, reason: u32) {
+        let scratch = self.bus.watchdog_tick.scratch;
+        let reset_reason = self.bus.watchdog_tick.reason | reason;
+        // Board-level inputs are external to the MCU reset domain.  In the
+        // harness the SD card-detect line (and any test GPIO override) is
+        // represented by this pair; dropping it would make a warm reset
+        // appear to physically remove the card and the loader would fail to
+        // remount it after watchdog_reboot().
+        let external_gpio_in_mask = self.bus.external_gpio_in_mask;
+        let external_gpio_in_override = self.bus.external_gpio_in_override;
+        let next_epoch = self.watchdog_reset_count.saturating_add(1);
+        self.reset();
+        self.clock.cycles = cycle;
+        self.bus.master_cycle = cycle;
+        self.bus.external_gpio_in_mask = external_gpio_in_mask;
+        self.bus.external_gpio_in_override = external_gpio_in_override;
+        self.bus.watchdog_tick.scratch = scratch;
+        self.bus.watchdog_tick.reason = reset_reason;
+        self.watchdog_reset_count = next_epoch;
+        self.watchdog_reset_event = Some(WatchdogResetEvent {
+            epoch: next_epoch,
+            cycle,
+            core: core as u8,
+            pc,
+            reason: reset_reason,
+        });
+    }
+
+    /// If the current instruction requested a watchdog reset, perform it at
+    /// the exact instruction boundary. Returns true when the scheduler must
+    /// abandon the rest of the current quantum.
+    #[inline]
+    fn finish_watchdog_trigger(&mut self, instruction_cycles: u64) -> bool {
+        if !self.bus.take_watchdog_reset_request() {
+            return false;
+        }
+        let cycle = self.clock.cycles.wrapping_add(instruction_cycles);
+        let core = self.bus.active_core();
+        let pc = self.bus.active_pc_for_event();
+        let reason = self.bus.watchdog_tick.reason;
+        self.apply_watchdog_warm_reset(cycle, core, pc, reason);
+        true
     }
 
     /// Load a raw binary at the given address. ROM writes are honoured
@@ -610,6 +705,42 @@ impl Emulator {
         // through the wrapper so the handshake FSM re-arms if the caller
         // used `direct_boot_from_flash` as a mode-switch (§2.1).
         self.halt_core1();
+    }
+
+    /// Enter a flash-resident RP2040 boot2 image without executing the
+    /// ROM's QSPI-detection/USB-MSC path.
+    ///
+    /// This is deliberately a lower-level entry than
+    /// [`Self::direct_boot_from_flash`].  The RP2040 bootrom normally
+    /// supplies the initial register state before branching to boot2, but
+    /// the full ROM path is outside this emulator's scope.  The caller
+    /// therefore supplies the stack pointer and link-register values that
+    /// its boot2 contract requires.  The PC is always the XIP flash base
+    /// (`0x1000_0000`), Thumb state is restored, core 1 remains parked, and
+    /// VTOR is left at the reset value because boot2 owns the handoff to the
+    /// next image.
+    ///
+    /// Call after [`Self::reset`] and [`Self::load_flash`].  This helper does
+    /// not validate the contents or provenance of the boot2 bytes; the
+    /// harness performs artifact-level validation before accepting a run.
+    pub fn boot2_from_flash(
+        &mut self,
+        stack_pointer: u32,
+        link_register: u32,
+    ) -> Result<(), Boot2EntryError> {
+        self.assert_not_placeholder();
+        if stack_pointer & 3 != 0 || !(0x2000_0000..=RP2040_SRAM_TOP).contains(&stack_pointer) {
+            return Err(Boot2EntryError::InvalidStackPointer(stack_pointer));
+        }
+
+        let core = &mut self.cores[0];
+        core.regs.msp = stack_pointer;
+        core.regs.set_sp(stack_pointer);
+        core.regs.set_lr(link_register);
+        core.regs.set_pc(bus::XIP_FLASH_BASE);
+        core.regs.xpsr = 1 << 24;
+        self.halt_core1();
+        Ok(())
     }
 
     /// Advance the system by up to `step_quantum` master-clock cycles,
@@ -828,6 +959,9 @@ impl Emulator {
                 // sees the eviction next quantum. Mirrors rp2350_emu
                 // (commit 0c31479, lib.rs §lookup-and-drain).
                 Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
+                if self.finish_watchdog_trigger(c) {
+                    return c;
+                }
                 self.maybe_wake_core1(0);
                 c
             } else {
@@ -840,6 +974,9 @@ impl Emulator {
                 let c = self.cores[1].step(&mut self.bus) as u64;
                 Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
                 self.bus.end_core1_step();
+                if self.finish_watchdog_trigger(c0.max(c)) {
+                    return c0.max(c);
+                }
                 self.maybe_wake_core1(1);
                 c
             } else {
@@ -1487,6 +1624,8 @@ impl Emulator {
             pio0_sm0_max_pc: self.pio0_sm0_max_pc,
             pio0_sm0_pc_advances: self.pio0_sm0_pc_advances,
             pio0_sm0_last_pc: self.pio0_sm0_last_pc,
+            watchdog_reset_count: self.watchdog_reset_count,
+            watchdog_reset_event: self.watchdog_reset_event,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
             #[cfg(feature = "event-horizon-profiler")]
@@ -1571,6 +1710,26 @@ impl Emulator {
         let ext_mask = self.bus.external_gpio_in_mask;
         if ext_mask != 0 {
             out = (out & !ext_mask) | (self.bus.external_gpio_in_override & ext_mask);
+        }
+
+        // IO_BANK0 GPIO_CTRL.INOVER is applied to the resolved pad level,
+        // after external devices have contributed their input.  This is
+        // observable on PicoCalc GP22: the uf2loader sets INOVER=INVERT and
+        // then treats the physically-active-low card-detect switch as a
+        // logical high (card present).  Ignoring INOVER makes the loader
+        // report "SD card not found" even though SPI reads succeed.
+        for pin in 0..bus::io_bank0::NUM_GPIOS {
+            let mode = (self.bus.io_bank0.ctrl[pin] >> 16) & 0x3;
+            if mode == 0 {
+                continue;
+            }
+            let mask = 1u32 << pin;
+            match mode {
+                1 => out ^= mask, // GPIO_OVERRIDE_INVERT
+                2 => out &= !mask, // GPIO_OVERRIDE_LOW
+                3 => out |= mask,  // GPIO_OVERRIDE_HIGH
+                _ => unreachable!(),
+            }
         }
         self.bus.gpio_in = out;
 
@@ -2298,6 +2457,8 @@ impl EmulatorBuilder {
             pio0_sm0_max_pc: 0,
             pio0_sm0_pc_advances: 0,
             pio0_sm0_last_pc: 0xFF,
+            watchdog_reset_count: 0,
+            watchdog_reset_event: None,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
             #[cfg(feature = "event-horizon-profiler")]
@@ -3377,6 +3538,25 @@ mod stage5_lib_residue {
         // Trigger update_gpio via gpio_write.
         emu.gpio_write(0, false);
         assert!(emu.gpio_read(5));
+    }
+
+    /// The PicoCalc SD slot's card-detect switch is physically active-low.
+    /// uf2loader configures IO_BANK0 GPIO_CTRL.INOVER=INVERT on GP22, so a
+    /// low external pad level must be observed by firmware as logical high.
+    /// Keep this at the emulator boundary: a loader run must not rely on a
+    /// harness-only logical-level shortcut.
+    #[test]
+    fn update_gpio_applies_io_bank0_input_override() {
+        let mut emu = Emulator::new(Config::default());
+        let pin = 22u8;
+        let mask = 1u32 << pin;
+        emu.bus.external_gpio_in_mask = mask;
+        emu.bus.external_gpio_in_override = 0;
+        emu.bus.io_bank0.ctrl[pin as usize] = 1u32 << 16; // INOVER=INVERT
+
+        emu.gpio_write(0, false);
+
+        assert!(emu.gpio_read(pin), "active-low card detect must invert to high");
     }
 
     // ------------------- wake_checks (lines 1148, 1155) -------------------

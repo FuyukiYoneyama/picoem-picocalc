@@ -2,7 +2,7 @@
 //! construct, reset, peek, and basic config/cycle accessors work. The
 //! full CPU / bus / peripheral paths arrive in Phase 4+.
 
-use rp2040_emu::{Config, Emulator, EmulatorBuilder};
+use rp2040_emu::{Config, Emulator, EmulatorBuilder, RP2040_SRAM_TOP};
 
 #[test]
 fn construct_and_reset() {
@@ -89,4 +89,31 @@ fn direct_boot_from_flash_applies_vector_table() {
     // assertion proves the end-to-end path is wired up.
     assert_eq!(emu.bus.read32(0xE000_ED08), 0x1000_0100);
     assert!(emu.cores[1].is_halted());
+}
+
+#[test]
+fn boot2_from_flash_seeds_loader_entry_state() {
+    let mut emu = EmulatorBuilder::new(Config::default())
+        .flash([0xFE, 0xE7].repeat(128)) // Thumb `b .` at flash offset 0.
+        .build()
+        .expect("Serial build is infallible");
+    emu.reset();
+    emu.boot2_from_flash(RP2040_SRAM_TOP, 0)
+        .expect("valid RP2040 boot2 entry state");
+
+    assert_eq!(emu.cores[0].regs.msp, RP2040_SRAM_TOP);
+    assert_eq!(emu.cores[0].regs.r[13], RP2040_SRAM_TOP);
+    assert_eq!(emu.cores[0].regs.r[14], 0);
+    assert_eq!(emu.cores[0].regs.r[15], 0x1000_0000);
+    assert_eq!(emu.cores[0].regs.xpsr, 1 << 24);
+    assert_eq!(emu.bus.ppb[0].vtor, 0);
+    assert!(emu.cores[1].is_halted());
+}
+
+#[test]
+fn boot2_from_flash_rejects_invalid_stack_pointer() {
+    let mut emu = Emulator::new(Config::default());
+    emu.reset();
+    assert!(emu.boot2_from_flash(0x2000_0002, 0).is_err());
+    assert!(emu.boot2_from_flash(0x2004_2004, 0).is_err());
 }

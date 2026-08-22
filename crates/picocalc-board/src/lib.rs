@@ -40,6 +40,9 @@ pub use framebuffer::{Framebuffer, PngError};
 pub use keyboard::{KeyEvent, KeyState, Keyboard, KeyboardWire};
 pub use lcd_pio_wire::LcdPioWire;
 pub use sd_wire::SdCardWire;
-pub use sdcard::{RawMetadata, SdCard, SdFormat};
+pub use sdcard::{
+    RawMetadata, SD_TRACE_SCHEMA_VERSION, SdCard, SdFormat, SdTraceData, SdTraceDirection,
+    SdTraceEvent, SdTraceSnapshot,
+};
 pub use st7365p::{Colmod, St7365p};
 pub use wire::St7365pWire;

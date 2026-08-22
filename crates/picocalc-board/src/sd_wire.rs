@@ -48,6 +48,9 @@ impl SpiExternalDevice for SdCardWire {
 
     fn observe_pins(&mut self, gpio_out_levels: u32) {
         let cs = level(gpio_out_levels, SD_PIN_CS);
+        if !cs && self.cs_high {
+            self.card.lock().expect("SD mutex").trace_select();
+        }
         // Only the rising edge matters: that is what ends a command.
         if cs && !self.cs_high {
             self.card.lock().expect("SD mutex").deselect();
@@ -164,6 +167,77 @@ mod tests {
         assert_eq!(reply[start], 0x00, "R1 ready");
         // The driver tests bit 6 of the first OCR byte for SDHC.
         assert_ne!(reply[start + 1] & 0x40, 0, "CCS must be set");
+    }
+
+    #[test]
+    fn single_block_read_returns_r1_before_data_token() {
+        let (mut w, _card) = wire();
+        let reply = command(&mut w, 17, 0);
+
+        // One idle byte may precede the response, but the command response
+        // must be visible before the 0xFE data token and sector payload.
+        assert_eq!(&reply[..3], &[0xFF, 0x00, 0xFE]);
+        // The compact FAT16 fixture's boot sector begins with the standard
+        // short jump over its BPB.
+        assert_eq!(reply[3], 0xEB);
+    }
+
+    #[test]
+    fn diagnostic_trace_is_opt_in_and_records_command_boundaries() {
+        let (mut w, card) = wire();
+        assert!(card.lock().unwrap().trace_snapshot().is_none());
+        card.lock().unwrap().enable_trace();
+
+        let _ = command(&mut w, 17, 3);
+        w.observe_pins(0);
+        w.observe_pins(1 << SD_PIN_CS);
+
+        let snapshot = card.lock().unwrap().trace_snapshot().unwrap();
+        assert_eq!(
+            snapshot.schema_version,
+            crate::sdcard::SD_TRACE_SCHEMA_VERSION
+        );
+        assert!(snapshot.event_count >= 2, "command plus deselect");
+        assert!(!snapshot.digest_sha256.is_empty());
+        assert!(snapshot.preview.iter().any(|event| matches!(
+            event,
+            crate::sdcard::SdTraceEvent::Command {
+                index: 17,
+                argument: 3,
+                data: Some(crate::sdcard::SdTraceData {
+                    direction: crate::sdcard::SdTraceDirection::Read,
+                    block: 3,
+                    length: crate::sdcard::BLOCK_SIZE,
+                    ..
+                }),
+                ..
+            }
+        )));
+        assert!(
+            snapshot
+                .preview
+                .iter()
+                .any(|event| matches!(event, crate::sdcard::SdTraceEvent::Deselect { .. }))
+        );
+    }
+
+    #[test]
+    fn diagnostic_trace_does_not_change_card_replies_or_counters() {
+        let (mut traced, traced_card) = wire();
+        let (mut plain, plain_card) = wire();
+        traced_card.lock().unwrap().enable_trace();
+
+        for (index, argument) in [(0, 0), (8, 0x1AA), (17, 2), (24, 3)] {
+            let traced_reply = command(&mut traced, index, argument);
+            let plain_reply = command(&mut plain, index, argument);
+            assert_eq!(traced_reply, plain_reply, "CMD{index} reply");
+        }
+        let traced = traced_card.lock().unwrap();
+        let plain = plain_card.lock().unwrap();
+        assert_eq!(traced.commands_seen, plain.commands_seen);
+        assert_eq!(traced.blocks_read, plain.blocks_read);
+        assert_eq!(traced.blocks_written, plain.blocks_written);
+        assert_eq!(traced.unknown_commands, plain.unknown_commands);
     }
 
     #[test]

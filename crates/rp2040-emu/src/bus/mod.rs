@@ -610,6 +610,10 @@ pub struct Bus {
     /// the `TICK` register at offset `0x2C` is modelled today; the rest
     /// of the WATCHDOG block reads as 0.
     pub watchdog_tick: WatchdogTickRegs,
+    /// Sticky request raised by WATCHDOG CTRL.TRIGGER.  The CPU scheduler
+    /// consumes it only after the current instruction retires, so the core
+    /// executing the trigger never executes a following instruction.
+    pub(crate) watchdog_reset_requested: bool,
     /// TIMER register model (Phase 1 Wave 2 — HLD V7 §5.3). Lazy
     /// microsecond counter + four alarms; `advance_lazy_scheduled`
     /// polls `poll_alarms` on every step tail to surface alarm-match
@@ -793,6 +797,7 @@ impl Bus {
             pio: [PioBlock::new(), PioBlock::new()],
             pin_devices: Vec::new(),
             watchdog_tick: WatchdogTickRegs::new(),
+            watchdog_reset_requested: false,
             timer: TimerRegs::new(),
             uart0: UartRegs::new(IRQ_UART0_IRQ),
             uart1: UartRegs::new(IRQ_UART1_IRQ),
@@ -842,6 +847,18 @@ impl Bus {
     pub fn set_active_core(&mut self, core: usize) {
         debug_assert!(core < 2);
         self.active_core = core;
+    }
+
+    /// PC attributed to the instruction currently executing on the active
+    /// core.  Used only for deterministic watchdog reset provenance.
+    #[inline]
+    pub(crate) fn active_pc_for_event(&self) -> u32 {
+        self.active_pc[self.active_core]
+    }
+
+    #[inline]
+    pub(crate) fn take_watchdog_reset_request(&mut self) -> bool {
+        std::mem::take(&mut self.watchdog_reset_requested)
     }
 
     #[cfg(feature = "event-horizon-profiler")]
@@ -1457,7 +1474,11 @@ impl Bus {
                 let mc = self.master_cycle;
                 self.timer.write32(offset, val, alias, mc, sys_hz);
             }
-            WATCHDOG_BASE => self.watchdog_tick.write32(offset, val, alias),
+            WATCHDOG_BASE => {
+                if self.watchdog_tick.write32(offset, val, alias) {
+                    self.watchdog_reset_requested = true;
+                }
+            }
             UART0_BASE => self
                 .uart0
                 .write32(offset, val, alias, &mut self.irq_pending),

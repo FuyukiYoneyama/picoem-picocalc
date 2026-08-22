@@ -15,9 +15,10 @@
 //!    executed*. It is there so SDK firmware can resolve ROM function
 //!    table pointers (`rom_func_lookup`). The real bootrom would sample
 //!    QSPI pads we do not model and park in USB-MSC boot forever.
-//! 3. `reset`, then `direct_boot_from_flash(0x100)` — seeds SP / PC /
-//!    VTOR straight from the SDK vector table at flash offset `0x100`,
-//!    exactly what boot2 does on silicon.
+//! 3. `reset`, then the selected boot handoff: the default `app` path uses
+//!    `direct_boot_from_flash(0x100)`; explicit `--boot-mode boot2` enters
+//!    the flash-resident boot2 at XIP base so a loader artifact can execute
+//!    its own handoff.
 //!
 //! Stop reasons: `cycle_limit` (budget exhausted — only acceptable when
 //! explicitly named by the conformance contract),
@@ -39,11 +40,12 @@ use std::time::{Duration, Instant};
 use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{
     Framebuffer, KeyEvent, KeyState, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire,
-    SdFormat, St7365p, St7365pWire, pins,
+    SdFormat, SdTraceData, SdTraceDirection, SdTraceEvent, SdTraceSnapshot, St7365p, St7365pWire,
+    pins,
 };
 #[cfg(feature = "behavior-trace")]
 use rp2040_emu::{BehaviorEventDomain, BehaviorTraceSnapshot};
-use rp2040_emu::{Config, Emulator, EmulatorBuilder};
+use rp2040_emu::{Config, Emulator, EmulatorBuilder, RP2040_SRAM_TOP, WatchdogResetEvent};
 #[cfg(feature = "idle-profiler")]
 use rp2040_emu::{
     CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_PROFILE_SCHEMA_VERSION,
@@ -225,9 +227,31 @@ impl LcdVariant {
     }
 }
 
+/// Explicit startup request. The runner keeps this separate from the
+/// reported [`BootMode`], because `app` may still fall back to the ROM
+/// reset vector for hand-assembled images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootRequest {
+    App,
+    Boot2,
+}
+
+impl BootRequest {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "app" => Ok(Self::App),
+            "boot2" => Ok(Self::Boot2),
+            other => Err(format!(
+                "unknown --boot-mode '{other}' (expected app|boot2)"
+            )),
+        }
+    }
+}
+
 struct Args {
     bin: PathBuf,
     bootrom: PathBuf,
+    boot_mode: BootRequest,
     cycles: u64,
     stop_pc: Option<u32>,
     json: Option<PathBuf>,
@@ -244,6 +268,7 @@ struct Args {
     sd: bool,
     sd_image: Option<PathBuf>,
     sd_image_out: Option<PathBuf>,
+    sd_trace: Option<PathBuf>,
     sd_format: SdFormat,
     keys: Option<String>,
     scenario: Option<PathBuf>,
@@ -439,6 +464,7 @@ fn validate_sd_selection(
     sd: bool,
     sd_image: Option<&Path>,
     sd_image_out: Option<&Path>,
+    sd_trace: Option<&Path>,
     format_explicit: bool,
 ) -> Result<(), String> {
     if sd && sd_image.is_some() {
@@ -450,6 +476,9 @@ fn validate_sd_selection(
     if format_explicit && !sd {
         return Err("--sd-format requires --sd".to_string());
     }
+    if sd_trace.is_some() && !sd && sd_image.is_none() {
+        return Err("--sd-trace requires --sd or --sd-image".to_string());
+    }
     Ok(())
 }
 
@@ -459,9 +488,11 @@ fn print_usage() {
          picocalc-run --bin <firmware.bin> [options]\n\
          \n\
          --bin <path>             Required. Raw RP2040 flash image (.bin), loaded at\n\
-                                  0x1000_0000 and direct-booted from offset 0x100.\n\
+                                  0x1000_0000; startup uses --boot-mode (default app).\n\
          --bootrom <path>         16 KB RP2040 bootrom image, loaded but never executed.\n\
                                   Default: {DEFAULT_BOOTROM_PATH}\n\
+         --boot-mode <app|boot2>  Startup path. Default 'app' preserves direct boot from\n\
+                                  flash+0x100; 'boot2' enters the flash offset 0 loader stub.\n\
          --cycles <N>             Cycle budget. Exceeding it gives cycle_limit, which is\n\
                                   not a pass unless explicitly expected. Default: {DEFAULT_CYCLE_LIMIT}\n\
          --stop-pc <hex>          Stop with stop_reason=pc_match when core 0's PC equals\n\
@@ -499,6 +530,8 @@ fn print_usage() {
                                   emulated writes use a sector copy-on-write overlay.\n\
          --sd-image-out <path>    Atomically export the RAW image plus COW writes after the run.\n\
                                   Requires --sd-image and must differ from the input path.\n\
+         --sd-trace <path>       Diagnostic-only structured SD SPI trace (separate JSON file).\n\
+                                  Requires --sd or --sd-image; not part of the normal report.\n\
          --sd-format <fat32|fat16>\n\
                                   Initial filesystem profile. FAT32 is the default, matching\n\
                                   PicoCalc's bundled 32 GB card. Requires --sd.\n\
@@ -555,6 +588,7 @@ fn parse_args() -> Result<Args, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut bin: Option<PathBuf> = None;
     let mut bootrom: Option<PathBuf> = None;
+    let mut boot_mode = BootRequest::App;
     let mut cycles: Option<u64> = None;
     let mut stop_pc: Option<u32> = None;
     let mut json: Option<PathBuf> = None;
@@ -581,6 +615,7 @@ fn parse_args() -> Result<Args, String> {
     let mut sd = false;
     let mut sd_image: Option<PathBuf> = None;
     let mut sd_image_out: Option<PathBuf> = None;
+    let mut sd_trace: Option<PathBuf> = None;
     let mut sd_format = SdFormat::default();
     let mut sd_format_explicit = false;
     let mut keys: Option<String> = None;
@@ -616,6 +651,7 @@ fn parse_args() -> Result<Args, String> {
         match flag {
             "--bin" => bin = Some(PathBuf::from(value("--bin")?)),
             "--bootrom" => bootrom = Some(PathBuf::from(value("--bootrom")?)),
+            "--boot-mode" => boot_mode = BootRequest::parse(&value("--boot-mode")?)?,
             "--cycles" => {
                 let raw = value("--cycles")?;
                 let cleaned = raw.replace('_', "");
@@ -660,6 +696,12 @@ fn parse_args() -> Result<Args, String> {
             "--sd" => sd = true,
             "--sd-image" => sd_image = Some(PathBuf::from(value("--sd-image")?)),
             "--sd-image-out" => sd_image_out = Some(PathBuf::from(value("--sd-image-out")?)),
+            "--sd-trace" => {
+                if sd_trace.is_some() {
+                    return Err("--sd-trace may be specified only once".to_string());
+                }
+                sd_trace = Some(PathBuf::from(value("--sd-trace")?));
+            }
             "--sd-format" => {
                 let raw = value("--sd-format")?;
                 sd_format = raw.parse::<SdFormat>()?;
@@ -779,6 +821,7 @@ fn parse_args() -> Result<Args, String> {
         sd,
         sd_image.as_deref(),
         sd_image_out.as_deref(),
+        sd_trace.as_deref(),
         sd_format_explicit,
     )?;
     // Queueing keys implies the controller they arrive through.
@@ -820,6 +863,9 @@ fn parse_args() -> Result<Args, String> {
         _ => {}
     }
     if machine_api {
+        if boot_mode == BootRequest::Boot2 {
+            return Err("--machine-api cannot be combined with --boot-mode boot2".to_string());
+        }
         let conflicts = [
             (scenario.is_some(), "--scenario"),
             (stop_pc.is_some(), "--stop-pc"),
@@ -837,6 +883,7 @@ fn parse_args() -> Result<Args, String> {
             (audio_wav.is_some(), "--audio-wav"),
             (keys.is_some(), "--keys"),
             (sd_image_out.is_some(), "--sd-image-out"),
+            (sd_trace.is_some(), "--sd-trace"),
             (run_id.is_some(), "--run-id"),
             (progress_interval.is_some(), "--progress-interval"),
         ];
@@ -885,6 +932,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         bin: bin.ok_or_else(|| "missing required --bin <path>".to_string())?,
         bootrom: bootrom.unwrap_or_else(|| PathBuf::from(DEFAULT_BOOTROM_PATH)),
+        boot_mode,
         cycles: cycles.unwrap_or(DEFAULT_CYCLE_LIMIT),
         stop_pc,
         json,
@@ -901,6 +949,7 @@ fn parse_args() -> Result<Args, String> {
         sd,
         sd_image,
         sd_image_out,
+        sd_trace,
         sd_format,
         keys,
         scenario,
@@ -973,6 +1022,7 @@ struct RunOutcome {
     exception: Option<&'static str>,
     error: Option<String>,
     uart_bytes: Vec<u8>,
+    watchdog_resets: Vec<WatchdogResetEvent>,
 }
 
 /// Process result. `CannotJudge` is distinct from a negative firmware
@@ -1175,10 +1225,13 @@ fn load_image(path: &Path, what: &str) -> Result<Vec<u8>, String> {
 /// SDK vector table at flash+0x100 to seed from. It is *not* the real
 /// bootrom's USB-MSC path: nothing in the bootrom image executes; the
 /// reset vector is taken from ROM word 1 by `Emulator::reset`.
+/// `Boot2FromFlash` is the explicit U5-A path: the flash-resident boot2
+/// starts at XIP base and owns the subsequent handoff.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BootMode {
     DirectBootFromFlash,
     BootromResetVector,
+    Boot2FromFlash,
 }
 
 impl BootMode {
@@ -1186,22 +1239,45 @@ impl BootMode {
         match self {
             BootMode::DirectBootFromFlash => "direct_boot_from_flash",
             BootMode::BootromResetVector => "bootrom_reset_vector",
+            BootMode::Boot2FromFlash => "boot2",
         }
     }
 }
 
-/// Build the emulator and perform the direct-boot handoff.
+fn boot_report_fragment(boot_mode: BootMode) -> String {
+    match boot_mode {
+        BootMode::Boot2FromFlash => format!(
+            "  \"boot\": {{\"mode\": {}, \"vtor_flash_offset\": null}},\n",
+            json_string(boot_mode.as_str())
+        ),
+        BootMode::DirectBootFromFlash | BootMode::BootromResetVector => format!(
+            "  \"boot\": {{\"mode\": {}, \"vtor_flash_offset\": \"{:#06x}\"}},\n",
+            json_string(boot_mode.as_str()),
+            SDK_VTOR_FLASH_OFFSET
+        ),
+    }
+}
+
+/// Build the emulator and perform the selected startup handoff.
 #[allow(clippy::type_complexity)]
 fn boot(
     firmware: Vec<u8>,
     bootrom: &[u8],
     step_quantum: u32,
+    boot_request: BootRequest,
     board: Board,
     lcd_variant: LcdVariant,
     psram: bool,
     keyboard: Option<Arc<Mutex<Keyboard>>>,
     sd: Option<Arc<Mutex<SdCard>>>,
 ) -> Result<(Emulator, BootMode, Option<Arc<Mutex<St7365p>>>), String> {
+    if boot_request == BootRequest::Boot2 && firmware.len() < 256 {
+        return Err(format!(
+            "--boot-mode boot2 requires at least 256 firmware bytes for the boot2 region (got {})",
+            firmware.len()
+        ));
+    }
+
     let mut builder = EmulatorBuilder::new(Config {
         sys_clk_hz: DEFAULT_SYS_CLK_HZ,
     })
@@ -1272,6 +1348,7 @@ fn boot(
     // The card sits on SPI0. Card detect is an input to the chip, so it
     // is forced low here rather than driven by the device: the slot
     // reports "occupied" for as long as a card is attached.
+    let sd_attached = sd.is_some();
     if let Some(card) = sd {
         emu.bus
             .attach_spi_device(pins::SD_SPI_INSTANCE, Box::new(SdCardWire::new(card)))
@@ -1284,6 +1361,30 @@ fn boot(
     // Loaded, never executed — see the module docs.
     emu.load_bootrom(bootrom);
     emu.reset();
+
+    // `Emulator::reset` models the MCU reset domain and deliberately clears
+    // harness GPIO overrides (cold-reset tests rely on that).  Card detect
+    // is an external slot signal, however, so restore the attached-card
+    // level after reset before entering boot2.  Without this re-assertion a
+    // real SD-backed loader sees the card electrically present on the first
+    // boot, while the emulator reports "SD card not found".
+    if sd_attached {
+        let detect = 1u32 << pins::SD_PIN_DETECT;
+        emu.bus.external_gpio_in_mask |= detect;
+        // The slot switch is physically active-low.  Firmware that needs a
+        // logical-high signal (the pinned uf2loader sets GPIO_CTRL.INOVER to
+        // INVERT) gets that transformation from IO_BANK0 in
+        // `Emulator::update_gpio`, rather than from a workload-specific
+        // harness polarity shortcut.
+        emu.bus.external_gpio_in_override &= !detect;
+        emu.bus.gpio_in &= !detect;
+    }
+
+    if boot_request == BootRequest::Boot2 {
+        emu.boot2_from_flash(RP2040_SRAM_TOP, 0)
+            .map_err(|error| format!("entering flash boot2: {error}"))?;
+        return Ok((emu, BootMode::Boot2FromFlash, lcd));
+    }
 
     // Sanity-check the vector table before seeding from it: a garbage
     // SP/PC pair means the image is not an SDK flash image and the run
@@ -1386,6 +1487,8 @@ struct MachineSession {
     uart_bytes: Vec<u8>,
     dispatches: u64,
     board: BoardHandles,
+    boot_mode: Option<BootMode>,
+    watchdog_resets: Vec<WatchdogResetEvent>,
     sticky_stop: Option<SessionStop>,
     #[cfg(feature = "event-horizon-profiler")]
     event_profile_after_uart: Option<String>,
@@ -1409,12 +1512,43 @@ impl MachineSession {
             uart_bytes: Vec::new(),
             dispatches: 0,
             board,
+            boot_mode: None,
+            watchdog_resets: Vec::new(),
             sticky_stop: None,
             #[cfg(feature = "event-horizon-profiler")]
             event_profile_after_uart: None,
             #[cfg(feature = "event-horizon-profiler")]
             event_profile_start_cycle: None,
         }
+    }
+
+    #[inline]
+    fn set_boot_mode(&mut self, boot_mode: BootMode) {
+        self.boot_mode = Some(boot_mode);
+    }
+
+    /// Re-enter the selected firmware handoff after an emulated watchdog
+    /// bite.  The emulator has already performed the MCU warm reset and
+    /// retained flash/SD/scratch; this method only selects the same entry
+    /// path that was used for the initial run.
+    fn handle_watchdog_reset(&mut self) -> Result<bool, String> {
+        let Some(event) = self.emu.take_watchdog_reset_event() else {
+            return Ok(false);
+        };
+        self.watchdog_resets.push(event);
+        match self.boot_mode {
+            Some(BootMode::Boot2FromFlash) => self
+                .emu
+                .boot2_from_flash(RP2040_SRAM_TOP, 0)
+                .map_err(|error| format!("re-entering flash boot2 after watchdog reset: {error}"))?,
+            Some(BootMode::DirectBootFromFlash) => {
+                self.emu.direct_boot_from_flash(SDK_VTOR_FLASH_OFFSET);
+            }
+            Some(BootMode::BootromResetVector) | None => {}
+        }
+        self.vclock
+            .rebase(self.emu.clock.cycles, self.emu.bus.clock_tree.sys_clk_hz);
+        Ok(true)
     }
 
     #[inline(always)]
@@ -1498,6 +1632,7 @@ impl MachineSession {
             self.sticky_stop = Some(SessionStop::Error(message.clone()));
             message
         })?;
+        self.handle_watchdog_reset()?;
         self.dispatches = self.dispatches.saturating_add(1);
         if self.dispatches.is_multiple_of(UART_DRAIN_INTERVAL) {
             self.drain_uart();
@@ -1532,6 +1667,7 @@ impl MachineSession {
             exception,
             error,
             uart_bytes: std::mem::take(&mut self.uart_bytes),
+            watchdog_resets: std::mem::take(&mut self.watchdog_resets),
         }
     }
 }
@@ -1612,6 +1748,10 @@ fn run_loop(
             }
         };
         steps += 1;
+
+        if let Err(error) = machine.handle_watchdog_reset() {
+            return machine.finish(StopReason::Error, None, Some(error));
+        }
 
         if consumed == 0 {
             // Every core is halted or parked on WFE, so the master
@@ -3532,6 +3672,118 @@ fn write_flash_image(path: &Path, image: &[u8]) -> Result<(), String> {
 const TOP_RESET_VALUE: u16 = 0xFFFF;
 
 /// The attached SD card and the initial filesystem profile supplied to it.
+fn sd_trace_data_json(data: &SdTraceData) -> String {
+    let direction = match data.direction {
+        SdTraceDirection::Read => "read",
+        SdTraceDirection::Write => "write",
+    };
+    format!(
+        "{{\"direction\":{},\"block\":{},\"token\":{},\"length\":{},\"crc\":[{},{}]}}",
+        json_string(direction),
+        data.block,
+        data.token,
+        data.length,
+        data.crc[0],
+        data.crc[1]
+    )
+}
+
+fn sd_trace_event_json(event: &SdTraceEvent) -> String {
+    match event {
+        SdTraceEvent::Command {
+            sequence,
+            cs_epoch,
+            transfers,
+            index,
+            argument,
+            crc,
+            crc_valid,
+            response,
+            data,
+        } => {
+            let response = response
+                .iter()
+                .map(|byte| byte.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let data = data
+                .as_ref()
+                .map(sd_trace_data_json)
+                .unwrap_or_else(|| "null".to_string());
+            format!(
+                "{{\"kind\":\"command\",\"sequence\":{},\"cs_epoch\":{},\"transfers\":{},\"index\":{},\"argument\":{},\"crc\":{},\"crc_valid\":{},\"response\":[{}],\"data\":{}}}",
+                sequence, cs_epoch, transfers, index, argument, crc, crc_valid, response, data
+            )
+        }
+        SdTraceEvent::BlockData {
+            sequence,
+            cs_epoch,
+            transfers,
+            data,
+        } => format!(
+            "{{\"kind\":\"block_data\",\"sequence\":{},\"cs_epoch\":{},\"transfers\":{},\"data\":{}}}",
+            sequence,
+            cs_epoch,
+            transfers,
+            sd_trace_data_json(data)
+        ),
+        SdTraceEvent::Deselect {
+            sequence,
+            cs_epoch,
+            transfers,
+        } => format!(
+            "{{\"kind\":\"deselect\",\"sequence\":{},\"cs_epoch\":{},\"transfers\":{}}}",
+            sequence, cs_epoch, transfers
+        ),
+    }
+}
+
+fn sd_trace_json(snapshot: &SdTraceSnapshot) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!(
+        "  \"schema_version\": {},\n  \"trace_kind\": \"sd-spi-structured-v1\",\n  \"event_count\": {},\n  \"digest_sha256\": {},\n  \"preview_truncated\": {},\n  \"preview\": [",
+        snapshot.schema_version,
+        snapshot.event_count,
+        json_string(&snapshot.digest_sha256),
+        snapshot.preview_truncated
+    ));
+    for (index, event) in snapshot.preview.iter().enumerate() {
+        if index == 0 {
+            out.push('\n');
+        } else {
+            out.push_str(",\n");
+        }
+        out.push_str("    ");
+        out.push_str(&sd_trace_event_json(event));
+    }
+    if !snapshot.preview.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("  ]\n}\n");
+    out
+}
+
+fn write_sd_trace(path: &Path, contents: &str) -> Result<(), String> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("writing SD trace {}: {error}", path.display()));
+    }
+    Ok(())
+}
+
 struct SdReport {
     format: SdFormat,
     block_count: usize,
@@ -3825,11 +4077,7 @@ fn build_report(
         "  \"lcd_variant\": {},\n",
         json_string(lcd_variant.as_str())
     ));
-    s.push_str(&format!(
-        "  \"boot\": {{\"mode\": {}, \"vtor_flash_offset\": \"{:#06x}\"}},\n",
-        json_string(boot_mode.as_str()),
-        SDK_VTOR_FLASH_OFFSET
-    ));
+    s.push_str(&boot_report_fragment(boot_mode));
     s.push_str(&format!("  \"step_quantum\": {step_quantum},\n"));
     s.push_str(&format!("  \"cycle_limit\": {cycle_limit},\n"));
     s.push_str(&format!(
@@ -3869,6 +4117,21 @@ fn build_report(
             None => "null".to_string(),
         }
     ));
+    if !outcome.watchdog_resets.is_empty() {
+        s.push_str("  \"watchdog_resets\": [\n");
+        for (index, event) in outcome.watchdog_resets.iter().enumerate() {
+            s.push_str(&format!(
+                "    {{\"epoch\": {}, \"cycle\": {}, \"core\": {}, \"pc\": {}, \"reason\": {}}}{}\n",
+                event.epoch,
+                event.cycle,
+                event.core,
+                json_string(&format!("{:#010x}", event.pc)),
+                event.reason,
+                if index + 1 == outcome.watchdog_resets.len() { "" } else { "," },
+            ));
+        }
+        s.push_str("  ],\n");
+    }
     s.push_str(&verdict.to_json());
 
     s.push_str("  \"unsupported_mmio\": [");
@@ -4248,11 +4511,17 @@ fn run() -> Result<Verdict, String> {
     } else {
         None
     };
+    if args.sd_trace.is_some() {
+        if let Some(card) = sd_card.as_ref() {
+            card.lock().expect("SD mutex").enable_trace();
+        }
+    }
 
     let (mut emu, boot_mode, lcd) = boot(
         firmware,
         &bootrom,
         step_quantum,
+        args.boot_mode,
         args.board,
         args.lcd_variant,
         args.psram,
@@ -4292,6 +4561,7 @@ fn run() -> Result<Verdict, String> {
         sd: sd_card.clone(),
     };
     let mut machine = MachineSession::new(emu, handles);
+    machine.set_boot_mode(boot_mode);
     #[cfg(feature = "event-horizon-profiler")]
     if let Some(marker) = args.event_horizon_profile_after_uart.clone() {
         machine.arm_event_profile_after_uart(marker);
@@ -4455,6 +4725,17 @@ fn run() -> Result<Verdict, String> {
         let card = card.lock().expect("SD mutex");
         SdReport::snapshot(&card)
     });
+
+    if let Some(path) = args.sd_trace.as_deref() {
+        let card = sd_card
+            .as_ref()
+            .ok_or_else(|| "--sd-trace requires an attached SD card".to_string())?;
+        let card = card.lock().expect("SD mutex");
+        let snapshot = card
+            .trace_snapshot()
+            .ok_or_else(|| "SD trace was not enabled before the run".to_string())?;
+        write_sd_trace(path, &sd_trace_json(&snapshot))?;
+    }
 
     if let Some(path) = args.sd_image_out.as_deref() {
         let card = sd_card
@@ -4660,11 +4941,11 @@ fn run() -> Result<Verdict, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioSinkReport, BoardHandles, MachineApiState, MachineSession, RunOutcome, SdReport,
-        StopReason, Verdict, apply_audio_sink_expectation, dispatch_machine_request,
-        fatal_exception_name, json_escape, judge_run, run_loop, snapshot_machine,
-        validate_backend_identity, validate_progress_interval, validate_run_id,
-        validate_sd_selection, write_audio_wav,
+        AudioSinkReport, BoardHandles, BootMode, BootRequest, MachineApiState, MachineSession,
+        RunOutcome, SdReport, StopReason, Verdict, apply_audio_sink_expectation,
+        boot_report_fragment, dispatch_machine_request, fatal_exception_name, json_escape,
+        judge_run, run_loop, sd_trace_json, snapshot_machine, validate_backend_identity,
+        validate_progress_interval, validate_run_id, validate_sd_selection, write_audio_wav,
     };
     use picocalc_board::{Keyboard, SdFormat, St7365p};
     use rp2040_emu::AudioSinkSnapshot;
@@ -4749,6 +5030,26 @@ mod tests {
     }
 
     #[test]
+    fn boot_mode_request_is_explicit_and_fail_closed() {
+        assert_eq!(BootRequest::parse("app"), Ok(BootRequest::App));
+        assert_eq!(BootRequest::parse("boot2"), Ok(BootRequest::Boot2));
+        assert!(BootRequest::parse("bootrom").is_err());
+        assert_eq!(BootMode::Boot2FromFlash.as_str(), "boot2");
+    }
+
+    #[test]
+    fn boot_report_keeps_vtor_meaning_explicit_per_mode() {
+        assert_eq!(
+            boot_report_fragment(BootMode::Boot2FromFlash),
+            "  \"boot\": {\"mode\": \"boot2\", \"vtor_flash_offset\": null},\n"
+        );
+        assert_eq!(
+            boot_report_fragment(BootMode::DirectBootFromFlash),
+            "  \"boot\": {\"mode\": \"direct_boot_from_flash\", \"vtor_flash_offset\": \"0x0100\"},\n"
+        );
+    }
+
+    #[test]
     fn run_id_validation_accepts_safe_identifiers() {
         assert_eq!(validate_run_id("mapper19-case.a_1:ok"), Ok(()));
         assert_eq!(validate_run_id(&"a".repeat(64)), Ok(()));
@@ -4786,6 +5087,7 @@ mod tests {
             exception: None,
             error: None,
             uart_bytes: uart.to_vec(),
+            watchdog_resets: Vec::new(),
         }
     }
 
@@ -5083,12 +5385,19 @@ mod tests {
 
     #[test]
     fn an_explicit_sd_format_requires_an_attached_card() {
-        assert_eq!(validate_sd_selection(true, None, None, true), Ok(()));
-        assert_eq!(validate_sd_selection(true, None, None, false), Ok(()));
-        assert_eq!(validate_sd_selection(false, None, None, false), Ok(()));
+        assert_eq!(validate_sd_selection(true, None, None, None, true), Ok(()));
+        assert_eq!(validate_sd_selection(true, None, None, None, false), Ok(()));
         assert_eq!(
-            validate_sd_selection(false, None, None, true),
+            validate_sd_selection(false, None, None, None, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_sd_selection(false, None, None, None, true),
             Err("--sd-format requires --sd".to_string())
+        );
+        assert_eq!(
+            validate_sd_selection(false, None, None, Some(Path::new("trace.json")), false),
+            Err("--sd-trace requires --sd or --sd-image".to_string())
         );
     }
 
@@ -5107,6 +5416,39 @@ mod tests {
         assert!(report.contains("\"format\": \"fat32\""));
         assert!(report.contains("\"block_size\": 512"));
         assert!(report.contains("\"blocks_written\": 1"));
+    }
+
+    #[test]
+    fn sd_trace_json_is_a_separate_structured_artifact() {
+        let snapshot = picocalc_board::SdTraceSnapshot {
+            schema_version: 1,
+            event_count: 2,
+            digest_sha256: "ab".repeat(32),
+            preview_truncated: false,
+            preview: vec![picocalc_board::SdTraceEvent::Command {
+                sequence: 0,
+                cs_epoch: 1,
+                transfers: 6,
+                index: 17,
+                argument: 4,
+                crc: 1,
+                crc_valid: true,
+                response: vec![0],
+                data: Some(picocalc_board::SdTraceData {
+                    direction: picocalc_board::SdTraceDirection::Read,
+                    block: 4,
+                    token: 0xFE,
+                    length: 512,
+                    crc: [0xFF, 0xFF],
+                }),
+            }],
+        };
+        let json = sd_trace_json(&snapshot);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["trace_kind"], "sd-spi-structured-v1");
+        assert_eq!(parsed["preview"][0]["kind"], "command");
+        assert_eq!(parsed["preview"][0]["data"]["length"], 512);
     }
 
     #[test]

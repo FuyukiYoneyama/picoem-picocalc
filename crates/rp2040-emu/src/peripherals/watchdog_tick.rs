@@ -1,11 +1,12 @@
-//! WATCHDOG_TICK register model — minimal Phase 1 scope.
+//! RP2040 WATCHDOG register model.
 //!
 //! RP2040 datasheet §4.7. The watchdog block sits at base
 //! `0x4005_8000`; this file models only the `TICK` register at offset
 //! `0x2C`, which is the sole register TIMER reads to derive its 1 µs
-//! cadence. The rest of the watchdog (timeout counter, reset select,
-//! scratch registers, feed / pause state) is out of scope for Phase 1
-//! — out-of-range offsets read as 0 and write as no-op.
+//! cadence.  The register image also models the small subset used by the
+//! PicoCalc UF2 loader: CTRL/TRIGGER, REASON and SCRATCH0..7.  The timer
+//! countdown itself remains lazy; a CTRL trigger is latched and consumed by
+//! the serial scheduler at the end of the instruction that wrote it.
 //!
 //! # `TICK` register layout (offset `0x2C`)
 //!
@@ -35,6 +36,20 @@ use super::apply_alias_rmw;
 
 /// `TICK` register offset within the WATCHDOG block (datasheet §4.7.3).
 pub const TICK_OFFSET: u32 = 0x2C;
+/// WATCHDOG CTRL register offset.
+pub const CTRL_OFFSET: u32 = 0x00;
+/// WATCHDOG LOAD register offset (stored for firmware readback).
+pub const LOAD_OFFSET: u32 = 0x04;
+/// WATCHDOG REASON register offset.
+pub const REASON_OFFSET: u32 = 0x08;
+
+/// CTRL bit used by `watchdog_reboot(0, 0, 0)` to request an immediate reset.
+pub const CTRL_TRIGGER: u32 = 1 << 31;
+/// CTRL enable bit.  The timeout engine is intentionally lazy, but the bit
+/// is retained so firmware configuration/readback is deterministic.
+pub const CTRL_ENABLE: u32 = 1 << 30;
+/// REASON bit set by an explicit watchdog trigger.
+pub const REASON_FORCE: u32 = 1 << 1;
 
 /// SCRATCH0 offset within the WATCHDOG block. The pico-sdk header
 /// `rp2040/hardware_structs/include/hardware/structs/watchdog.h` lays
@@ -60,6 +75,13 @@ pub const CYCLES_RESET: u16 = 12;
 /// offsets within the watchdog block are Phase 1 no-ops (read 0, write
 /// ignored) and are decoded at `Bus::peripheral_*32` dispatch time.
 pub struct WatchdogTickRegs {
+    /// CTRL register image (ENABLE and other writable bits).
+    pub ctrl: u32,
+    /// LOAD register image (24-bit countdown seed).
+    pub load: u32,
+    /// Sticky reset reason.  A warm reset preserves this value until a
+    /// subsequent cold reset, matching the firmware-visible contract.
+    pub reason: u32,
     /// `CYCLES[8:0]` — cycles of `clk_ref` per 1 µs TIMER tick.
     pub cycles: u16,
     /// `ENABLE[9]` — tick-generator enable.
@@ -73,33 +95,63 @@ pub struct WatchdogTickRegs {
     /// last value. The PicoGUS multifw bootloader reads SCRATCH3 to
     /// pick a firmware slot.
     pub scratch: [u32; 8],
+    /// Latched when CTRL.TRIGGER is written.  The bus consumes this at an
+    /// instruction boundary; it is never acted on in the middle of a bus
+    /// transaction.
+    triggered: bool,
 }
 
 impl WatchdogTickRegs {
     /// Construct in the post-init state (CYCLES = 12, ENABLE/RUNNING = 0).
     pub fn new() -> Self {
         Self {
+            ctrl: 0,
+            load: 0,
+            reason: 0,
             cycles: CYCLES_RESET,
             enable: false,
             running: false,
             scratch: [0; 8],
+            triggered: false,
         }
     }
 
     /// Reset to power-on defaults. Called from `Emulator::reset()`.
     /// Clears scratch — `Emulator::reset()` is a cold-boot equivalent.
     pub fn reset(&mut self) {
+        self.ctrl = 0;
+        self.load = 0;
+        self.reason = 0;
         self.cycles = CYCLES_RESET;
         self.enable = false;
         self.running = false;
         self.scratch = [0; 8];
+        self.triggered = false;
+    }
+
+    /// Reset MCU-side watchdog state while retaining scratch and REASON.
+    /// The external flash/SD models are owned by the bus and are therefore
+    /// unaffected by this operation.
+    pub fn warm_reset(&mut self) {
+        let scratch = self.scratch;
+        let reason = self.reason;
+        *self = Self::new();
+        self.scratch = scratch;
+        self.reason = reason;
+    }
+
+    /// Consume an already-latched CTRL trigger.
+    pub fn take_trigger(&mut self) -> bool {
+        std::mem::take(&mut self.triggered)
     }
 
     /// Read a register by canonical offset within the watchdog block.
-    /// Only `TICK` (`0x2C`) returns meaningful state; other offsets are
-    /// 0 in Phase 1.
+    /// Return the modeled WATCHDOG register image.
     pub fn read32(&self, offset: u32) -> u32 {
         match offset {
+            CTRL_OFFSET => self.ctrl & !CTRL_TRIGGER,
+            LOAD_OFFSET => self.load,
+            REASON_OFFSET => self.reason,
             TICK_OFFSET => {
                 let mut v = (self.cycles as u32) & 0x1FF;
                 if self.enable {
@@ -118,22 +170,43 @@ impl WatchdogTickRegs {
     }
 
     /// Write a register with an APB alias in the normalised 2-bit form
-    /// (`0` plain / `1` XOR / `2` BITSET / `3` BITCLR). Only `TICK` is
-    /// writable in Phase 1; other offsets are no-ops.
+    /// (`0` plain / `1` XOR / `2` BITSET / `3` BITCLR).  Returns true when
+    /// CTRL.TRIGGER was asserted by this write.
     ///
     /// RUNNING mirrors ENABLE — any transition on bit 9 transitions
     /// bit 10 on the same cycle. This collapses the "takes effect one
     /// cycle later" silicon delay into an instant transition, which is
     /// sufficient for firmware that polls `RUNNING` after `ENABLE`
     /// (there's no corpus binary distinguishing the two cadences).
-    pub fn write32(&mut self, offset: u32, value: u32, alias: u32) {
+    pub fn write32(&mut self, offset: u32, value: u32, alias: u32) -> bool {
         if (SCRATCH0_OFFSET..SCRATCH_END_OFFSET).contains(&offset) && (offset & 0x3) == 0 {
             let idx = ((offset - SCRATCH0_OFFSET) >> 2) as usize;
             apply_alias_rmw(&mut self.scratch[idx], value, alias);
-            return;
+            return false;
         }
-        if offset != TICK_OFFSET {
-            return;
+        match offset {
+            CTRL_OFFSET => {
+                let old = self.ctrl;
+                let mut word = old;
+                apply_alias_rmw(&mut word, value, alias);
+                // TRIGGER is write-only and does not remain set in CTRL.
+                let trigger = word & CTRL_TRIGGER != 0;
+                self.ctrl = word & !CTRL_TRIGGER;
+                if trigger {
+                    self.reason |= REASON_FORCE;
+                    self.triggered = true;
+                }
+                return trigger;
+            }
+            LOAD_OFFSET => {
+                let mut word = self.load;
+                apply_alias_rmw(&mut word, value, alias);
+                self.load = word & 0x00FF_FFFF;
+                return false;
+            }
+            REASON_OFFSET => return false,
+            TICK_OFFSET => {}
+            _ => return false,
         }
         // Rebuild the stored word, apply the alias RMW, then decode
         // back into fields. This keeps the alias math in a single
@@ -151,6 +224,7 @@ impl WatchdogTickRegs {
         self.enable = (word & (1 << 9)) != 0;
         // RUNNING mirrors ENABLE on the same cycle — see doc comment.
         self.running = self.enable;
+        false
     }
 }
 
