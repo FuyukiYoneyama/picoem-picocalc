@@ -125,6 +125,23 @@ enum Phase {
     WriteData { taken: usize },
     /// Data taken; the acceptance token goes out on the next transfer.
     DataResponse,
+    /// A multi-block read has finished its current block. The host may
+    /// clock the next block or start CMD12 without raising CS.
+    #[cfg(feature = "sd-gen1-multiblock")]
+    MultiReadAwait { next_block: u32 },
+    /// A multi-block write is waiting for either another block token or the
+    /// stop token.
+    #[cfg(feature = "sd-gen1-multiblock")]
+    MultiWriteAwaitToken { block: u32 },
+    /// Taking the 512-byte payload and two CRC bytes of a multi-block write.
+    #[cfg(feature = "sd-gen1-multiblock")]
+    MultiWriteData { block: u32, taken: usize },
+    /// The data-response token is returned one transfer after the CRC.
+    #[cfg(feature = "sd-gen1-multiblock")]
+    MultiWriteDataResponse { next_block: u32 },
+    /// A bounded busy interval follows each accepted multi-block write.
+    #[cfg(feature = "sd-gen1-multiblock")]
+    MultiWriteBusy { next_block: u32 },
 }
 
 /// Schema version for the diagnostic SD protocol trace.  This is separate
@@ -435,13 +452,13 @@ impl RawBacking {
         // component does not exist yet, and could let a same-file export
         // bypass the policy check.  Reject symlink output paths explicitly;
         // the export is an atomic rename, never a write through a link.
-        if let Ok(metadata) = std::fs::symlink_metadata(output) {
-            if metadata.file_type().is_symlink() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "SD RAW output must not be a symlink",
-                ));
-            }
+        if let Ok(metadata) = std::fs::symlink_metadata(output)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SD RAW output must not be a symlink",
+            ));
         }
         let output_canonical = if output.exists() {
             std::fs::canonicalize(output)
@@ -516,6 +533,18 @@ pub struct SdCard {
     pub blocks_written: u64,
     /// Commands this model does not implement, with their counts.
     pub unknown_commands: Vec<(u8, u32)>,
+    /// Protocol violations observed by the experimental multi-block model.
+    /// This is diagnostic state only; the feature is not enabled by default.
+    #[cfg(feature = "sd-gen1-multiblock")]
+    pub protocol_errors: Vec<String>,
+    #[cfg(feature = "sd-gen1-multiblock")]
+    multi_write_expected: Option<u32>,
+    #[cfg(feature = "sd-gen1-multiblock")]
+    multi_write_start_pending: Option<u32>,
+    #[cfg(feature = "sd-gen1-multiblock")]
+    multi_write_blocks_done: u32,
+    #[cfg(feature = "sd-gen1-multiblock")]
+    multi_read_next_block: Option<u32>,
     trace: Option<SdTraceState>,
 }
 
@@ -553,6 +582,16 @@ impl SdCard {
             blocks_read: 0,
             blocks_written: 0,
             unknown_commands: Vec::new(),
+            #[cfg(feature = "sd-gen1-multiblock")]
+            protocol_errors: Vec::new(),
+            #[cfg(feature = "sd-gen1-multiblock")]
+            multi_write_expected: None,
+            #[cfg(feature = "sd-gen1-multiblock")]
+            multi_write_start_pending: None,
+            #[cfg(feature = "sd-gen1-multiblock")]
+            multi_write_blocks_done: 0,
+            #[cfg(feature = "sd-gen1-multiblock")]
+            multi_read_next_block: None,
             trace: None,
         };
         match format {
@@ -592,6 +631,16 @@ impl SdCard {
             blocks_read: 0,
             blocks_written: 0,
             unknown_commands: Vec::new(),
+            #[cfg(feature = "sd-gen1-multiblock")]
+            protocol_errors: Vec::new(),
+            #[cfg(feature = "sd-gen1-multiblock")]
+            multi_write_expected: None,
+            #[cfg(feature = "sd-gen1-multiblock")]
+            multi_write_start_pending: None,
+            #[cfg(feature = "sd-gen1-multiblock")]
+            multi_write_blocks_done: 0,
+            #[cfg(feature = "sd-gen1-multiblock")]
+            multi_read_next_block: None,
             trace: None,
         })
     }
@@ -869,6 +918,13 @@ impl SdCard {
         self.reply.clear();
         self.write_buf.clear();
         self.write_crc = [0; 2];
+        #[cfg(feature = "sd-gen1-multiblock")]
+        {
+            self.multi_read_next_block = None;
+            self.multi_write_expected = None;
+            self.multi_write_start_pending = None;
+            self.multi_write_blocks_done = 0;
+        }
     }
 
     /// One byte exchanged. Returns what the card puts on MISO.
@@ -907,8 +963,26 @@ impl SdCard {
                         // A write command hands over to the data phase
                         // rather than going idle.
                         self.phase = match self.pending_write() {
-                            true => Phase::AwaitWriteToken,
-                            false => Phase::Idle,
+                            true => {
+                                #[cfg(feature = "sd-gen1-multiblock")]
+                                if let Some(block) = self.multi_write_start_pending.take() {
+                                    Phase::MultiWriteAwaitToken { block }
+                                } else {
+                                    Phase::AwaitWriteToken
+                                }
+                                #[cfg(not(feature = "sd-gen1-multiblock"))]
+                                Phase::AwaitWriteToken
+                            }
+                            false => {
+                                #[cfg(feature = "sd-gen1-multiblock")]
+                                if let Some(next_block) = self.multi_read_next_block {
+                                    Phase::MultiReadAwait { next_block }
+                                } else {
+                                    Phase::Idle
+                                }
+                                #[cfg(not(feature = "sd-gen1-multiblock"))]
+                                Phase::Idle
+                            }
                         };
                     }
                     b
@@ -951,6 +1025,88 @@ impl SdCard {
                     IDLE
                 }
             }
+            #[cfg(feature = "sd-gen1-multiblock")]
+            Phase::MultiReadAwait { next_block } => {
+                if byte & 0xC0 == 0x40 {
+                    // CMD12 is sent while CS remains low after a block.
+                    self.phase = Phase::Command {
+                        index: byte & 0x3F,
+                        taken: 0,
+                    };
+                } else if byte == IDLE {
+                    if self.queue_multi_read_block(next_block).is_some() {
+                        self.multi_read_next_block = next_block.checked_add(1);
+                        self.phase = Phase::Reply;
+                    } else {
+                        self.multi_read_next_block = None;
+                        self.phase = Phase::Idle;
+                    }
+                } else {
+                    self.note_protocol_error(format!(
+                        "multi_read_expected_clock_or_cmd12_got_{byte:02x}"
+                    ));
+                }
+                IDLE
+            }
+            #[cfg(feature = "sd-gen1-multiblock")]
+            Phase::MultiWriteAwaitToken { block } => {
+                match byte {
+                    0xFC => {
+                        self.write_block = block;
+                        self.write_buf.clear();
+                        self.write_crc = [0; 2];
+                        self.phase = Phase::MultiWriteData { block, taken: 0 };
+                    }
+                    0xFD => {
+                        self.finish_multi_write(block);
+                        self.phase = Phase::Idle;
+                    }
+                    other => self.note_protocol_error(format!(
+                        "multi_write_expected_fc_or_fd_got_{other:02x}"
+                    )),
+                }
+                IDLE
+            }
+            #[cfg(feature = "sd-gen1-multiblock")]
+            Phase::MultiWriteData { block, taken } => {
+                if taken < BLOCK_SIZE {
+                    self.write_buf.push(byte);
+                    self.phase = Phase::MultiWriteData {
+                        block,
+                        taken: taken + 1,
+                    };
+                    IDLE
+                } else if taken < BLOCK_SIZE + 1 {
+                    self.write_crc[0] = byte;
+                    self.phase = Phase::MultiWriteData {
+                        block,
+                        taken: taken + 1,
+                    };
+                    IDLE
+                } else {
+                    self.write_crc[1] = byte;
+                    self.write_block = block;
+                    if self.commit_write() {
+                        self.phase = Phase::MultiWriteDataResponse {
+                            next_block: block.saturating_add(1),
+                        };
+                    } else {
+                        self.note_protocol_error(format!("multi_write_block_out_of_range_{block}"));
+                        self.phase = Phase::Idle;
+                    }
+                    IDLE
+                }
+            }
+            #[cfg(feature = "sd-gen1-multiblock")]
+            Phase::MultiWriteDataResponse { next_block } => {
+                self.phase = Phase::MultiWriteBusy { next_block };
+                DATA_ACCEPTED
+            }
+            #[cfg(feature = "sd-gen1-multiblock")]
+            Phase::MultiWriteBusy { next_block } => {
+                self.phase = Phase::MultiWriteAwaitToken { block: next_block };
+                0x00
+            }
         }
     }
 
@@ -959,7 +1115,7 @@ impl SdCard {
         self.write_pending
     }
 
-    fn commit_write(&mut self) {
+    fn commit_write(&mut self) -> bool {
         let block = self.write_block as usize;
         let committed = if let Some(raw) = self.raw.as_mut() {
             block < raw.block_count && raw.write_sector(block, &self.write_buf).is_ok()
@@ -974,6 +1130,10 @@ impl SdCard {
         };
         if committed {
             self.blocks_written += 1;
+            #[cfg(feature = "sd-gen1-multiblock")]
+            if matches!(self.phase, Phase::MultiWriteData { .. }) {
+                self.multi_write_blocks_done = self.multi_write_blocks_done.saturating_add(1);
+            }
             if let Some(trace) = self.trace.as_mut() {
                 trace.record(SdTraceEvent::BlockData {
                     sequence: trace.event_count,
@@ -991,6 +1151,7 @@ impl SdCard {
         }
         self.write_buf.clear();
         self.write_pending = false;
+        committed
     }
 
     fn arg_value(&self) -> u32 {
@@ -1069,15 +1230,55 @@ impl SdCard {
             }
             // SET_BLOCKLEN: SDHC is fixed at 512, so just accept it.
             16 => response.push(R1_READY),
+            #[cfg(feature = "sd-gen1-multiblock")]
+            // STOP_TRANSMISSION. This is only meaningful while a
+            // multi-block read is awaiting the next host clock.
+            12 => {
+                if self.multi_read_next_block.is_some() {
+                    self.multi_read_next_block = None;
+                    response.push(R1_READY);
+                } else {
+                    self.note_protocol_error("cmd12_without_active_multi_read".to_string());
+                    response.push(R1_READY);
+                }
+            }
             // READ_SINGLE_BLOCK.
             17 => {
                 response.push(R1_READY);
                 data = self.queue_block_read(argument);
             }
+            #[cfg(feature = "sd-gen1-multiblock")]
+            // READ_MULTIPLE_BLOCK. The host ends the stream with CMD12.
+            18 => {
+                if self.multi_read_next_block.is_some() {
+                    self.note_protocol_error("nested_cmd18".to_string());
+                    response.push(R1_READY);
+                } else {
+                    response.push(R1_READY);
+                    data = self.queue_multi_read_block(argument);
+                    if data.is_some() {
+                        self.multi_read_next_block = argument.checked_add(1);
+                    }
+                }
+            }
+            #[cfg(feature = "sd-gen1-multiblock")]
+            // SET_BLOCK_COUNT for the following multi-block write.
+            23 => {
+                self.multi_write_expected = Some(argument);
+                response.push(R1_READY);
+            }
             // WRITE_BLOCK: acknowledge, then take the data phase.
             24 => {
                 response.push(R1_READY);
                 self.write_block = argument;
+                self.write_pending = true;
+            }
+            #[cfg(feature = "sd-gen1-multiblock")]
+            // WRITE_MULTIPLE_BLOCK. The data phase starts with 0xFC.
+            25 => {
+                response.push(R1_READY);
+                self.multi_write_start_pending = Some(argument);
+                self.multi_write_blocks_done = 0;
                 self.write_pending = true;
             }
             // APP_CMD: the next command is an ACMD.
@@ -1171,6 +1372,52 @@ impl SdCard {
             length: BLOCK_SIZE,
             crc: [0xFF, 0xFF],
         })
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    fn queue_multi_read_block(&mut self, block: u32) -> Option<SdTraceData> {
+        let sector = match self.read_sector(block as usize) {
+            Ok(sector) => sector,
+            Err(_) => {
+                self.note_protocol_error(format!("multi_read_block_out_of_range_{block}"));
+                return None;
+            }
+        };
+        self.reply.push_back(TOKEN_START);
+        self.reply.extend(sector);
+        self.reply.extend([0xFF, 0xFF]);
+        self.blocks_read += 1;
+        Some(SdTraceData {
+            direction: SdTraceDirection::Read,
+            block,
+            token: TOKEN_START,
+            length: BLOCK_SIZE,
+            crc: [0xFF, 0xFF],
+        })
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    fn finish_multi_write(&mut self, next_block: u32) {
+        if let Some(expected) = self.multi_write_expected
+            && expected != self.multi_write_blocks_done
+        {
+            self.note_protocol_error(format!(
+                "multi_write_count_mismatch_expected_{expected}_actual_{}",
+                self.multi_write_blocks_done
+            ));
+        }
+        if next_block == u32::MAX {
+            self.note_protocol_error("multi_write_block_address_overflow".to_string());
+        }
+        self.multi_write_expected = None;
+        self.multi_write_start_pending = None;
+        self.multi_write_blocks_done = 0;
+        self.write_pending = false;
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    fn note_protocol_error(&mut self, error: String) {
+        self.protocol_errors.push(error);
     }
 
     fn note_unknown(&mut self, code: u8) {

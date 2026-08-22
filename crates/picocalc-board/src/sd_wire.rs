@@ -307,4 +307,125 @@ mod tests {
         let _ = command(&mut w, 62, 0);
         assert_eq!(card.lock().unwrap().unknown_commands, vec![(62, 1)]);
     }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    fn send_frame(wire: &mut SdCardWire, index: u8, arg: u32) {
+        wire.transfer(0x40 | index as u16, 8);
+        for shift in [24, 16, 8, 0] {
+            wire.transfer(((arg >> shift) & 0xFF) as u16, 8);
+        }
+        wire.transfer(0x01, 8);
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    fn drain_block(wire: &mut SdCardWire) -> Vec<u8> {
+        let token_seen = (0..32).find_map(|_| {
+            let byte = wire.transfer(0xFF, 8) as u8;
+            (byte == 0xFE).then_some(byte)
+        });
+        assert_eq!(token_seen, Some(0xFE), "expected a data token");
+        (0..crate::sdcard::BLOCK_SIZE + 2)
+            .map(|_| wire.transfer(0xFF, 8) as u8)
+            .collect()
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    fn write_multi_block(wire: &mut SdCardWire, block: u32, value: u8) {
+        assert_eq!(wire.transfer(0xFC, 8) as u8, 0xFF);
+        for _ in 0..crate::sdcard::BLOCK_SIZE {
+            wire.transfer(value as u16, 8);
+        }
+        wire.transfer(0xFF, 8);
+        wire.transfer(0xFF, 8);
+        assert_eq!(wire.transfer(0xFF, 8) as u8, 0x05, "block {block} accepted");
+        assert_eq!(wire.transfer(0xFF, 8) as u8, 0x00, "block {block} busy");
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    #[test]
+    fn synthetic_cmd18_streams_two_blocks_and_cmd12_stops() {
+        let (mut w, card) = wire();
+        send_frame(&mut w, 18, 3);
+        let first = drain_block(&mut w);
+        assert_eq!(first.len(), crate::sdcard::BLOCK_SIZE + 2);
+
+        // The host clocks one idle byte to request the next block while CS
+        // remains low; the card starts the next token on the following byte.
+        assert_eq!(w.transfer(0xFF, 8) as u8, 0xFF);
+        let second = drain_block(&mut w);
+        assert_eq!(second.len(), crate::sdcard::BLOCK_SIZE + 2);
+
+        // CMD12 is framed without a CS pulse after the final block.
+        send_frame(&mut w, 12, 0);
+        let stop_reply: Vec<_> = (0..8).map(|_| w.transfer(0xFF, 8) as u8).collect();
+        assert_eq!(r1(&stop_reply), 0x00);
+        assert!(card.lock().unwrap().protocol_errors.is_empty());
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    #[test]
+    fn synthetic_cmd23_cmd25_writes_two_blocks_with_busy_between_them() {
+        let (mut w, card) = wire();
+        send_frame(&mut w, 23, 2);
+        let _ = (0..8).map(|_| w.transfer(0xFF, 8) as u8).collect::<Vec<_>>();
+        send_frame(&mut w, 25, 3);
+        let _ = (0..8).map(|_| w.transfer(0xFF, 8) as u8).collect::<Vec<_>>();
+
+        write_multi_block(&mut w, 3, 0xA5);
+        write_multi_block(&mut w, 4, 0x5A);
+        assert_eq!(w.transfer(0xFD, 8) as u8, 0xFF, "stop token is consumed");
+        assert_eq!(card.lock().unwrap().blocks_written, 2);
+
+        // Read one written block back through the existing single-block
+        // path; this also proves that the multi-block commit used the same
+        // backing/COW boundary as CMD24.
+        send_frame(&mut w, 17, 3);
+        let data = drain_block(&mut w);
+        assert!(data[..crate::sdcard::BLOCK_SIZE]
+            .iter()
+            .all(|byte| *byte == 0xA5));
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    #[test]
+    fn multi_block_mutations_are_visible_and_fail_closed() {
+        let (mut w, card) = wire();
+
+        // Out-of-range CMD18 returns no token and records the reason.
+        send_frame(&mut w, 18, 64);
+        let reply: Vec<_> = (0..16).map(|_| w.transfer(0xFF, 8) as u8).collect();
+        assert!(!reply.contains(&0xFE));
+        assert!(card
+            .lock()
+            .unwrap()
+            .protocol_errors
+            .iter()
+            .any(|error| error == "multi_read_block_out_of_range_64"));
+
+        // A single-block token is not silently accepted for CMD25.
+        send_frame(&mut w, 25, 3);
+        let _ = (0..8).map(|_| w.transfer(0xFF, 8) as u8).collect::<Vec<_>>();
+        assert_eq!(w.transfer(0xFE, 8) as u8, 0xFF);
+        assert!(card
+            .lock()
+            .unwrap()
+            .protocol_errors
+            .iter()
+            .any(|error| error == "multi_write_expected_fc_or_fd_got_fe"));
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    #[test]
+    fn cs_abort_discards_a_multi_block_transfer() {
+        let (mut w, card) = wire();
+        send_frame(&mut w, 18, 3);
+        let _ = drain_block(&mut w);
+        w.observe_pins(1 << SD_PIN_CS);
+        w.observe_pins(0);
+
+        send_frame(&mut w, 17, 0);
+        let data = drain_block(&mut w);
+        assert_eq!(data.len(), crate::sdcard::BLOCK_SIZE + 2);
+        assert!(card.lock().unwrap().protocol_errors.is_empty());
+    }
 }
