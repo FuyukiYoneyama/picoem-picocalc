@@ -364,6 +364,39 @@ mod tests {
 
     #[cfg(feature = "sd-gen1-multiblock")]
     #[test]
+    fn synthetic_multi_read_trace_replays_command_and_block_boundaries() {
+        let (mut w, card) = wire();
+        card.lock().unwrap().enable_trace();
+        w.observe_pins(0);
+        send_frame(&mut w, 18, 3);
+        let _ = drain_block(&mut w);
+        let _ = w.transfer(0xFF, 8);
+        let _ = drain_block(&mut w);
+        send_frame(&mut w, 12, 0);
+        let _ = (0..8).map(|_| w.transfer(0xFF, 8) as u8).collect::<Vec<_>>();
+        w.observe_pins(1 << SD_PIN_CS);
+
+        let snapshot = card.lock().unwrap().trace_snapshot().unwrap();
+        let command_indices = snapshot
+            .preview
+            .iter()
+            .filter_map(|event| match event {
+                crate::sdcard::SdTraceEvent::Command { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let block_events = snapshot
+            .preview
+            .iter()
+            .filter(|event| matches!(event, crate::sdcard::SdTraceEvent::BlockData { .. }))
+            .count();
+        assert_eq!(command_indices, vec![18, 12]);
+        assert_eq!(block_events, 1, "first block is attached to CMD18");
+        assert_eq!(snapshot.event_count, 4, "CMD18 + block + CMD12 + deselect");
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    #[test]
     fn synthetic_cmd23_cmd25_writes_two_blocks_with_busy_between_them() {
         let (mut w, card) = wire();
         send_frame(&mut w, 23, 2);

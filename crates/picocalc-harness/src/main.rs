@@ -1181,6 +1181,14 @@ fn apply_audio_sink_expectation(verdict: &mut VerdictReport, audio_sink: Option<
     }
 }
 
+#[cfg(feature = "sd-gen1-multiblock")]
+fn apply_sd_protocol_errors(verdict: &mut VerdictReport, sd: Option<&SdReport>) {
+    if sd.is_some_and(|report| !report.protocol_errors.is_empty()) {
+        verdict.status = Verdict::Fail;
+        verdict.reasons.push("sd_protocol_error");
+    }
+}
+
 /// ARMv6-M IPSR exception numbers that mean "the firmware has fallen
 /// over". Ordinary IRQs (>= 16), SVCall, PendSV and SysTick are normal
 /// operation and must not stop the run.
@@ -3791,6 +3799,8 @@ struct SdReport {
     blocks_read: u64,
     blocks_written: u64,
     unknown_commands: Vec<(u8, u32)>,
+    #[cfg(feature = "sd-gen1-multiblock")]
+    protocol_errors: Vec<String>,
     raw: Option<picocalc_board::sdcard::RawMetadata>,
 }
 
@@ -3805,6 +3815,8 @@ impl SdReport {
             blocks_read: card.blocks_read,
             blocks_written: card.blocks_written,
             unknown_commands,
+            #[cfg(feature = "sd-gen1-multiblock")]
+            protocol_errors: card.protocol_errors().to_vec(),
             raw: card.raw_metadata(),
         }
     }
@@ -3830,6 +3842,21 @@ impl SdReport {
                 raw.dirty_blocks,
                 json_string(&raw.source_sha256),
             ));
+        }
+        #[cfg(feature = "sd-gen1-multiblock")]
+        {
+            s.push_str("    \"protocol_errors\": [");
+            if self.protocol_errors.is_empty() {
+                s.push_str("],\n");
+            } else {
+                for (index, error) in self.protocol_errors.iter().enumerate() {
+                    if index > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&json_string(error));
+                }
+                s.push_str("],\n");
+            }
         }
         s.push_str("    \"unknown_commands\": [");
         if self.unknown_commands.is_empty() {
@@ -4511,10 +4538,10 @@ fn run() -> Result<Verdict, String> {
     } else {
         None
     };
-    if args.sd_trace.is_some() {
-        if let Some(card) = sd_card.as_ref() {
-            card.lock().expect("SD mutex").enable_trace();
-        }
+    if args.sd_trace.is_some()
+        && let Some(card) = sd_card.as_ref()
+    {
+        card.lock().expect("SD mutex").enable_trace();
     }
 
     let (mut emu, boot_mode, lcd) = boot(
@@ -4853,6 +4880,8 @@ fn run() -> Result<Verdict, String> {
         &args.expected_uart,
     );
     apply_audio_sink_expectation(&mut verdict, audio_sink_report.as_ref());
+    #[cfg(feature = "sd-gen1-multiblock")]
+    apply_sd_protocol_errors(&mut verdict, sd_report.as_ref());
 
     let report = build_report(
         backend_commit,
@@ -4947,6 +4976,8 @@ mod tests {
         judge_run, run_loop, sd_trace_json, snapshot_machine, validate_backend_identity,
         validate_progress_interval, validate_run_id, validate_sd_selection, write_audio_wav,
     };
+    #[cfg(feature = "sd-gen1-multiblock")]
+    use super::{VerdictReport, apply_sd_protocol_errors};
     use picocalc_board::{Keyboard, SdFormat, St7365p};
     use rp2040_emu::AudioSinkSnapshot;
     #[cfg(feature = "idle-profiler")]
@@ -5410,12 +5441,39 @@ mod tests {
             blocks_read: 2,
             blocks_written: 1,
             unknown_commands: Vec::new(),
+            #[cfg(feature = "sd-gen1-multiblock")]
+            protocol_errors: Vec::new(),
             raw: None,
         }
         .to_json();
         assert!(report.contains("\"format\": \"fat32\""));
         assert!(report.contains("\"block_size\": 512"));
         assert!(report.contains("\"blocks_written\": 1"));
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    #[test]
+    fn sd_protocol_error_forces_a_judged_failure() {
+        let mut verdict = VerdictReport {
+            status: Verdict::Pass,
+            reasons: Vec::new(),
+            expected_stop: None,
+            required_uart_markers: Vec::new(),
+            missing_uart_markers: Vec::new(),
+        };
+        let report = SdReport {
+            format: SdFormat::Fat32,
+            block_count: 128,
+            commands_seen: 1,
+            blocks_read: 0,
+            blocks_written: 0,
+            unknown_commands: Vec::new(),
+            protocol_errors: vec!["wrong_token".to_string()],
+            raw: None,
+        };
+        apply_sd_protocol_errors(&mut verdict, Some(&report));
+        assert!(matches!(verdict.status, Verdict::Fail));
+        assert_eq!(verdict.reasons, vec!["sd_protocol_error"]);
     }
 
     #[test]

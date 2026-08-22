@@ -683,6 +683,20 @@ impl SdCard {
         self.trace.as_ref().map(SdTraceState::snapshot)
     }
 
+    /// Protocol errors raised by the optional SD-GEN-1 multi-block model.
+    /// The default model returns an empty slice so callers can expose the
+    /// field without changing the normal report schema.
+    pub fn protocol_errors(&self) -> &[String] {
+        #[cfg(feature = "sd-gen1-multiblock")]
+        {
+            &self.protocol_errors
+        }
+        #[cfg(not(feature = "sd-gen1-multiblock"))]
+        {
+            &[]
+        }
+    }
+
     /// Notify the card that SPI chip-select went low.  The wire calls this
     /// on the falling edge; direct card tests may omit it because the trace
     /// state also infers a first selection from the first transfer.
@@ -1034,7 +1048,8 @@ impl SdCard {
                         taken: 0,
                     };
                 } else if byte == IDLE {
-                    if self.queue_multi_read_block(next_block).is_some() {
+                    if let Some(data) = self.queue_multi_read_block(next_block) {
+                        self.trace_block_data(data);
                         self.multi_read_next_block = next_block.checked_add(1);
                         self.phase = Phase::Reply;
                     } else {
@@ -1324,6 +1339,18 @@ impl SdCard {
     ) {
         if let Some(trace) = self.trace.as_mut() {
             trace.command(index, argument, crc, crc_valid, response, data);
+        }
+    }
+
+    #[cfg(feature = "sd-gen1-multiblock")]
+    fn trace_block_data(&mut self, data: SdTraceData) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.record(SdTraceEvent::BlockData {
+                sequence: trace.event_count,
+                cs_epoch: trace.cs_epoch,
+                transfers: trace.transfers,
+                data,
+            });
         }
     }
 
