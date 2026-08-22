@@ -204,9 +204,36 @@ impl RawBacking {
     }
 
     fn export_raw(&mut self, output: &Path) -> io::Result<()> {
-        if std::fs::canonicalize(output).ok().as_deref() == Some(self.source_path.as_path())
-            || output == self.source_path.as_path()
-        {
+        // `output` is normally a new path, so canonicalize its existing
+        // parent as well as an already-existing file.  Comparing only
+        // `canonicalize(output)` misses alternate spellings when the final
+        // component does not exist yet, and could let a same-file export
+        // bypass the policy check.  Reject symlink output paths explicitly;
+        // the export is an atomic rename, never a write through a link.
+        if let Ok(metadata) = std::fs::symlink_metadata(output) {
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SD RAW output must not be a symlink",
+                ));
+            }
+        }
+        let output_canonical = if output.exists() {
+            std::fs::canonicalize(output)
+        } else {
+            let parent = output.parent().unwrap_or_else(|| Path::new("."));
+            let name = output.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SD RAW output must name a file",
+                )
+            })?;
+            std::fs::canonicalize(parent).map(|parent| parent.join(name))
+        };
+        if matches!(
+            output_canonical.as_deref(),
+            Ok(path) if path == self.source_path.as_path()
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "SD RAW input and output must be different files",
@@ -835,7 +862,7 @@ impl SdCard {
 
 #[cfg(test)]
 mod format_tests {
-    use super::{BLOCK_SIZE, DEFAULT_BLOCKS, SdCard, SdFormat};
+    use super::{SdCard, SdFormat, BLOCK_SIZE, DEFAULT_BLOCKS};
     use std::path::PathBuf;
 
     fn temp_path(label: &str) -> PathBuf {
@@ -977,11 +1004,25 @@ mod format_tests {
         std::fs::write(&input, [0u8; BLOCK_SIZE]).unwrap();
         let mut raw = SdCard::from_raw_file(&input).unwrap();
         assert!(raw.export_raw(&input).is_err());
-        assert!(
-            SdCard::new_with_format(1024, SdFormat::Fat16)
-                .export_raw(temp_path("memory-output"))
-                .is_err()
-        );
+        let dotted = input
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(input.file_name().unwrap());
+        assert!(raw.export_raw(&dotted).is_err());
+        #[cfg(unix)]
+        {
+            let alias_dir = temp_path("raw-same-path-alias-dir");
+            std::fs::create_dir(&alias_dir).unwrap();
+            let alias = alias_dir.join(input.file_name().unwrap());
+            std::fs::remove_dir(&alias_dir).unwrap();
+            std::os::unix::fs::symlink(input.parent().unwrap(), &alias_dir).unwrap();
+            assert!(raw.export_raw(&alias).is_err());
+            std::fs::remove_file(&alias_dir).unwrap();
+        }
+        assert!(SdCard::new_with_format(1024, SdFormat::Fat16)
+            .export_raw(temp_path("memory-output"))
+            .is_err());
         let _ = std::fs::remove_file(input);
     }
 }
