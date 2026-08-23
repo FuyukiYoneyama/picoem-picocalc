@@ -2,10 +2,11 @@
 //!
 //! The fixture is deliberately a tiny, repository-owned Thumb program.  It
 //! configures SPI0 and the real PicoCalc SD chip-select pin, performs a
-//! CMD18 two-block read followed by CMD12 while CS remains asserted, and
-//! reports a UART marker.  The test therefore exercises the complete path
-//! (CPU -> SIO/SPI0 -> `SdCardWire` -> default `SdCard` feature) rather than
-//! calling the card state machine directly.
+//! CMD18 two-block read followed by CMD12 while CS remains asserted, then
+//! performs a CMD23/CMD25 one-block write and CMD17 readback before emitting
+//! a UART marker.  The test therefore exercises the complete path (CPU ->
+//! SIO/SPI0 -> `SdCardWire` -> default `SdCard` feature) rather than calling
+//! the card state machine directly.
 
 #![cfg(feature = "sd-gen1-multiblock")]
 
@@ -169,13 +170,60 @@ fn multiblock_fixture_image() -> Vec<u8> {
         program.write_byte(6, 0xff);
     }
 
-    // Deselect, then emit a marker that the runner can use as the app-level
-    // completion condition.
+    // Start a fresh CS epoch for the multi-block write.  CMD23 and CMD25
+    // have only the two-byte [idle, R1] response in this model; clocking
+    // beyond it would correctly be treated as an invalid data token.
     program.load_page_address(4, 0xd0, 0x00);
     program.adds_imm(4, 0x14); // GPIO_OUT_SET
     program.movs(1, 1);
     program.lsls(1, 17);
     program.str_word(1, 4);
+    program.load_page_address(4, 0xd0, 0x00);
+    program.adds_imm(4, 0x18); // GPIO_OUT_CLR
+    program.str_word(1, 4);
+
+    // ACMD23-style pre-erase count followed by CMD25 at block 6.
+    for byte in [0x57, 0x00, 0x00, 0x00, 0x01, 0x01] {
+        program.write_byte(6, byte);
+    }
+    for _ in 0..2 {
+        program.write_byte(6, 0xff);
+    }
+    for byte in [0x59, 0x00, 0x00, 0x00, 0x06, 0x01] {
+        program.write_byte(6, byte);
+    }
+    for _ in 0..2 {
+        program.write_byte(6, 0xff);
+    }
+    program.write_byte(6, 0xfc); // multi-block data token
+    for _ in 0..512 {
+        program.write_byte(6, 0xa5);
+    }
+    program.write_byte(6, 0xff); // CRC high
+    program.write_byte(6, 0xff); // CRC low
+    program.write_byte(6, 0xff); // data-accepted token
+    program.write_byte(6, 0xff); // busy byte
+    program.write_byte(6, 0xfd); // stop transmission token
+
+    // Read the written block through the existing single-block path.  The
+    // runner exports the COW-backed RAW image after the run and the test
+    // below checks that the readback source is byte-for-byte A5.
+    for byte in [0x51, 0x00, 0x00, 0x00, 0x06, 0x01] {
+        program.write_byte(6, byte);
+    }
+    for _ in 0..517 {
+        program.write_byte(6, 0xff);
+    }
+
+    // Deselect before reporting completion.
+    program.load_page_address(4, 0xd0, 0x00);
+    program.adds_imm(4, 0x14); // GPIO_OUT_SET
+    program.movs(1, 1);
+    program.lsls(1, 17);
+    program.str_word(1, 4);
+
+    // Emit a marker that the runner can use as the app-level completion
+    // condition.
     program.load_page_address(7, 0x40, 0x34);
     program.adds_imm(7, 0x30); // UART0_UARTCR
     program.movs(1, 0x01);
@@ -207,12 +255,15 @@ fn temp_dir() -> PathBuf {
 }
 
 #[test]
-fn default_runtime_executes_cmd18_and_cmd12_without_protocol_errors() {
+fn default_runtime_executes_multiblock_read_write_and_readback_without_protocol_errors() {
     let directory = temp_dir();
     let firmware = directory.join("sd-multiblock-fixture.bin");
+    let input_image = directory.join("input.img");
+    let output_image = directory.join("output.img");
     let report_path = directory.join("report.json");
     let trace_path = directory.join("sd-trace.json");
     fs::write(&firmware, multiblock_fixture_image()).expect("write generated raw firmware");
+    fs::write(&input_image, vec![0u8; 8 * 512]).expect("write isolated RAW SD image");
 
     let output = Command::new(env!("CARGO_BIN_EXE_picocalc-run"))
         .args([
@@ -222,7 +273,10 @@ fn default_runtime_executes_cmd18_and_cmd12_without_protocol_errors() {
             bootrom_path().to_str().unwrap(),
             "--board",
             "picocalc",
-            "--sd",
+            "--sd-image",
+            input_image.to_str().unwrap(),
+            "--sd-image-out",
+            output_image.to_str().unwrap(),
             "--sd-trace",
             trace_path.to_str().unwrap(),
             "--cycles",
@@ -250,9 +304,13 @@ fn default_runtime_executes_cmd18_and_cmd12_without_protocol_errors() {
     assert_eq!(report["verdict"]["status"], "pass");
     assert_eq!(report["sd"]["protocol_errors"], serde_json::json!([]));
     assert_eq!(report["sd"]["unknown_commands"], serde_json::json!([]));
-    assert_eq!(report["sd"]["commands_seen"], 2);
-    assert_eq!(report["sd"]["blocks_read"], 2);
-    assert_eq!(report["sd"]["blocks_written"], 0);
+    assert_eq!(report["sd"]["commands_seen"], 5);
+    assert_eq!(report["sd"]["blocks_read"], 3);
+    assert_eq!(report["sd"]["blocks_written"], 1);
+
+    let exported = fs::read(&output_image).expect("read exported RAW SD image");
+    assert_eq!(exported.len(), 8 * 512);
+    assert!(exported[6 * 512..7 * 512].iter().all(|byte| *byte == 0xa5));
 
     let trace: Value = serde_json::from_slice(&fs::read(&trace_path).expect("read SD trace"))
         .expect("parse SD trace");
