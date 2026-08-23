@@ -50,7 +50,7 @@ workspace = true
 # docs/IMPLEMENTATION_PLAN.md §3.1). No `threading` feature.
 rp2040-emu = { path = "../rp2040-emu" }
 # Board models (ST7365P display, pin map, framebuffer/PNG, shared sha256).
-picocalc-board = { path = "../picocalc-board" }
+picocalc-board = { path = "../picocalc-board", default-features = false }
 # Scenario files are JSON *input*. Reports stay hand-written so field
 # order — and therefore the report bytes — is fixed by this crate rather
 # than by a serialiser's map ordering. Parsed through `Value` rather than
