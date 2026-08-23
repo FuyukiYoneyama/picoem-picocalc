@@ -194,6 +194,21 @@ pub trait I2cExternalDevice: Send {
     /// Advance the child by deterministic virtual time. The default keeps
     /// existing keyboard and test devices time-independent.
     fn advance_virtual_time(&mut self, _delta: I2cVirtualTimeDelta) {}
+    /// Stable model label used only by an optional board-level observation
+    /// sidecar. The default keeps existing third-party/test devices opaque.
+    fn model_name(&self) -> &'static str {
+        "external"
+    }
+    /// Protocol errors detected by the device model itself. A model must not
+    /// silently turn an unsupported command into a successful transaction.
+    fn protocol_error_count(&self) -> u64 {
+        0
+    }
+    /// Deterministic, human-readable state summary for an observation
+    /// sidecar. It is deliberately not part of the primary runner report.
+    fn state_summary(&self) -> String {
+        "{}".to_string()
+    }
 }
 
 pub struct I2cRegs {
@@ -1070,12 +1085,7 @@ mod tests {
         let mut i = enabled_with_device(0x1F, 0x10);
         let mut irqs = 0;
         i.write32(IC_DATA_CMD, 0x09, 0, &mut irqs);
-        i.write32(
-            IC_DATA_CMD,
-            DATA_CMD_READ | DATA_CMD_RESTART,
-            0,
-            &mut irqs,
-        );
+        i.write32(IC_DATA_CMD, DATA_CMD_READ | DATA_CMD_RESTART, 0, &mut irqs);
         assert_eq!(i.raw_intr_stat & INT_RESTART_DET, INT_RESTART_DET);
         assert_eq!(i.raw_intr_stat & INT_TX_ABRT, 0);
         assert_eq!(i.rx_fifo.pop_front(), Some(0x10));
@@ -1092,12 +1102,7 @@ mod tests {
         i.active_address = Some(0x1F);
         i.active_device = true;
         i.tar = 0x22;
-        i.write32(
-            IC_DATA_CMD,
-            DATA_CMD_READ | DATA_CMD_RESTART,
-            0,
-            &mut irqs,
-        );
+        i.write32(IC_DATA_CMD, DATA_CMD_READ | DATA_CMD_RESTART, 0, &mut irqs);
         assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
         assert_ne!(i.tx_abrt_source & ABRT_7B_ADDR_NOACK, 0);
         assert_eq!(i.active_address, None);

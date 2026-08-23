@@ -43,7 +43,9 @@ pub use i2c_devices::{
     AHT20_ADDRESS, AT24C32_ADDRESS, AT24C32_SIZE, Aht20, At24c32, BMP280_ADDRESS, Bmp280,
     DS3231_ADDRESS, Ds3231, RtcDateTime,
 };
-pub use i2c_external::{I2cBusMux, I2cBusMuxError, I2cExternalDeviceStub};
+pub use i2c_external::{
+    I2cBusMux, I2cBusMuxError, I2cBusObservation, I2cChildObservation, I2cExternalDeviceStub,
+};
 pub use keyboard::{KeyEvent, KeyState, Keyboard, KeyboardWire};
 pub use lcd_pio_wire::LcdPioWire;
 pub use sd_wire::SdCardWire;

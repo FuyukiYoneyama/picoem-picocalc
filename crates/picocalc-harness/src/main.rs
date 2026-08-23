@@ -39,8 +39,8 @@ use std::time::{Duration, Instant};
 
 use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{
-    Aht20, At24c32, Bmp280, Ds3231, Framebuffer, I2cBusMux, KeyEvent, KeyState, Keyboard,
-    KeyboardWire, LcdPioWire, RtcDateTime, SdCard, SdCardWire, SdFormat, SdTraceData,
+    Aht20, At24c32, Bmp280, Ds3231, Framebuffer, I2cBusMux, I2cBusObservation, KeyEvent, KeyState,
+    Keyboard, KeyboardWire, LcdPioWire, RtcDateTime, SdCard, SdCardWire, SdFormat, SdTraceData,
     SdTraceDirection, SdTraceEvent, SdTraceSnapshot, St7365p, St7365pWire, pins,
 };
 use rp2040_emu::peripherals::i2c::I2cExternalDevice;
@@ -1241,6 +1241,13 @@ fn apply_sd_protocol_errors(verdict: &mut VerdictReport, sd: Option<&SdReport>) 
     }
 }
 
+fn apply_i2c_protocol_errors(verdict: &mut VerdictReport, observation: &I2cBusObservation) {
+    if observation.protocol_errors > 0 || observation.data_nacks > 0 {
+        verdict.status = Verdict::Fail;
+        verdict.reasons.push("i2c_protocol_error");
+    }
+}
+
 /// ARMv6-M IPSR exception numbers that mean "the firmware has fallen
 /// over". Ordinary IRQs (>= 16), SVCall, PendSV and SysTick are normal
 /// operation and must not stop the run.
@@ -1281,7 +1288,52 @@ struct I2cProfileRuntime {
     fixture_basename: Option<String>,
     fixture_sha256: Option<String>,
     attached_addresses: Vec<u16>,
-    mux: Option<Box<dyn I2cExternalDevice>>,
+    mux: Arc<Mutex<I2cBusMux>>,
+}
+
+impl I2cProfileRuntime {
+    fn observation(&self) -> I2cBusObservation {
+        self.mux.lock().expect("I2C mux mutex").observation()
+    }
+}
+
+/// The emulator owns the trait object while the runner retains a shared
+/// handle for the profile sidecar. This keeps observation out of the primary
+/// report and avoids downcasting a board-specific model through rp2040-emu.
+struct SharedI2cBusMux {
+    inner: Arc<Mutex<I2cBusMux>>,
+}
+
+impl I2cExternalDevice for SharedI2cBusMux {
+    fn responds_to(&self, addr: u16) -> bool {
+        self.inner.lock().expect("I2C mux mutex").responds_to(addr)
+    }
+
+    fn address_phase(&mut self, addr: u16) -> bool {
+        self.inner
+            .lock()
+            .expect("I2C mux mutex")
+            .address_phase(addr)
+    }
+
+    fn write_byte(&mut self, byte: u8) -> bool {
+        self.inner.lock().expect("I2C mux mutex").write_byte(byte)
+    }
+
+    fn read_byte(&mut self) -> u8 {
+        self.inner.lock().expect("I2C mux mutex").read_byte()
+    }
+
+    fn transaction_end(&mut self) {
+        self.inner.lock().expect("I2C mux mutex").transaction_end();
+    }
+
+    fn advance_virtual_time(&mut self, delta: rp2040_emu::peripherals::i2c::I2cVirtualTimeDelta) {
+        self.inner
+            .lock()
+            .expect("I2C mux mutex")
+            .advance_virtual_time(delta);
+    }
 }
 
 fn fixture_object<'a>(
@@ -1685,6 +1737,7 @@ fn build_i2c_profile(
         .map_err(|e| format!("adding BMP280 to I2C profile: {e}"))?;
     }
     let attached_addresses = mux.addresses().collect();
+    let mux = Arc::new(Mutex::new(mux));
 
     Ok(I2cProfileRuntime {
         profile: profile.to_string(),
@@ -1692,7 +1745,7 @@ fn build_i2c_profile(
         fixture_basename,
         fixture_sha256,
         attached_addresses,
-        mux: Some(Box::new(mux)),
+        mux,
     })
 }
 
@@ -1702,6 +1755,7 @@ fn write_i2c_profile_report(
     outcome: &RunOutcome,
     verdict: &VerdictReport,
 ) -> Result<(), String> {
+    let observation = profile.observation();
     let status = if verdict.status == Verdict::Pass {
         "pass"
     } else {
@@ -1724,13 +1778,37 @@ fn write_i2c_profile_report(
         .map(|reason| json_string(reason))
         .collect::<Vec<_>>()
         .join(", ");
+    let child_json = observation
+        .children
+        .iter()
+        .map(|child| {
+            let state = serde_json::from_str::<serde_json::Value>(&child.state_summary)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| json_string(&child.state_summary));
+            format!(
+                "{{\"address\":\"0x{:02x}\",\"model\":{},\"address_phases\":{},\"address_acks\":{},\"address_nacks\":{},\"write_bytes\":{},\"read_bytes\":{},\"stop_count\":{},\"data_nacks\":{},\"protocol_errors\":{},\"state\":{}}}",
+                child.address,
+                json_string(&child.model),
+                child.address_phases,
+                child.address_acks,
+                child.address_nacks,
+                child.write_bytes,
+                child.read_bytes,
+                child.stop_count,
+                child.data_nacks,
+                child.protocol_errors,
+                state,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let model_scope = if profile.profile == "picocalc-rtc-env-v1" {
         "E3-AHT20-BMP280-profile-attach"
     } else {
         "E2-DS3231-AT24C32-profile-attach"
     };
     let report = format!(
-        "{{\n  \"schema_version\": 1,\n  \"profile\": {},\n  \"fixture\": {{\"id\": {}, \"basename\": {}, \"sha256\": {}}},\n  \"bus\": {{\"controller\": \"i2c1\", \"sda_gpio\": 6, \"scl_gpio\": 7, \"address_bits\": 7}},\n  \"attached_addresses\": [{}],\n  \"model_scope\": {},\n  \"status\": {},\n  \"verdict_status\": {},\n  \"verdict_reasons\": [{}],\n  \"stop_reason\": {},\n  \"cycles\": {},\n  \"error\": {}\n}}\n",
+        "{{\n  \"schema_version\": 2,\n  \"profile\": {},\n  \"fixture\": {{\"id\": {}, \"basename\": {}, \"sha256\": {}}},\n  \"bus\": {{\"controller\": \"i2c1\", \"sda_gpio\": 6, \"scl_gpio\": 7, \"address_bits\": 7}},\n  \"attached_addresses\": [{}],\n  \"model_scope\": {},\n  \"observation\": {{\"address_phases\": {}, \"address_acks\": {}, \"address_nacks\": {}, \"unknown_addresses\": {}, \"write_bytes\": {}, \"read_bytes\": {}, \"stop_count\": {}, \"data_nacks\": {}, \"protocol_errors\": {}, \"transaction_digest_sha256\": {}, \"children\": [{}]}},\n  \"status\": {},\n  \"verdict_status\": {},\n  \"verdict_reasons\": [{}],\n  \"stop_reason\": {},\n  \"cycles\": {},\n  \"error\": {}\n}}\n",
         json_string(&profile.profile),
         json_string(&profile.fixture_id),
         profile
@@ -1745,6 +1823,17 @@ fn write_i2c_profile_report(
             .unwrap_or_else(|| "null".to_string()),
         addresses,
         json_string(model_scope),
+        observation.address_phases,
+        observation.address_acks,
+        observation.address_nacks,
+        observation.unknown_addresses,
+        observation.write_bytes,
+        observation.read_bytes,
+        observation.stop_count,
+        observation.data_nacks,
+        observation.protocol_errors,
+        json_string(&observation.transaction_digest_sha256),
+        child_json,
         json_string(status),
         json_string(verdict.status.as_str()),
         reasons,
@@ -5009,7 +5098,7 @@ fn run() -> Result<Verdict, String> {
         kbd
     });
 
-    let mut i2c_profile_runtime = match args.i2c_profile.as_deref() {
+    let i2c_profile_runtime = match args.i2c_profile.as_deref() {
         Some(profile) => Some(build_i2c_profile(
             profile,
             args.i2c_fixture.as_deref(),
@@ -5017,9 +5106,11 @@ fn run() -> Result<Verdict, String> {
         )?),
         None => None,
     };
-    let i2c_profile_device = i2c_profile_runtime
-        .as_mut()
-        .and_then(|runtime| runtime.mux.take());
+    let i2c_profile_device = i2c_profile_runtime.as_ref().map(|runtime| {
+        Box::new(SharedI2cBusMux {
+            inner: Arc::clone(&runtime.mux),
+        }) as Box<dyn I2cExternalDevice>
+    });
 
     // The BSP mounts but does not format (FF_USE_MKFS=0), so the card
     // constructor supplies the selected pre-formatted volume. FAT32 is
@@ -5381,6 +5472,10 @@ fn run() -> Result<Verdict, String> {
     apply_audio_sink_expectation(&mut verdict, audio_sink_report.as_ref());
     #[cfg(feature = "sd-gen1-multiblock")]
     apply_sd_protocol_errors(&mut verdict, sd_report.as_ref());
+    if let Some(runtime) = &i2c_profile_runtime {
+        let observation = runtime.observation();
+        apply_i2c_protocol_errors(&mut verdict, &observation);
+    }
     if let (Some(runtime), Some(path)) = (&i2c_profile_runtime, args.i2c_report.as_deref()) {
         write_i2c_profile_report(path, runtime, &outcome, &verdict)?;
     }
@@ -5501,7 +5596,7 @@ mod tests {
                 picocalc_board::AT24C32_ADDRESS
             ]
         );
-        assert!(profile.mux.is_some());
+        assert_eq!(profile.observation().protocol_errors, 0);
     }
 
     #[test]
@@ -5553,7 +5648,7 @@ mod tests {
                 picocalc_board::BMP280_ADDRESS,
             ]
         );
-        assert!(profile.mux.is_some());
+        assert_eq!(profile.observation().protocol_errors, 0);
     }
 
     #[cfg(feature = "behavior-trace")]

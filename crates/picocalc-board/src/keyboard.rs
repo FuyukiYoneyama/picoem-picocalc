@@ -788,6 +788,27 @@ impl KeyboardWire {
 }
 
 impl rp2040_emu::peripherals::i2c::I2cExternalDevice for KeyboardWire {
+    fn model_name(&self) -> &'static str {
+        "picocalc-keyboard"
+    }
+
+    fn protocol_error_count(&self) -> u64 {
+        let keyboard = self.inner.lock().expect("keyboard mutex");
+        keyboard.unknown_reg_selects + keyboard.unknown_reg_writes
+    }
+
+    fn state_summary(&self) -> String {
+        let keyboard = self.inner.lock().expect("keyboard mutex");
+        format!(
+            "{{\"queued\":{},\"delivered\":{},\"dropped\":{},\"unknown_reg_selects\":{},\"unknown_reg_writes\":{}}}",
+            keyboard.queued(),
+            keyboard.key_events_delivered,
+            keyboard.key_events_dropped,
+            keyboard.unknown_reg_selects,
+            keyboard.unknown_reg_writes,
+        )
+    }
+
     fn responds_to(&self, addr: u16) -> bool {
         self.inner.lock().expect("keyboard mutex").responds_to(addr)
     }

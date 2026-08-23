@@ -11,6 +11,8 @@ use std::fmt;
 
 use rp2040_emu::peripherals::i2c::{I2cExternalDevice, I2cVirtualTimeDelta};
 
+use crate::sha256::StreamingSha256;
+
 /// Configuration errors caught before a profile is attached to the emulator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum I2cBusMuxError {
@@ -36,12 +38,67 @@ impl std::error::Error for I2cBusMuxError {}
 struct Child {
     address: u16,
     device: Box<dyn I2cExternalDevice>,
+    observation: ChildObservation,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChildObservation {
+    address_phases: u64,
+    address_acks: u64,
+    address_nacks: u64,
+    write_bytes: u64,
+    read_bytes: u64,
+    stop_count: u64,
+    data_nacks: u64,
+}
+
+/// Per-device wire counters and final model state for an optional I2C
+/// profile. This is emitted only in the profile sidecar; it is not part of
+/// the primary firmware report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct I2cChildObservation {
+    pub address: u16,
+    pub model: String,
+    pub address_phases: u64,
+    pub address_acks: u64,
+    pub address_nacks: u64,
+    pub write_bytes: u64,
+    pub read_bytes: u64,
+    pub stop_count: u64,
+    pub data_nacks: u64,
+    pub protocol_errors: u64,
+    pub state_summary: String,
+}
+
+/// Deterministic wire observation for one explicitly selected I2C profile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct I2cBusObservation {
+    pub address_phases: u64,
+    pub address_acks: u64,
+    pub address_nacks: u64,
+    pub unknown_addresses: u64,
+    pub write_bytes: u64,
+    pub read_bytes: u64,
+    pub stop_count: u64,
+    pub data_nacks: u64,
+    pub protocol_errors: u64,
+    pub transaction_digest_sha256: String,
+    pub children: Vec<I2cChildObservation>,
 }
 
 /// Deterministic address router for an explicitly selected I2C profile.
 pub struct I2cBusMux {
     children: Vec<Child>,
     active: Option<usize>,
+    address_phases: u64,
+    address_acks: u64,
+    address_nacks: u64,
+    unknown_addresses: u64,
+    write_bytes: u64,
+    read_bytes: u64,
+    stop_count: u64,
+    data_nacks: u64,
+    transaction_digest: StreamingSha256,
 }
 
 impl I2cBusMux {
@@ -49,7 +106,26 @@ impl I2cBusMux {
         Self {
             children: Vec::new(),
             active: None,
+            address_phases: 0,
+            address_acks: 0,
+            address_nacks: 0,
+            unknown_addresses: 0,
+            write_bytes: 0,
+            read_bytes: 0,
+            stop_count: 0,
+            data_nacks: 0,
+            transaction_digest: StreamingSha256::new(),
         }
+    }
+
+    fn digest_event(&mut self, kind: u8, address: u16, value: u8, ack: bool) {
+        self.transaction_digest.update(&[
+            kind,
+            (address >> 8) as u8,
+            address as u8,
+            value,
+            u8::from(ack),
+        ]);
     }
 
     /// Add one child at its declared 7-bit address.
@@ -64,7 +140,11 @@ impl I2cBusMux {
         if self.children.iter().any(|child| child.address == address) {
             return Err(I2cBusMuxError::DuplicateAddress(address));
         }
-        self.children.push(Child { address, device });
+        self.children.push(Child {
+            address,
+            device,
+            observation: ChildObservation::default(),
+        });
         Ok(())
     }
 
@@ -78,6 +158,46 @@ impl I2cBusMux {
 
     pub fn addresses(&self) -> impl Iterator<Item = u16> + '_ {
         self.children.iter().map(|child| child.address)
+    }
+
+    /// Return deterministic transaction counters, a streaming wire digest,
+    /// and final state summaries for all attached children.
+    pub fn observation(&self) -> I2cBusObservation {
+        let mut protocol_errors = 0;
+        let children = self
+            .children
+            .iter()
+            .map(|child| {
+                let child_errors = child.device.protocol_error_count();
+                protocol_errors += child_errors;
+                I2cChildObservation {
+                    address: child.address,
+                    model: child.device.model_name().to_string(),
+                    address_phases: child.observation.address_phases,
+                    address_acks: child.observation.address_acks,
+                    address_nacks: child.observation.address_nacks,
+                    write_bytes: child.observation.write_bytes,
+                    read_bytes: child.observation.read_bytes,
+                    stop_count: child.observation.stop_count,
+                    data_nacks: child.observation.data_nacks,
+                    protocol_errors: child_errors,
+                    state_summary: child.device.state_summary(),
+                }
+            })
+            .collect();
+        I2cBusObservation {
+            address_phases: self.address_phases,
+            address_acks: self.address_acks,
+            address_nacks: self.address_nacks,
+            unknown_addresses: self.unknown_addresses,
+            write_bytes: self.write_bytes,
+            read_bytes: self.read_bytes,
+            stop_count: self.stop_count,
+            data_nacks: self.data_nacks,
+            protocol_errors,
+            transaction_digest_sha256: self.transaction_digest.finalize_hex(),
+            children,
+        }
     }
 }
 
@@ -95,7 +215,11 @@ impl I2cExternalDevice for I2cBusMux {
     }
 
     fn address_phase(&mut self, addr: u16) -> bool {
+        self.address_phases = self.address_phases.wrapping_add(1);
         let Some(index) = self.children.iter().position(|child| child.address == addr) else {
+            self.address_nacks = self.address_nacks.wrapping_add(1);
+            self.unknown_addresses = self.unknown_addresses.wrapping_add(1);
+            self.digest_event(b'A', addr, 0, false);
             return false;
         };
 
@@ -103,31 +227,84 @@ impl I2cExternalDevice for I2cBusMux {
         // for the same target. A different target is selected by STOP,
         // disable, IC_TAR, enable, then a new address phase.
         if self.active.is_some_and(|active| active != index) {
+            self.address_nacks = self.address_nacks.wrapping_add(1);
+            self.children[index].observation.address_nacks = self.children[index]
+                .observation
+                .address_nacks
+                .wrapping_add(1);
+            self.digest_event(b'A', addr, 0, false);
             return false;
         }
-        if self.children[index].device.address_phase(addr) {
+        let ack = self.children[index].device.address_phase(addr);
+        self.digest_event(b'A', addr, 0, ack);
+        if ack {
+            self.address_acks = self.address_acks.wrapping_add(1);
+            self.children[index].observation.address_phases = self.children[index]
+                .observation
+                .address_phases
+                .wrapping_add(1);
+            self.children[index].observation.address_acks = self.children[index]
+                .observation
+                .address_acks
+                .wrapping_add(1);
             self.active = Some(index);
             true
         } else {
+            self.address_nacks = self.address_nacks.wrapping_add(1);
+            self.children[index].observation.address_phases = self.children[index]
+                .observation
+                .address_phases
+                .wrapping_add(1);
+            self.children[index].observation.address_nacks = self.children[index]
+                .observation
+                .address_nacks
+                .wrapping_add(1);
             false
         }
     }
 
     fn write_byte(&mut self, byte: u8) -> bool {
-        self.active
-            .and_then(|index| self.children.get_mut(index))
-            .is_some_and(|child| child.device.write_byte(byte))
+        let Some(index) = self.active else {
+            self.data_nacks = self.data_nacks.wrapping_add(1);
+            return false;
+        };
+        let address = self.children[index].address;
+        let ack = self.children[index].device.write_byte(byte);
+        self.write_bytes = self.write_bytes.wrapping_add(1);
+        self.children[index].observation.write_bytes =
+            self.children[index].observation.write_bytes.wrapping_add(1);
+        if !ack {
+            self.data_nacks = self.data_nacks.wrapping_add(1);
+            self.children[index].observation.data_nacks =
+                self.children[index].observation.data_nacks.wrapping_add(1);
+        }
+        self.digest_event(b'W', address, byte, ack);
+        ack
     }
 
     fn read_byte(&mut self) -> u8 {
-        self.active
-            .and_then(|index| self.children.get_mut(index))
-            .map_or(0xFF, |child| child.device.read_byte())
+        let Some(index) = self.active else {
+            self.read_bytes = self.read_bytes.wrapping_add(1);
+            self.digest_event(b'R', 0, 0xff, false);
+            return 0xFF;
+        };
+        let address = self.children[index].address;
+        let byte = self.children[index].device.read_byte();
+        self.read_bytes = self.read_bytes.wrapping_add(1);
+        self.children[index].observation.read_bytes =
+            self.children[index].observation.read_bytes.wrapping_add(1);
+        self.digest_event(b'R', address, byte, true);
+        byte
     }
 
     fn transaction_end(&mut self) {
         if let Some(index) = self.active.take() {
+            let address = self.children[index].address;
             self.children[index].device.transaction_end();
+            self.children[index].observation.stop_count =
+                self.children[index].observation.stop_count.wrapping_add(1);
+            self.stop_count = self.stop_count.wrapping_add(1);
+            self.digest_event(b'S', address, 0, true);
         }
     }
 
@@ -314,5 +491,40 @@ mod tests {
         mux.advance_virtual_time(I2cVirtualTimeDelta { nanoseconds: 123 });
         assert_eq!(first.lock().unwrap().advances, vec![123]);
         assert_eq!(second.lock().unwrap().advances, vec![123]);
+    }
+
+    #[test]
+    fn observation_is_deterministic_and_counts_wire_events() {
+        let first = Arc::new(Mutex::new(Probe {
+            address: 0x38,
+            ..Default::default()
+        }));
+        let mut mux = I2cBusMux::new();
+        mux.add_device(0x38, Box::new(ProbeWire(first.clone())))
+            .unwrap();
+
+        assert!(mux.address_phase(0x38));
+        assert!(mux.write_byte(0xaa));
+        assert_eq!(mux.read_byte(), 0);
+        mux.transaction_end();
+        assert!(!mux.address_phase(0x39));
+
+        let observation = mux.observation();
+        assert_eq!(observation.address_phases, 2);
+        assert_eq!(observation.address_acks, 1);
+        assert_eq!(observation.address_nacks, 1);
+        assert_eq!(observation.unknown_addresses, 1);
+        assert_eq!(observation.write_bytes, 1);
+        assert_eq!(observation.read_bytes, 1);
+        assert_eq!(observation.stop_count, 1);
+        assert_eq!(observation.data_nacks, 0);
+        assert_eq!(observation.children[0].address, 0x38);
+        assert_eq!(observation.children[0].write_bytes, 1);
+        assert_eq!(observation.children[0].read_bytes, 1);
+        assert_eq!(observation.children[0].stop_count, 1);
+        assert_eq!(observation.transaction_digest_sha256.len(), 64);
+
+        let again = mux.observation();
+        assert_eq!(observation, again);
     }
 }

@@ -227,6 +227,29 @@ impl Ds3231 {
 }
 
 impl I2cExternalDevice for Ds3231 {
+    fn model_name(&self) -> &'static str {
+        "ds3231"
+    }
+
+    fn protocol_error_count(&self) -> u64 {
+        self.protocol_errors
+    }
+
+    fn state_summary(&self) -> String {
+        format!(
+            "{{\"datetime\":\"{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z\",\"day_of_week\":{},\"status\":{},\"pointer\":{}}}",
+            self.datetime.year,
+            self.datetime.month,
+            self.datetime.day,
+            self.datetime.hour,
+            self.datetime.minute,
+            self.datetime.second,
+            self.datetime.day_of_week,
+            self.status,
+            self.pointer,
+        )
+    }
+
     fn responds_to(&self, addr: u16) -> bool {
         addr == DS3231_ADDRESS
     }
@@ -335,6 +358,24 @@ impl At24c32 {
 }
 
 impl I2cExternalDevice for At24c32 {
+    fn model_name(&self) -> &'static str {
+        "at24c32"
+    }
+
+    fn protocol_error_count(&self) -> u64 {
+        self.protocol_errors
+    }
+
+    fn state_summary(&self) -> String {
+        format!(
+            "{{\"image_sha256\":\"{}\",\"pointer\":{},\"busy\":{},\"busy_ns\":{}}}",
+            crate::sha256::sha256_hex(&self.memory),
+            self.pointer,
+            self.is_busy(),
+            self.busy_ns,
+        )
+    }
+
     fn responds_to(&self, addr: u16) -> bool {
         addr == AT24C32_ADDRESS
     }
@@ -480,6 +521,24 @@ impl Aht20 {
 }
 
 impl I2cExternalDevice for Aht20 {
+    fn model_name(&self) -> &'static str {
+        "aht20"
+    }
+
+    fn protocol_error_count(&self) -> u64 {
+        self.protocol_errors
+    }
+
+    fn state_summary(&self) -> String {
+        format!(
+            "{{\"status\":{},\"busy\":{},\"conversion_ns\":{},\"measurement_sha256\":\"{}\"}}",
+            self.current_status(),
+            self.is_busy(),
+            self.conversion_ns,
+            crate::sha256::sha256_hex(&self.measurement),
+        )
+    }
+
     fn responds_to(&self, addr: u16) -> bool {
         addr == AHT20_ADDRESS
     }
@@ -619,6 +678,25 @@ impl Bmp280 {
 }
 
 impl I2cExternalDevice for Bmp280 {
+    fn model_name(&self) -> &'static str {
+        "bmp280"
+    }
+
+    fn protocol_error_count(&self) -> u64 {
+        self.protocol_errors
+    }
+
+    fn state_summary(&self) -> String {
+        format!(
+            "{{\"chip_id\":88,\"pointer\":{},\"busy\":{},\"conversion_ns\":{},\"calibration_sha256\":\"{}\",\"measurement_sha256\":\"{}\"}}",
+            self.pointer,
+            self.is_busy(),
+            self.conversion_ns,
+            crate::sha256::sha256_hex(&self.calibration),
+            crate::sha256::sha256_hex(&self.measurement),
+        )
+    }
+
     fn responds_to(&self, addr: u16) -> bool {
         addr == BMP280_ADDRESS
     }
