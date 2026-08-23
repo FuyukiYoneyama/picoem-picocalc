@@ -373,7 +373,9 @@ mod tests {
         let _ = w.transfer(0xFF, 8);
         let _ = drain_block(&mut w);
         send_frame(&mut w, 12, 0);
-        let _ = (0..8).map(|_| w.transfer(0xFF, 8) as u8).collect::<Vec<_>>();
+        let _ = (0..8)
+            .map(|_| w.transfer(0xFF, 8) as u8)
+            .collect::<Vec<_>>();
         w.observe_pins(1 << SD_PIN_CS);
 
         let snapshot = card.lock().unwrap().trace_snapshot().unwrap();
@@ -400,9 +402,13 @@ mod tests {
     fn synthetic_cmd23_cmd25_writes_two_blocks_with_busy_between_them() {
         let (mut w, card) = wire();
         send_frame(&mut w, 23, 2);
-        let _ = (0..8).map(|_| w.transfer(0xFF, 8) as u8).collect::<Vec<_>>();
+        let _ = (0..8)
+            .map(|_| w.transfer(0xFF, 8) as u8)
+            .collect::<Vec<_>>();
         send_frame(&mut w, 25, 3);
-        let _ = (0..8).map(|_| w.transfer(0xFF, 8) as u8).collect::<Vec<_>>();
+        let _ = (0..8)
+            .map(|_| w.transfer(0xFF, 8) as u8)
+            .collect::<Vec<_>>();
 
         write_multi_block(&mut w, 3, 0xA5);
         write_multi_block(&mut w, 4, 0x5A);
@@ -414,9 +420,11 @@ mod tests {
         // backing/COW boundary as CMD24.
         send_frame(&mut w, 17, 3);
         let data = drain_block(&mut w);
-        assert!(data[..crate::sdcard::BLOCK_SIZE]
-            .iter()
-            .all(|byte| *byte == 0xA5));
+        assert!(
+            data[..crate::sdcard::BLOCK_SIZE]
+                .iter()
+                .all(|byte| *byte == 0xA5)
+        );
     }
 
     #[cfg(feature = "sd-gen1-multiblock")]
@@ -428,23 +436,27 @@ mod tests {
         send_frame(&mut w, 18, 64);
         let reply: Vec<_> = (0..16).map(|_| w.transfer(0xFF, 8) as u8).collect();
         assert!(!reply.contains(&0xFE));
-        assert!(card
-            .lock()
-            .unwrap()
-            .protocol_errors
-            .iter()
-            .any(|error| error == "multi_read_block_out_of_range_64"));
+        assert!(
+            card.lock()
+                .unwrap()
+                .protocol_errors
+                .iter()
+                .any(|error| error == "multi_read_block_out_of_range_64")
+        );
 
         // A single-block token is not silently accepted for CMD25.
         send_frame(&mut w, 25, 3);
-        let _ = (0..8).map(|_| w.transfer(0xFF, 8) as u8).collect::<Vec<_>>();
+        let _ = (0..8)
+            .map(|_| w.transfer(0xFF, 8) as u8)
+            .collect::<Vec<_>>();
         assert_eq!(w.transfer(0xFE, 8) as u8, 0xFF);
-        assert!(card
-            .lock()
-            .unwrap()
-            .protocol_errors
-            .iter()
-            .any(|error| error == "multi_write_expected_fc_or_fd_got_fe"));
+        assert!(
+            card.lock()
+                .unwrap()
+                .protocol_errors
+                .iter()
+                .any(|error| error == "multi_write_expected_fc_or_fd_got_fe")
+        );
     }
 
     #[cfg(feature = "sd-gen1-multiblock")]

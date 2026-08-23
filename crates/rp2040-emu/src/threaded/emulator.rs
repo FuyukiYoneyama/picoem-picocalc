@@ -121,6 +121,11 @@ impl ThreadedEmulator {
             threaded: _,
             panic_info: _,
             timeout_info: _,
+            // Watchdog warm-reset bookkeeping belongs to the Serial
+            // runner handoff; the threaded path cannot preserve or emit
+            // the reset event, so discard it explicitly here.
+            watchdog_reset_count: _,
+            watchdog_reset_event: _,
             #[cfg(feature = "testing")]
                 pending_panic_inject: _,
             bus_is_placeholder: _,

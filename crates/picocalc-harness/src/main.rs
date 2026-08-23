@@ -1548,7 +1548,9 @@ impl MachineSession {
             Some(BootMode::Boot2FromFlash) => self
                 .emu
                 .boot2_from_flash(RP2040_SRAM_TOP, 0)
-                .map_err(|error| format!("re-entering flash boot2 after watchdog reset: {error}"))?,
+                .map_err(|error| {
+                    format!("re-entering flash boot2 after watchdog reset: {error}")
+                })?,
             Some(BootMode::DirectBootFromFlash) => {
                 self.emu.direct_boot_from_flash(SDK_VTOR_FLASH_OFFSET);
             }
