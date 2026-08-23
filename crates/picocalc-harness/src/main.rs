@@ -39,9 +39,9 @@ use std::time::{Duration, Instant};
 
 use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{
-    At24c32, Ds3231, Framebuffer, I2cBusMux, KeyEvent, KeyState, Keyboard, KeyboardWire,
-    LcdPioWire, RtcDateTime, SdCard, SdCardWire, SdFormat, SdTraceData, SdTraceDirection,
-    SdTraceEvent, SdTraceSnapshot, St7365p, St7365pWire, pins,
+    Aht20, At24c32, Bmp280, Ds3231, Framebuffer, I2cBusMux, KeyEvent, KeyState, Keyboard,
+    KeyboardWire, LcdPioWire, RtcDateTime, SdCard, SdCardWire, SdFormat, SdTraceData,
+    SdTraceDirection, SdTraceEvent, SdTraceSnapshot, St7365p, St7365pWire, pins,
 };
 use rp2040_emu::peripherals::i2c::I2cExternalDevice;
 #[cfg(feature = "behavior-trace")]
@@ -566,7 +566,8 @@ fn print_usage() {
          -h, --help               This message."
     );
     eprintln!(
-        "         --i2c-profile <name>     Attach optional picocalc-rtc-v1 (DS3231 + AT24C32).\n\
+        "         --i2c-profile <name>     Attach optional picocalc-rtc-v1 (DS3231 + AT24C32)\n\
+                                  or picocalc-rtc-env-v1 (+ AHT20 + BMP280).\n\
          --i2c-fixture <path>     Deterministic fixture JSON; defaults to a built-in fixture.\n\
          --i2c-report <path>      Required sidecar report path when --i2c-profile is used."
     );
@@ -1340,6 +1341,30 @@ fn parse_fixture_registers(
     Ok(image)
 }
 
+fn parse_fixture_bytes<const N: usize>(
+    state: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &str,
+) -> Result<[u8; N], String> {
+    let raw = fixture_string(state, key, path)?;
+    let compact = raw
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace() && *character != '-')
+        .collect::<String>();
+    if compact.len() != N * 2 {
+        return Err(format!(
+            "{path}.{key} must contain exactly {N} hexadecimal bytes"
+        ));
+    }
+    let mut bytes = [0u8; N];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16).map_err(|_| {
+            format!("{path}.{key} contains a non-hexadecimal byte at index {index}")
+        })?;
+    }
+    Ok(bytes)
+}
+
 fn parse_fixture_datetime(raw: &str) -> Result<RtcDateTime, String> {
     if raw.len() != 20
         || raw.as_bytes().get(4) != Some(&b'-')
@@ -1399,19 +1424,31 @@ fn build_i2c_profile(
     fixture_path: Option<&Path>,
     keyboard: Option<Arc<Mutex<Keyboard>>>,
 ) -> Result<I2cProfileRuntime, String> {
-    if profile == "picocalc-rtc-env-v1" {
-        return Err(
-            "--i2c-profile picocalc-rtc-env-v1 is reserved for E3; AHT20/BMP280 models are not implemented yet"
-                .to_string(),
-        );
-    }
-    if profile != "picocalc-rtc-v1" {
+    if profile != "picocalc-rtc-v1" && profile != "picocalc-rtc-env-v1" {
         return Err(format!("unsupported I2C profile '{profile}'"));
     }
 
-    let (fixture_id, fixture_basename, fixture_sha256, datetime, osf, eeprom) = if let Some(path) =
-        fixture_path
-    {
+    // The values are deliberately ordinary, deterministic sensor samples;
+    // callers needing another environment provide a fixture instead.
+    let builtin_aht20 = [0x18, 0x80, 0x00, 0x06, 0x00, 0x00, 0x23];
+    let builtin_bmp280_calibration = [
+        0x70, 0x6b, 0x43, 0x67, 0x18, 0xfc, 0x7d, 0x8e, 0x43, 0xd6, 0xd0, 0x0b, 0x27, 0x0b, 0x8c,
+        0x00, 0xf9, 0xff, 0x8c, 0x3c, 0xf8, 0xc6, 0x70, 0x17,
+    ];
+    let builtin_bmp280_measurement = [0x65, 0x5a, 0xc0, 0x7e, 0xed, 0x00];
+    let (
+        fixture_id,
+        fixture_basename,
+        fixture_sha256,
+        datetime,
+        osf,
+        eeprom,
+        aht_measurement,
+        bmp_calibration,
+        bmp_measurement,
+        seen_aht20,
+        seen_bmp280,
+    ) = if let Some(path) = fixture_path {
         let bytes = std::fs::read(path)
             .map_err(|e| format!("reading I2C fixture {}: {e}", path.display()))?;
         let text = std::str::from_utf8(&bytes)
@@ -1469,6 +1506,11 @@ fn build_i2c_profile(
         let mut eeprom = [0u8; picocalc_board::AT24C32_SIZE];
         let mut seen_ds3231 = false;
         let mut seen_at24c32 = false;
+        let mut aht_measurement = builtin_aht20;
+        let mut bmp_calibration = builtin_bmp280_calibration;
+        let mut bmp_measurement = builtin_bmp280_measurement;
+        let mut seen_aht20 = false;
+        let mut seen_bmp280 = false;
         let mut seen_keyboard = false;
         for (index, device) in devices.iter().enumerate() {
             let path = format!("fixture.devices[{index}]");
@@ -1510,6 +1552,40 @@ fn build_i2c_profile(
                     eeprom = parse_fixture_registers(state, &format!("{path}.state"))?;
                     seen_at24c32 = true;
                 }
+                "aht20" => {
+                    if profile != "picocalc-rtc-env-v1"
+                        || address != u64::from(picocalc_board::AHT20_ADDRESS)
+                        || seen_aht20
+                    {
+                        return Err(format!(
+                            "{path} must be the unique AHT20 at 0x38 in picocalc-rtc-env-v1"
+                        ));
+                    }
+                    aht_measurement =
+                        parse_fixture_bytes(state, "measurement_bytes", &format!("{path}.state"))?;
+                    // Aht20::new performs the CRC check before the model is
+                    // attached, so malformed fixtures fail closed here.
+                    Aht20::new(aht_measurement)
+                        .map_err(|error| format!("{path}.state: {error}"))?;
+                    seen_aht20 = true;
+                }
+                "bmp280" => {
+                    if profile != "picocalc-rtc-env-v1"
+                        || address != u64::from(picocalc_board::BMP280_ADDRESS)
+                        || seen_bmp280
+                    {
+                        return Err(format!(
+                            "{path} must be the unique BMP280 at 0x77 in picocalc-rtc-env-v1"
+                        ));
+                    }
+                    bmp_calibration =
+                        parse_fixture_bytes(state, "calibration_bytes", &format!("{path}.state"))?;
+                    bmp_measurement =
+                        parse_fixture_bytes(state, "measurement_bytes", &format!("{path}.state"))?;
+                    Bmp280::new(bmp_calibration, bmp_measurement)
+                        .map_err(|error| format!("{path}.state: {error}"))?;
+                    seen_bmp280 = true;
+                }
                 "keyboard" => {
                     if address != u64::from(picocalc_board::keyboard::KEYBOARD_I2C_ADDR)
                         || seen_keyboard
@@ -1529,6 +1605,12 @@ fn build_i2c_profile(
         if !seen_at24c32 {
             return Err("fixture is missing at24c32".to_string());
         }
+        if profile == "picocalc-rtc-env-v1" && !seen_aht20 {
+            return Err("picocalc-rtc-env-v1 fixture is missing aht20".to_string());
+        }
+        if profile == "picocalc-rtc-env-v1" && !seen_bmp280 {
+            return Err("picocalc-rtc-env-v1 fixture is missing bmp280".to_string());
+        }
         if seen_keyboard && keyboard.is_none() {
             return Err(
                 "fixture declares keyboard 0x1f; rerun with --keyboard to attach it".to_string(),
@@ -1541,15 +1623,25 @@ fn build_i2c_profile(
             datetime,
             osf,
             eeprom,
+            aht_measurement,
+            bmp_calibration,
+            bmp_measurement,
+            seen_aht20,
+            seen_bmp280,
         )
     } else {
         (
-            "builtin-picocalc-rtc-v1".to_string(),
+            format!("builtin-{profile}"),
             None,
             None,
             parse_fixture_datetime("2024-01-01T00:00:00Z")?,
             false,
             [0u8; picocalc_board::AT24C32_SIZE],
+            builtin_aht20,
+            builtin_bmp280_calibration,
+            builtin_bmp280_measurement,
+            profile == "picocalc-rtc-env-v1",
+            profile == "picocalc-rtc-env-v1",
         )
     };
 
@@ -1571,6 +1663,27 @@ fn build_i2c_profile(
         Box::new(At24c32::new(eeprom)),
     )
     .map_err(|e| format!("adding AT24C32 to I2C profile: {e}"))?;
+    if profile == "picocalc-rtc-env-v1" {
+        if !seen_aht20 || !seen_bmp280 {
+            return Err("picocalc-rtc-env-v1 requires AHT20 and BMP280".to_string());
+        }
+        mux.add_device(
+            picocalc_board::AHT20_ADDRESS,
+            Box::new(
+                Aht20::new(aht_measurement)
+                    .map_err(|error| format!("adding AHT20 to I2C profile: {error}"))?,
+            ),
+        )
+        .map_err(|e| format!("adding AHT20 to I2C profile: {e}"))?;
+        mux.add_device(
+            picocalc_board::BMP280_ADDRESS,
+            Box::new(
+                Bmp280::new(bmp_calibration, bmp_measurement)
+                    .map_err(|error| format!("adding BMP280 to I2C profile: {error}"))?,
+            ),
+        )
+        .map_err(|e| format!("adding BMP280 to I2C profile: {e}"))?;
+    }
     let attached_addresses = mux.addresses().collect();
 
     Ok(I2cProfileRuntime {
@@ -1611,8 +1724,13 @@ fn write_i2c_profile_report(
         .map(|reason| json_string(reason))
         .collect::<Vec<_>>()
         .join(", ");
+    let model_scope = if profile.profile == "picocalc-rtc-env-v1" {
+        "E3-AHT20-BMP280-profile-attach"
+    } else {
+        "E2-DS3231-AT24C32-profile-attach"
+    };
     let report = format!(
-        "{{\n  \"schema_version\": 1,\n  \"profile\": {},\n  \"fixture\": {{\"id\": {}, \"basename\": {}, \"sha256\": {}}},\n  \"bus\": {{\"controller\": \"i2c1\", \"sda_gpio\": 6, \"scl_gpio\": 7, \"address_bits\": 7}},\n  \"attached_addresses\": [{}],\n  \"model_scope\": \"E2-DS3231-AT24C32-profile-attach\",\n  \"status\": {},\n  \"verdict_status\": {},\n  \"verdict_reasons\": [{}],\n  \"stop_reason\": {},\n  \"cycles\": {},\n  \"error\": {}\n}}\n",
+        "{{\n  \"schema_version\": 1,\n  \"profile\": {},\n  \"fixture\": {{\"id\": {}, \"basename\": {}, \"sha256\": {}}},\n  \"bus\": {{\"controller\": \"i2c1\", \"sda_gpio\": 6, \"scl_gpio\": 7, \"address_bits\": 7}},\n  \"attached_addresses\": [{}],\n  \"model_scope\": {},\n  \"status\": {},\n  \"verdict_status\": {},\n  \"verdict_reasons\": [{}],\n  \"stop_reason\": {},\n  \"cycles\": {},\n  \"error\": {}\n}}\n",
         json_string(&profile.profile),
         json_string(&profile.fixture_id),
         profile
@@ -1626,6 +1744,7 @@ fn write_i2c_profile_report(
             .map(json_string)
             .unwrap_or_else(|| "null".to_string()),
         addresses,
+        json_string(model_scope),
         json_string(status),
         json_string(verdict.status.as_str()),
         reasons,
@@ -5422,11 +5541,19 @@ mod tests {
     }
 
     #[test]
-    fn i2c_environment_profile_is_rejected_until_e3() {
-        let error = build_i2c_profile("picocalc-rtc-env-v1", None, None)
-            .err()
-            .expect("environment profile must be rejected before E3");
-        assert!(error.contains("reserved for E3"));
+    fn i2c_environment_profile_builtin_attaches_both_sensors() {
+        let profile = build_i2c_profile("picocalc-rtc-env-v1", None, None).unwrap();
+        assert_eq!(profile.fixture_id, "builtin-picocalc-rtc-env-v1");
+        assert_eq!(
+            profile.attached_addresses,
+            vec![
+                picocalc_board::DS3231_ADDRESS,
+                picocalc_board::AT24C32_ADDRESS,
+                picocalc_board::AHT20_ADDRESS,
+                picocalc_board::BMP280_ADDRESS,
+            ]
+        );
+        assert!(profile.mux.is_some());
     }
 
     #[cfg(feature = "behavior-trace")]

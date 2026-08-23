@@ -40,7 +40,8 @@ pub mod wire;
 
 pub use framebuffer::{Framebuffer, PngError};
 pub use i2c_devices::{
-    AT24C32_ADDRESS, AT24C32_SIZE, At24c32, DS3231_ADDRESS, Ds3231, RtcDateTime,
+    AHT20_ADDRESS, AT24C32_ADDRESS, AT24C32_SIZE, Aht20, At24c32, BMP280_ADDRESS, Bmp280,
+    DS3231_ADDRESS, Ds3231, RtcDateTime,
 };
 pub use i2c_external::{I2cBusMux, I2cBusMuxError, I2cExternalDeviceStub};
 pub use keyboard::{KeyEvent, KeyState, Keyboard, KeyboardWire};
