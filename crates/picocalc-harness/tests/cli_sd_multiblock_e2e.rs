@@ -254,9 +254,8 @@ fn temp_dir() -> PathBuf {
     path
 }
 
-#[test]
-fn default_runtime_executes_multiblock_read_write_and_readback_without_protocol_errors() {
-    let directory = temp_dir();
+fn run_fixture(directory: &Path) -> (Value, Value, Vec<u8>) {
+    fs::create_dir_all(directory).expect("create isolated CLI run directory");
     let firmware = directory.join("sd-multiblock-fixture.bin");
     let input_image = directory.join("input.img");
     let output_image = directory.join("output.img");
@@ -317,6 +316,50 @@ fn default_runtime_executes_multiblock_read_write_and_readback_without_protocol_
     assert_eq!(trace["schema_version"], 1);
     assert!(trace["event_count"].as_u64().unwrap_or(0) >= 4);
     assert!(!trace["digest_sha256"].as_str().unwrap_or("").is_empty());
+
+    (report, trace, exported)
+}
+
+fn stable_report_projection(report: &Value) -> Value {
+    serde_json::json!({
+        "backend_build": report["backend_build"],
+        "firmware": report["firmware"],
+        "cycles": report["cycles"],
+        "stop_reason": report["stop_reason"],
+        "verdict": report["verdict"],
+        "sd": report["sd"],
+        "uart": report["uart"],
+    })
+}
+
+#[test]
+fn default_runtime_executes_multiblock_read_write_and_readback_without_protocol_errors() {
+    let directory = temp_dir();
+    let mut baseline_projection = None;
+    let mut baseline_trace = None;
+    let mut baseline_export = None;
+
+    for iteration in 0..3 {
+        let run_directory = directory.join(format!("run-{iteration}"));
+        let (report, trace, exported) = run_fixture(&run_directory);
+        let projection = stable_report_projection(&report);
+
+        if let Some(expected) = baseline_projection.as_ref() {
+            assert_eq!(expected, &projection, "stable report projection changed");
+        } else {
+            baseline_projection = Some(projection);
+        }
+        if let Some(expected) = baseline_trace.as_ref() {
+            assert_eq!(expected, &trace, "structured SD trace changed");
+        } else {
+            baseline_trace = Some(trace);
+        }
+        if let Some(expected) = baseline_export.as_ref() {
+            assert_eq!(expected, &exported, "exported SD image changed");
+        } else {
+            baseline_export = Some(exported);
+        }
+    }
 
     if std::env::var_os("PICOCALC_P4_KEEP").is_none() {
         let _ = fs::remove_dir_all(directory);
