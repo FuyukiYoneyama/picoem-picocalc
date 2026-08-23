@@ -4,7 +4,9 @@
 //! configures SPI0 and the real PicoCalc SD chip-select pin, performs a
 //! CMD18 two-block read followed by CMD12 while CS remains asserted, then
 //! performs a CMD23/CMD25 one-block write and CMD17 readback before emitting
-//! a UART marker.  The test therefore exercises the complete path (CPU ->
+//! a UART marker.  The test repeats the complete path three times and checks
+//! the stable report projection, trace, and exported image.  It therefore
+//! exercises the complete path (CPU ->
 //! SIO/SPI0 -> `SdCardWire` -> default `SdCard` feature) rather than calling
 //! the card state machine directly.
 
