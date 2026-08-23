@@ -39,10 +39,11 @@ use std::time::{Duration, Instant};
 
 use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{
-    Framebuffer, KeyEvent, KeyState, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire,
-    SdFormat, SdTraceData, SdTraceDirection, SdTraceEvent, SdTraceSnapshot, St7365p, St7365pWire,
-    pins,
+    At24c32, Ds3231, Framebuffer, I2cBusMux, KeyEvent, KeyState, Keyboard, KeyboardWire,
+    LcdPioWire, RtcDateTime, SdCard, SdCardWire, SdFormat, SdTraceData, SdTraceDirection,
+    SdTraceEvent, SdTraceSnapshot, St7365p, St7365pWire, pins,
 };
+use rp2040_emu::peripherals::i2c::I2cExternalDevice;
 #[cfg(feature = "behavior-trace")]
 use rp2040_emu::{BehaviorEventDomain, BehaviorTraceSnapshot};
 use rp2040_emu::{Config, Emulator, EmulatorBuilder, RP2040_SRAM_TOP, WatchdogResetEvent};
@@ -265,6 +266,9 @@ struct Args {
     psram: bool,
     psram_verify_range: Option<(u32, u32)>,
     keyboard: bool,
+    i2c_profile: Option<String>,
+    i2c_fixture: Option<PathBuf>,
+    i2c_report: Option<PathBuf>,
     sd: bool,
     sd_image: Option<PathBuf>,
     sd_image_out: Option<PathBuf>,
@@ -561,6 +565,11 @@ fn print_usage() {
          --flash-image-out <path> Export the final 2 MiB XIP image after SSI erase/program.\n\\
          -h, --help               This message."
     );
+    eprintln!(
+        "         --i2c-profile <name>     Attach optional picocalc-rtc-v1 (DS3231 + AT24C32).\n\
+         --i2c-fixture <path>     Deterministic fixture JSON; defaults to a built-in fixture.\n\
+         --i2c-report <path>      Required sidecar report path when --i2c-profile is used."
+    );
     #[cfg(feature = "idle-profiler")]
     eprintln!(
         "         --idle-profile <path>   OPT0-A diagnostic JSON (not valid for wall-time measurement)."
@@ -612,6 +621,9 @@ fn parse_args() -> Result<Args, String> {
     let mut psram = false;
     let mut psram_verify_range: Option<(u32, u32)> = None;
     let mut keyboard = false;
+    let mut i2c_profile: Option<String> = None;
+    let mut i2c_fixture: Option<PathBuf> = None;
+    let mut i2c_report: Option<PathBuf> = None;
     let mut sd = false;
     let mut sd_image: Option<PathBuf> = None;
     let mut sd_image_out: Option<PathBuf> = None;
@@ -693,6 +705,24 @@ fn parse_args() -> Result<Args, String> {
             }
             "--psram" => psram = true,
             "--keyboard" => keyboard = true,
+            "--i2c-profile" => {
+                if i2c_profile.is_some() {
+                    return Err("--i2c-profile may be specified only once".to_string());
+                }
+                i2c_profile = Some(value("--i2c-profile")?);
+            }
+            "--i2c-fixture" => {
+                if i2c_fixture.is_some() {
+                    return Err("--i2c-fixture may be specified only once".to_string());
+                }
+                i2c_fixture = Some(PathBuf::from(value("--i2c-fixture")?));
+            }
+            "--i2c-report" => {
+                if i2c_report.is_some() {
+                    return Err("--i2c-report may be specified only once".to_string());
+                }
+                i2c_report = Some(PathBuf::from(value("--i2c-report")?));
+            }
             "--sd" => sd = true,
             "--sd-image" => sd_image = Some(PathBuf::from(value("--sd-image")?)),
             "--sd-image-out" => sd_image_out = Some(PathBuf::from(value("--sd-image-out")?)),
@@ -817,6 +847,21 @@ fn parse_args() -> Result<Args, String> {
     if psram_verify_range.is_some() && !psram {
         return Err("--psram-verify-range requires --psram".to_string());
     }
+    if let Some(profile) = i2c_profile.as_deref() {
+        if board != Board::PicoCalc {
+            return Err("--i2c-profile requires --board picocalc".to_string());
+        }
+        if profile != "picocalc-rtc-v1" && profile != "picocalc-rtc-env-v1" {
+            return Err(format!(
+                "unknown --i2c-profile '{profile}' (expected picocalc-rtc-v1|picocalc-rtc-env-v1)"
+            ));
+        }
+        if i2c_report.is_none() {
+            return Err("--i2c-profile requires --i2c-report".to_string());
+        }
+    } else if i2c_fixture.is_some() || i2c_report.is_some() {
+        return Err("--i2c-fixture and --i2c-report require --i2c-profile".to_string());
+    }
     validate_sd_selection(
         sd,
         sd_image.as_deref(),
@@ -884,6 +929,9 @@ fn parse_args() -> Result<Args, String> {
             (keys.is_some(), "--keys"),
             (sd_image_out.is_some(), "--sd-image-out"),
             (sd_trace.is_some(), "--sd-trace"),
+            (i2c_profile.is_some(), "--i2c-profile"),
+            (i2c_fixture.is_some(), "--i2c-fixture"),
+            (i2c_report.is_some(), "--i2c-report"),
             (run_id.is_some(), "--run-id"),
             (progress_interval.is_some(), "--progress-interval"),
         ];
@@ -946,6 +994,9 @@ fn parse_args() -> Result<Args, String> {
         psram,
         psram_verify_range,
         keyboard,
+        i2c_profile,
+        i2c_fixture,
+        i2c_report,
         sd,
         sd_image,
         sd_image_out,
@@ -1222,6 +1273,370 @@ fn load_image(path: &Path, what: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Runtime metadata for one explicitly selected optional I2C profile.
+struct I2cProfileRuntime {
+    profile: String,
+    fixture_id: String,
+    fixture_basename: Option<String>,
+    fixture_sha256: Option<String>,
+    attached_addresses: Vec<u16>,
+    mux: Option<Box<dyn I2cExternalDevice>>,
+}
+
+fn fixture_object<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    value
+        .as_object()
+        .ok_or_else(|| format!("{path} must be an object"))
+}
+
+fn fixture_u64(value: &serde_json::Value, path: &str) -> Result<u64, String> {
+    value
+        .as_u64()
+        .ok_or_else(|| format!("{path} must be an unsigned integer"))
+}
+
+fn fixture_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    path: &str,
+) -> Result<&'a str, String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{path}.{key} must be a string"))
+}
+
+fn parse_fixture_hex_byte(value: &serde_json::Value, path: &str) -> Result<u8, String> {
+    let number = fixture_u64(value, path)?;
+    u8::try_from(number).map_err(|_| format!("{path} must be in the range 0..=255"))
+}
+
+fn parse_fixture_registers(
+    state: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<[u8; picocalc_board::AT24C32_SIZE], String> {
+    let mut image = [0u8; picocalc_board::AT24C32_SIZE];
+    let Some(registers) = state.get("registers") else {
+        return Ok(image);
+    };
+    let registers = fixture_object(registers, &format!("{path}.registers"))?;
+    for (key, value) in registers {
+        let raw = key
+            .strip_prefix("0x")
+            .ok_or_else(|| format!("{path}.registers.{key} must use a 0x prefix"))?;
+        let address = u16::from_str_radix(raw, 16)
+            .map_err(|_| format!("{path}.registers.{key} is not hexadecimal"))?;
+        if usize::from(address) >= image.len() {
+            return Err(format!(
+                "{path}.registers.{key} is outside the AT24C32 image"
+            ));
+        }
+        image[usize::from(address)] =
+            parse_fixture_hex_byte(value, &format!("{path}.registers.{key}"))?;
+    }
+    Ok(image)
+}
+
+fn parse_fixture_datetime(raw: &str) -> Result<RtcDateTime, String> {
+    if raw.len() != 20
+        || raw.as_bytes().get(4) != Some(&b'-')
+        || raw.as_bytes().get(7) != Some(&b'-')
+        || raw.as_bytes().get(10) != Some(&b'T')
+        || raw.as_bytes().get(13) != Some(&b':')
+        || raw.as_bytes().get(16) != Some(&b':')
+        || raw.as_bytes().get(19) != Some(&b'Z')
+    {
+        return Err(format!(
+            "invalid DS3231 initial_datetime '{raw}' (expected YYYY-MM-DDTHH:MM:SSZ)"
+        ));
+    }
+    let parse = |range: std::ops::Range<usize>, name: &str| {
+        raw[range]
+            .parse::<u16>()
+            .map_err(|_| format!("invalid {name} in DS3231 initial_datetime '{raw}'"))
+    };
+    let year = parse(0..4, "year")?;
+    let month = u8::try_from(parse(5..7, "month")?)
+        .map_err(|_| "month is outside the u8 range".to_string())?;
+    let day = u8::try_from(parse(8..10, "day")?)
+        .map_err(|_| "day is outside the u8 range".to_string())?;
+    let hour = u8::try_from(parse(11..13, "hour")?)
+        .map_err(|_| "hour is outside the u8 range".to_string())?;
+    let minute = u8::try_from(parse(14..16, "minute")?)
+        .map_err(|_| "minute is outside the u8 range".to_string())?;
+    let second = u8::try_from(parse(17..19, "second")?)
+        .map_err(|_| "second is outside the u8 range".to_string())?;
+
+    // DS3231 uses 1=Sunday..7=Saturday.  Count from Saturday 2000-01-01.
+    let mut days = 0u64;
+    for y in 2000..year {
+        days += if (y % 400 == 0) || (y % 4 == 0 && y % 100 != 0) {
+            366
+        } else {
+            365
+        };
+    }
+    for m in 1..month {
+        days += match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if (year % 400 == 0) || (year % 4 == 0 && year % 100 != 0) => 29,
+            2 => 28,
+            _ => 0,
+        };
+    }
+    days += u64::from(day.saturating_sub(1));
+    let day_of_week = ((6 + days % 7) % 7 + 1) as u8;
+    RtcDateTime::new(year, month, day, day_of_week, hour, minute, second)
+        .ok_or_else(|| format!("invalid DS3231 initial_datetime '{raw}'"))
+}
+
+fn build_i2c_profile(
+    profile: &str,
+    fixture_path: Option<&Path>,
+    keyboard: Option<Arc<Mutex<Keyboard>>>,
+) -> Result<I2cProfileRuntime, String> {
+    if profile == "picocalc-rtc-env-v1" {
+        return Err(
+            "--i2c-profile picocalc-rtc-env-v1 is reserved for E3; AHT20/BMP280 models are not implemented yet"
+                .to_string(),
+        );
+    }
+    if profile != "picocalc-rtc-v1" {
+        return Err(format!("unsupported I2C profile '{profile}'"));
+    }
+
+    let (fixture_id, fixture_basename, fixture_sha256, datetime, osf, eeprom) = if let Some(path) =
+        fixture_path
+    {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("reading I2C fixture {}: {e}", path.display()))?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|e| format!("I2C fixture {} is not UTF-8: {e}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| format!("parsing I2C fixture {}: {e}", path.display()))?;
+        let root = fixture_object(&value, "fixture")?;
+        if fixture_u64(
+            root.get("schema_version")
+                .ok_or_else(|| "fixture.schema_version is required".to_string())?,
+            "fixture.schema_version",
+        )? != 1
+        {
+            return Err("fixture.schema_version must be 1".to_string());
+        }
+        let fixture_profile = fixture_string(root, "profile", "fixture")?;
+        if fixture_profile != profile {
+            return Err(format!(
+                "fixture.profile '{}' does not match --i2c-profile '{}'",
+                fixture_profile, profile
+            ));
+        }
+        let bus = fixture_object(
+            root.get("bus")
+                .ok_or_else(|| "fixture.bus is required".to_string())?,
+            "fixture.bus",
+        )?;
+        if fixture_string(bus, "controller", "fixture.bus")? != "i2c1"
+            || fixture_u64(
+                bus.get("sda_gpio")
+                    .ok_or_else(|| "fixture.bus.sda_gpio is required".to_string())?,
+                "fixture.bus.sda_gpio",
+            )? != 6
+            || fixture_u64(
+                bus.get("scl_gpio")
+                    .ok_or_else(|| "fixture.bus.scl_gpio is required".to_string())?,
+                "fixture.bus.scl_gpio",
+            )? != 7
+            || fixture_u64(
+                bus.get("address_bits")
+                    .ok_or_else(|| "fixture.bus.address_bits is required".to_string())?,
+                "fixture.bus.address_bits",
+            )? != 7
+        {
+            return Err(
+                "fixture.bus must describe i2c1 on GPIO6/GPIO7 with 7-bit addresses".to_string(),
+            );
+        }
+        let devices = root
+            .get("devices")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "fixture.devices must be an array".to_string())?;
+        let mut datetime = None;
+        let mut osf = false;
+        let mut eeprom = [0u8; picocalc_board::AT24C32_SIZE];
+        let mut seen_ds3231 = false;
+        let mut seen_at24c32 = false;
+        let mut seen_keyboard = false;
+        for (index, device) in devices.iter().enumerate() {
+            let path = format!("fixture.devices[{index}]");
+            let device = fixture_object(device, &path)?;
+            let kind = fixture_string(device, "kind", &path)?;
+            let address = fixture_u64(
+                device
+                    .get("address")
+                    .ok_or_else(|| format!("{path}.address is required"))?,
+                &format!("{path}.address"),
+            )?;
+            let state = fixture_object(
+                device
+                    .get("state")
+                    .ok_or_else(|| format!("{path}.state is required"))?,
+                &format!("{path}.state"),
+            )?;
+            if fixture_string(state, "encoding", &format!("{path}.state"))? != "register_bytes" {
+                return Err(format!("{path}.state.encoding must be register_bytes"));
+            }
+            match kind {
+                "ds3231" => {
+                    if address != u64::from(picocalc_board::DS3231_ADDRESS) || seen_ds3231 {
+                        return Err(format!("{path} must be the unique DS3231 at 0x68"));
+                    }
+                    let raw_datetime =
+                        fixture_string(state, "initial_datetime", &format!("{path}.state"))?;
+                    datetime = Some(parse_fixture_datetime(raw_datetime)?);
+                    osf = state
+                        .get("osf")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    seen_ds3231 = true;
+                }
+                "at24c32" => {
+                    if address != u64::from(picocalc_board::AT24C32_ADDRESS) || seen_at24c32 {
+                        return Err(format!("{path} must be the unique AT24C32 at 0x57"));
+                    }
+                    eeprom = parse_fixture_registers(state, &format!("{path}.state"))?;
+                    seen_at24c32 = true;
+                }
+                "keyboard" => {
+                    if address != u64::from(picocalc_board::keyboard::KEYBOARD_I2C_ADDR)
+                        || seen_keyboard
+                    {
+                        return Err(format!("{path} must use keyboard address 0x1f"));
+                    }
+                    seen_keyboard = true;
+                }
+                other => {
+                    return Err(format!(
+                        "{path}.kind '{other}' is not implemented by {profile}"
+                    ));
+                }
+            }
+        }
+        let datetime = datetime.ok_or_else(|| "fixture is missing ds3231".to_string())?;
+        if !seen_at24c32 {
+            return Err("fixture is missing at24c32".to_string());
+        }
+        if seen_keyboard && keyboard.is_none() {
+            return Err(
+                "fixture declares keyboard 0x1f; rerun with --keyboard to attach it".to_string(),
+            );
+        }
+        (
+            fixture_string(root, "fixture_id", "fixture")?.to_string(),
+            Some(basename(path)),
+            Some(sha256_hex(&bytes)),
+            datetime,
+            osf,
+            eeprom,
+        )
+    } else {
+        (
+            "builtin-picocalc-rtc-v1".to_string(),
+            None,
+            None,
+            parse_fixture_datetime("2024-01-01T00:00:00Z")?,
+            false,
+            [0u8; picocalc_board::AT24C32_SIZE],
+        )
+    };
+
+    let mut mux = I2cBusMux::new();
+    if let Some(keyboard) = keyboard {
+        mux.add_device(
+            picocalc_board::keyboard::KEYBOARD_I2C_ADDR,
+            Box::new(KeyboardWire::new(keyboard)),
+        )
+        .map_err(|e| format!("adding keyboard to I2C profile: {e}"))?;
+    }
+    mux.add_device(
+        picocalc_board::DS3231_ADDRESS,
+        Box::new(Ds3231::new(datetime, osf)),
+    )
+    .map_err(|e| format!("adding DS3231 to I2C profile: {e}"))?;
+    mux.add_device(
+        picocalc_board::AT24C32_ADDRESS,
+        Box::new(At24c32::new(eeprom)),
+    )
+    .map_err(|e| format!("adding AT24C32 to I2C profile: {e}"))?;
+    let attached_addresses = mux.addresses().collect();
+
+    Ok(I2cProfileRuntime {
+        profile: profile.to_string(),
+        fixture_id,
+        fixture_basename,
+        fixture_sha256,
+        attached_addresses,
+        mux: Some(Box::new(mux)),
+    })
+}
+
+fn write_i2c_profile_report(
+    path: &Path,
+    profile: &I2cProfileRuntime,
+    outcome: &RunOutcome,
+    verdict: &VerdictReport,
+) -> Result<(), String> {
+    let status = if verdict.status == Verdict::Pass {
+        "pass"
+    } else {
+        "fail"
+    };
+    let addresses = profile
+        .attached_addresses
+        .iter()
+        .map(|address| json_string(&format!("0x{address:02x}")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let error = outcome
+        .error
+        .as_deref()
+        .map(json_string)
+        .unwrap_or_else(|| "null".to_string());
+    let reasons = verdict
+        .reasons
+        .iter()
+        .map(|reason| json_string(reason))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let report = format!(
+        "{{\n  \"schema_version\": 1,\n  \"profile\": {},\n  \"fixture\": {{\"id\": {}, \"basename\": {}, \"sha256\": {}}},\n  \"bus\": {{\"controller\": \"i2c1\", \"sda_gpio\": 6, \"scl_gpio\": 7, \"address_bits\": 7}},\n  \"attached_addresses\": [{}],\n  \"model_scope\": \"E2-DS3231-AT24C32-profile-attach\",\n  \"status\": {},\n  \"verdict_status\": {},\n  \"verdict_reasons\": [{}],\n  \"stop_reason\": {},\n  \"cycles\": {},\n  \"error\": {}\n}}\n",
+        json_string(&profile.profile),
+        json_string(&profile.fixture_id),
+        profile
+            .fixture_basename
+            .as_deref()
+            .map(json_string)
+            .unwrap_or_else(|| "null".to_string()),
+        profile
+            .fixture_sha256
+            .as_deref()
+            .map(json_string)
+            .unwrap_or_else(|| "null".to_string()),
+        addresses,
+        json_string(status),
+        json_string(verdict.status.as_str()),
+        reasons,
+        json_string(outcome.stop_reason.as_str()),
+        outcome.cycles,
+        error,
+    );
+    std::fs::write(path, report.as_bytes())
+        .map_err(|e| format!("writing I2C profile report {}: {e}", path.display()))
+}
+
 /// How execution was started. Reported so a run can never be mistaken
 /// for a direct boot that did not happen.
 ///
@@ -1277,6 +1692,7 @@ fn boot(
     lcd_variant: LcdVariant,
     psram: bool,
     keyboard: Option<Arc<Mutex<Keyboard>>>,
+    i2c_profile_device: Option<Box<dyn I2cExternalDevice>>,
     sd: Option<Arc<Mutex<SdCard>>>,
 ) -> Result<(Emulator, BootMode, Option<Arc<Mutex<St7365p>>>), String> {
     if boot_request == BootRequest::Boot2 && firmware.len() < 256 {
@@ -1344,7 +1760,11 @@ fn boot(
 
     // The keyboard/power controller hangs off I2C1 regardless of the
     // display model, same as the real mainboard.
-    if let Some(kbd) = keyboard {
+    if let Some(profile) = i2c_profile_device {
+        emu.bus
+            .attach_i2c_device_exclusive(pins::KEYBOARD_I2C_INSTANCE, profile)
+            .map_err(|i| format!("no I2C instance {i} on RP2040"))?;
+    } else if let Some(kbd) = keyboard {
         emu.bus
             .attach_i2c_device(
                 pins::KEYBOARD_I2C_INSTANCE,
@@ -4470,6 +4890,18 @@ fn run() -> Result<Verdict, String> {
         kbd
     });
 
+    let mut i2c_profile_runtime = match args.i2c_profile.as_deref() {
+        Some(profile) => Some(build_i2c_profile(
+            profile,
+            args.i2c_fixture.as_deref(),
+            keyboard.clone(),
+        )?),
+        None => None,
+    };
+    let i2c_profile_device = i2c_profile_runtime
+        .as_mut()
+        .and_then(|runtime| runtime.mux.take());
+
     // The BSP mounts but does not format (FF_USE_MKFS=0), so the card
     // constructor supplies the selected pre-formatted volume. FAT32 is
     // the default; FAT16 is retained for compatibility targets.
@@ -4500,6 +4932,7 @@ fn run() -> Result<Verdict, String> {
         args.lcd_variant,
         args.psram,
         keyboard.clone(),
+        i2c_profile_device,
         sd_card.clone(),
     )?;
     emu.bus.unsupported_mmio_log_enabled = true;
@@ -4829,6 +5262,9 @@ fn run() -> Result<Verdict, String> {
     apply_audio_sink_expectation(&mut verdict, audio_sink_report.as_ref());
     #[cfg(feature = "sd-gen1-multiblock")]
     apply_sd_protocol_errors(&mut verdict, sd_report.as_ref());
+    if let (Some(runtime), Some(path)) = (&i2c_profile_runtime, args.i2c_report.as_deref()) {
+        write_i2c_profile_report(path, runtime, &outcome, &verdict)?;
+    }
 
     let report = build_report(
         backend_commit,
@@ -4919,9 +5355,10 @@ mod tests {
     use super::{
         AudioSinkReport, BoardHandles, BootMode, BootRequest, MachineApiState, MachineSession,
         RunOutcome, SdReport, StopReason, Verdict, apply_audio_sink_expectation,
-        boot_report_fragment, dispatch_machine_request, fatal_exception_name, json_escape,
-        judge_run, run_loop, sd_trace_json, snapshot_machine, validate_backend_identity,
-        validate_progress_interval, validate_run_id, validate_sd_selection, write_audio_wav,
+        boot_report_fragment, build_i2c_profile, dispatch_machine_request, fatal_exception_name,
+        json_escape, judge_run, run_loop, sd_trace_json, sha256_hex, snapshot_machine,
+        validate_backend_identity, validate_progress_interval, validate_run_id,
+        validate_sd_selection, write_audio_wav,
     };
     #[cfg(feature = "sd-gen1-multiblock")]
     use super::{VerdictReport, apply_sd_protocol_errors};
@@ -4932,6 +5369,65 @@ mod tests {
     use rp2040_emu::{Config, EmulatorBuilder};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn i2c_profile_builtin_has_only_the_declared_rtc_devices() {
+        let profile = build_i2c_profile("picocalc-rtc-v1", None, None).unwrap();
+        assert_eq!(profile.fixture_id, "builtin-picocalc-rtc-v1");
+        assert_eq!(profile.fixture_basename, None);
+        assert_eq!(
+            profile.attached_addresses,
+            vec![
+                picocalc_board::DS3231_ADDRESS,
+                picocalc_board::AT24C32_ADDRESS
+            ]
+        );
+        assert!(profile.mux.is_some());
+    }
+
+    #[test]
+    fn i2c_profile_fixture_checks_bus_devices_and_records_provenance() {
+        let path =
+            std::env::temp_dir().join(format!("picocalc-i2c-fixture-{}.json", std::process::id()));
+        let fixture = r#"{
+          "schema_version": 1,
+          "fixture_id": "test-rtc",
+          "profile": "picocalc-rtc-v1",
+          "bus": {"controller": "i2c1", "sda_gpio": 6, "scl_gpio": 7, "address_bits": 7},
+          "devices": [
+            {"kind": "ds3231", "address": 104, "state": {
+              "encoding": "register_bytes",
+              "initial_datetime": "2024-02-29T12:34:56Z",
+              "osf": true
+            }},
+            {"kind": "at24c32", "address": 87, "state": {
+              "encoding": "register_bytes",
+              "registers": {"0x0000": 165, "0x0fff": 90}
+            }}
+          ]
+        }"#;
+        std::fs::write(&path, fixture).unwrap();
+        let profile = build_i2c_profile("picocalc-rtc-v1", Some(&path), None).unwrap();
+        assert_eq!(profile.fixture_id, "test-rtc");
+        assert_eq!(
+            profile.fixture_basename.as_deref(),
+            path.file_name().and_then(|name| name.to_str())
+        );
+        assert_eq!(
+            profile.fixture_sha256.as_deref(),
+            Some(sha256_hex(fixture.as_bytes()).as_str())
+        );
+        assert_eq!(profile.attached_addresses.len(), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn i2c_environment_profile_is_rejected_until_e3() {
+        let error = build_i2c_profile("picocalc-rtc-env-v1", None, None)
+            .err()
+            .expect("environment profile must be rejected before E3");
+        assert!(error.contains("reserved for E3"));
+    }
 
     #[cfg(feature = "behavior-trace")]
     use super::behavior_projection;

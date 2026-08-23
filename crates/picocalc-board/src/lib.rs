@@ -27,8 +27,8 @@
 //! ```
 
 pub mod framebuffer;
-pub mod i2c_external;
 pub mod i2c_devices;
+pub mod i2c_external;
 pub mod keyboard;
 pub mod lcd_pio_wire;
 pub mod pins;
@@ -39,7 +39,9 @@ pub mod st7365p;
 pub mod wire;
 
 pub use framebuffer::{Framebuffer, PngError};
-pub use i2c_devices::{At24c32, Ds3231, RtcDateTime};
+pub use i2c_devices::{
+    AT24C32_ADDRESS, AT24C32_SIZE, At24c32, DS3231_ADDRESS, Ds3231, RtcDateTime,
+};
 pub use i2c_external::{I2cBusMux, I2cBusMuxError, I2cExternalDeviceStub};
 pub use keyboard::{KeyEvent, KeyState, Keyboard, KeyboardWire};
 pub use lcd_pio_wire::LcdPioWire;
