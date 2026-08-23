@@ -107,7 +107,6 @@ const IC_CON_IC_RESTART_EN: u32 = 1 << 5;
 // --- IC_DATA_CMD bits -------------------------------------------------
 const DATA_CMD_READ: u32 = 1 << 8;
 const DATA_CMD_STOP: u32 = 1 << 9;
-#[allow(dead_code)] // firmware may set RESTART during scan; emulator treats as STOP
 const DATA_CMD_RESTART: u32 = 1 << 10;
 
 // --- Interrupt bits (shared across INTR_STAT / RAW_INTR_STAT / MASK) --
@@ -150,7 +149,18 @@ const ABRT_7B_ADDR_NOACK: u32 = 1 << 0;
 /// indicator when firmware enables `IC_CON.10BITADDR_MASTER`. Real DW
 /// silicon sets this bit when the slave NACKs the first (upper) 10-bit
 /// address byte; since we NACK every 10-bit attempt we reuse the bit.
-const ABRT_10ADDR1_NOACK: u32 = 1 << 2;
+const ABRT_10ADDR1_NOACK: u32 = 1 << 1;
+/// TX_ABRT reason bit for a data byte NACK from an addressed slave.
+const ABRT_TXDATA_NOACK: u32 = 1 << 3;
+
+/// Deterministic virtual-time increment delivered to optional I2C devices.
+///
+/// The controller reports integer nanoseconds only. Device models must not
+/// consult host wall time or reconstruct time from their own cycle counter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct I2cVirtualTimeDelta {
+    pub nanoseconds: u64,
+}
 
 /// An off-chip I2C slave attached to one of the two controllers.
 ///
@@ -168,12 +178,22 @@ const ABRT_10ADDR1_NOACK: u32 = 1 << 2;
 pub trait I2cExternalDevice: Send {
     /// True iff this device answers the 7-bit address `addr`.
     fn responds_to(&self, addr: u16) -> bool;
+    /// Begin an address phase. The default preserves the original single
+    /// device API while allowing a bus mux to select a child without
+    /// interior mutability. Implementations that need address-sensitive
+    /// state may override this method.
+    fn address_phase(&mut self, addr: u16) -> bool {
+        self.responds_to(addr)
+    }
     /// Master wrote `byte`. Return false to NACK it.
     fn write_byte(&mut self, byte: u8) -> bool;
     /// Master is clocking a byte out of the device.
     fn read_byte(&mut self) -> u8;
     /// Master issued STOP.
     fn transaction_end(&mut self);
+    /// Advance the child by deterministic virtual time. The default keeps
+    /// existing keyboard and test devices time-independent.
+    fn advance_virtual_time(&mut self, _delta: I2cVirtualTimeDelta) {}
 }
 
 pub struct I2cRegs {
@@ -200,6 +220,15 @@ pub struct I2cRegs {
     /// Off-chip slave, if any. Survives [`Self::reset`] — resetting the
     /// controller does not unsolder the device from the board.
     device: Option<Box<dyn I2cExternalDevice>>,
+    /// Address selected by the current transaction. A STOP, abort, disable,
+    /// or reset clears it so the next command starts a fresh address phase.
+    active_address: Option<u16>,
+    /// Whether the selected address belongs to the attached child rather
+    /// than the historical synthetic ACK fallback.
+    active_device: bool,
+    /// Keep the historical 0x3C/0x50 ACK fallback for legacy and
+    /// keyboard-only runs. Explicit profiles disable it.
+    legacy_ack_fallback: bool,
     #[cfg(feature = "behavior-trace")]
     behavior_transactions: u64,
 }
@@ -234,6 +263,9 @@ impl I2cRegs {
             activity: false,
             nvic_irq,
             device: None,
+            active_address: None,
+            active_device: false,
+            legacy_ack_fallback: true,
             #[cfg(feature = "behavior-trace")]
             behavior_transactions: 0,
         }
@@ -242,8 +274,10 @@ impl I2cRegs {
     pub fn reset(&mut self) {
         let irq = self.nvic_irq;
         let device = self.device.take();
+        let legacy_ack_fallback = self.legacy_ack_fallback;
         *self = Self::new(irq);
         self.device = device;
+        self.legacy_ack_fallback = legacy_ack_fallback;
     }
 
     /// Attach an off-chip slave, returning whatever was attached before.
@@ -251,6 +285,22 @@ impl I2cRegs {
         &mut self,
         device: Box<dyn I2cExternalDevice>,
     ) -> Option<Box<dyn I2cExternalDevice>> {
+        self.legacy_ack_fallback = true;
+        self.active_address = None;
+        self.active_device = false;
+        self.device.replace(device)
+    }
+
+    /// Attach an explicitly configured board profile. Unlike the historical
+    /// single-device hook, this disables the synthetic 0x3C/0x50 ACK list so
+    /// an unclaimed address cannot appear to exist beside a profile mux.
+    pub fn attach_device_exclusive(
+        &mut self,
+        device: Box<dyn I2cExternalDevice>,
+    ) -> Option<Box<dyn I2cExternalDevice>> {
+        self.legacy_ack_fallback = false;
+        self.active_address = None;
+        self.active_device = false;
         self.device.replace(device)
     }
 
@@ -267,6 +317,17 @@ impl I2cRegs {
     /// Mutably borrow the attached slave, e.g. to inject input.
     pub fn device_mut(&mut self) -> Option<&mut (dyn I2cExternalDevice + 'static)> {
         self.device.as_deref_mut()
+    }
+
+    /// Advance the attached device once for a shared bus-clock window.
+    /// `Bus` owns the clock snapshot and calls this from both the normal
+    /// peripheral tick and lazy fast-forward paths.
+    pub(crate) fn advance_virtual_time(&mut self, delta: I2cVirtualTimeDelta) {
+        if delta.nanoseconds != 0
+            && let Some(device) = self.device.as_mut()
+        {
+            device.advance_virtual_time(delta);
+        }
     }
 
     /// True iff FIFOs empty, no sticky interrupts, bus inactive.
@@ -368,18 +429,52 @@ impl I2cRegs {
         self.raw_intr_stat |= INT_ACTIVITY | INT_START_DET;
         let slave = self.tar & 0x3FF;
         let ten_bit = (self.con & IC_CON_10BIT_ADDR_MASTER) != 0;
-        // 10-bit mode never ACKs in our stub; the 7-bit ACK list only
-        // applies when firmware left the block in 7-bit mode. An
-        // attached off-chip device claims its own address; the stub
-        // list stays as a fallback so bus scans still find something on
-        // boards with no modelled slave.
-        let device_claims = !ten_bit
-            && self
-                .device
-                .as_ref()
-                .is_some_and(|d| d.responds_to(slave as u16));
-        let ack = device_claims || (!ten_bit && ALWAYS_ACK_ADDRS.contains(&slave));
+        let restart = (cmd & DATA_CMD_RESTART) != 0;
         let is_read = (cmd & DATA_CMD_READ) != 0;
+
+        // The address phase is explicit. A new transfer starts it after
+        // enable/STOP; RESTART may switch only the same target in this
+        // bounded controller model. Enabled IC_TAR writes remain ignored,
+        // so a different target uses the documented disable/reconfigure
+        // sequence.
+        let needs_address = self.active_address.is_none() || restart;
+        let mut device_claims = self.active_device;
+        let mut ack = true;
+        if needs_address {
+            if ten_bit {
+                ack = false;
+                device_claims = false;
+            } else if restart
+                && self.active_address.is_some()
+                && self.active_address != Some(slave as u16)
+            {
+                // A repeated START to a different target is outside the
+                // initial contract and fails closed rather than silently
+                // switching a mux child without a STOP.
+                ack = false;
+                device_claims = false;
+            } else {
+                device_claims = self
+                    .device
+                    .as_mut()
+                    .is_some_and(|d| d.address_phase(slave as u16));
+                ack = device_claims
+                    || (self.legacy_ack_fallback && ALWAYS_ACK_ADDRS.contains(&slave));
+                if ack {
+                    self.active_address = Some(slave as u16);
+                    self.active_device = device_claims;
+                }
+            }
+            if restart {
+                self.raw_intr_stat |= INT_RESTART_DET;
+            }
+        } else if self.active_address != Some(slave as u16) {
+            // This should only be reachable through an invalid internal
+            // state; treating it as an address NACK keeps the model fail
+            // closed.
+            ack = false;
+            device_claims = false;
+        }
 
         if !ack {
             // NACK: set TX_ABRT + abort-source bit. Distinguish 10-bit
@@ -414,8 +509,15 @@ impl I2cRegs {
                 // queued would fill the FIFO after 16 writes and stall
                 // every later transfer on TFNF, which firmware reports
                 // as a write timeout.
-                if let Some(d) = self.device.as_mut() {
-                    d.write_byte((cmd & 0xFF) as u8);
+                let data_ack = self
+                    .device
+                    .as_mut()
+                    .is_some_and(|d| d.write_byte((cmd & 0xFF) as u8));
+                if !data_ack {
+                    self.raw_intr_stat |= INT_TX_ABRT;
+                    self.tx_abrt_source |= ABRT_TXDATA_NOACK;
+                    self.tx_fifo.clear();
+                    ack = false;
                 }
             } else if self.tx_fifo.len() < I2C_FIFO_DEPTH {
                 self.tx_fifo.push_back(cmd & 0xFF);
@@ -434,6 +536,8 @@ impl I2cRegs {
             if device_claims && let Some(d) = self.device.as_mut() {
                 d.transaction_end();
             }
+            self.active_address = None;
+            self.active_device = false;
         }
         self.route_irq(irqs);
     }
@@ -609,6 +713,8 @@ impl I2cRegs {
                     self.tx_fifo.clear();
                     self.rx_fifo.clear();
                     self.activity = false;
+                    self.active_address = None;
+                    self.active_device = false;
                 }
             }
             IC_SDA_HOLD => {
@@ -889,6 +995,7 @@ mod tests {
         written: Vec<u8>,
         next_read: u8,
         stops: u32,
+        nack_writes: bool,
     }
 
     impl I2cExternalDevice for SpyDevice {
@@ -897,7 +1004,7 @@ mod tests {
         }
         fn write_byte(&mut self, byte: u8) -> bool {
             self.written.push(byte);
-            true
+            !self.nack_writes
         }
         fn read_byte(&mut self) -> u8 {
             let b = self.next_read;
@@ -956,6 +1063,78 @@ mod tests {
         i.write32(IC_DATA_CMD, DATA_CMD_READ, 0, &mut irqs);
         assert_eq!(i.rx_fifo.pop_front(), Some(0x10));
         assert_eq!(i.rx_fifo.pop_front(), Some(0x11));
+    }
+
+    #[test]
+    fn same_target_repeated_start_reenters_address_phase_without_stop() {
+        let mut i = enabled_with_device(0x1F, 0x10);
+        let mut irqs = 0;
+        i.write32(IC_DATA_CMD, 0x09, 0, &mut irqs);
+        i.write32(
+            IC_DATA_CMD,
+            DATA_CMD_READ | DATA_CMD_RESTART,
+            0,
+            &mut irqs,
+        );
+        assert_eq!(i.raw_intr_stat & INT_RESTART_DET, INT_RESTART_DET);
+        assert_eq!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_eq!(i.rx_fifo.pop_front(), Some(0x10));
+        assert_eq!(i.active_address, Some(0x1F));
+    }
+
+    #[test]
+    fn different_target_repeated_start_fails_closed() {
+        let mut i = enabled_with_device(0x1F, 0);
+        let mut irqs = 0;
+        // IC_TAR writes while enabled are intentionally ignored by the
+        // model; seed the impossible target switch directly to exercise the
+        // controller's fail-closed guard.
+        i.active_address = Some(0x1F);
+        i.active_device = true;
+        i.tar = 0x22;
+        i.write32(
+            IC_DATA_CMD,
+            DATA_CMD_READ | DATA_CMD_RESTART,
+            0,
+            &mut irqs,
+        );
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_ne!(i.tx_abrt_source & ABRT_7B_ADDR_NOACK, 0);
+        assert_eq!(i.active_address, None);
+    }
+
+    #[test]
+    fn child_data_nack_sets_txdata_abort_and_ends_transaction() {
+        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut irqs = 0;
+        i.attach_device(Box::new(SpyDevice {
+            addr: 0x1F,
+            nack_writes: true,
+            ..Default::default()
+        }));
+        i.write32(IC_TAR, 0x1F, 0, &mut irqs);
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, 0x42 | DATA_CMD_STOP, 0, &mut irqs);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_ne!(i.tx_abrt_source & ABRT_TXDATA_NOACK, 0);
+        assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
+        assert_eq!(i.active_address, None);
+    }
+
+    #[test]
+    fn exclusive_device_attachment_disables_historical_ack_fallback() {
+        let mut i = I2cRegs::new(I2C0_IRQ);
+        let mut irqs = 0;
+        i.attach_device_exclusive(Box::new(SpyDevice {
+            addr: 0x1F,
+            ..Default::default()
+        }));
+        i.write32(IC_TAR, 0x50, 0, &mut irqs);
+        i.write32(IC_ENABLE, 1, 0, &mut irqs);
+        i.write32(IC_DATA_CMD, DATA_CMD_READ | DATA_CMD_STOP, 0, &mut irqs);
+        assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_ne!(i.tx_abrt_source & ABRT_7B_ADDR_NOACK, 0);
+        assert_eq!(i.rx_fifo.len(), 0);
     }
 
     #[test]

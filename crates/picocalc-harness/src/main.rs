@@ -1426,55 +1426,6 @@ fn park_state(emu: &Emulator, core: usize) -> &'static str {
     }
 }
 
-/// Emulated cycles converted to virtual nanoseconds.
-///
-/// The system clock is not a constant: firmware boots on ROSC and moves
-/// to a PLL, so a fixed divisor would put every timestamp taken before
-/// the switch off by a factor of twenty. Instead the conversion is
-/// re-based whenever `clk_sys` changes — time already elapsed keeps the
-/// rate it was measured at, and only the new stretch uses the new rate.
-struct VirtualClock {
-    epoch_cycles: u64,
-    epoch_ns: u64,
-    hz: u64,
-}
-
-impl VirtualClock {
-    fn new(hz: u32) -> Self {
-        Self {
-            epoch_cycles: 0,
-            epoch_ns: 0,
-            hz: u64::from(hz).max(1),
-        }
-    }
-
-    fn ns_at(&self, cycles: u64) -> u64 {
-        let elapsed = u128::from(cycles.saturating_sub(self.epoch_cycles));
-        self.epoch_ns + (elapsed * 1_000_000_000 / u128::from(self.hz)) as u64
-    }
-
-    /// The cycle count at which the clock will read `ns`, saturating at
-    /// `u64::MAX` so a far-future deadline simply never arrives.
-    fn cycles_at(&self, ns: u64) -> u64 {
-        let ahead = u128::from(ns.saturating_sub(self.epoch_ns));
-        let cycles = ahead * u128::from(self.hz) / 1_000_000_000;
-        self.epoch_cycles
-            .saturating_add(u64::try_from(cycles).unwrap_or(u64::MAX))
-    }
-
-    /// Adopt a new rate from `cycles` onwards. No-op if unchanged.
-    fn rebase(&mut self, cycles: u64, hz: u32) -> bool {
-        let hz = u64::from(hz).max(1);
-        if hz == self.hz {
-            return false;
-        }
-        self.epoch_ns = self.ns_at(cycles);
-        self.epoch_cycles = cycles;
-        self.hz = hz;
-        true
-    }
-}
-
 /// Board models the scenario engine can reach into mid-run.
 #[derive(Default)]
 struct BoardHandles {
@@ -1491,7 +1442,6 @@ struct BoardHandles {
 /// clock-rebase, or observation semantics.
 struct MachineSession {
     emu: Emulator,
-    vclock: VirtualClock,
     uart_bytes: Vec<u8>,
     dispatches: u64,
     board: BoardHandles,
@@ -1513,10 +1463,8 @@ enum SessionStop {
 impl MachineSession {
     #[inline]
     fn new(emu: Emulator, board: BoardHandles) -> Self {
-        let vclock = VirtualClock::new(emu.bus.clock_tree.sys_clk_hz);
         Self {
             emu,
-            vclock,
             uart_bytes: Vec::new(),
             dispatches: 0,
             board,
@@ -1556,8 +1504,6 @@ impl MachineSession {
             }
             Some(BootMode::BootromResetVector) | None => {}
         }
-        self.vclock
-            .rebase(self.emu.clock.cycles, self.emu.bus.clock_tree.sys_clk_hz);
         Ok(true)
     }
 
@@ -1568,7 +1514,7 @@ impl MachineSession {
 
     #[inline(always)]
     fn elapsed_ns(&self) -> u64 {
-        self.vclock.ns_at(self.cycles())
+        self.emu.bus.virtual_time_ns()
     }
 
     fn fatal_exception(&self) -> Option<&'static str> {
@@ -1637,6 +1583,7 @@ impl MachineSession {
     /// external boundary. Returns `(cycles_consumed, clock_rate_changed)`.
     #[inline(always)]
     fn advance_once(&mut self, external_event_cycle: u64) -> Result<(u64, bool), String> {
+        let previous_hz = self.emu.bus.clock_tree.sys_clk_hz;
         let consumed = self.emu.step_until(external_event_cycle).map_err(|error| {
             let message = error.to_string();
             self.sticky_stop = Some(SessionStop::Error(message.clone()));
@@ -1647,10 +1594,8 @@ impl MachineSession {
         if self.dispatches.is_multiple_of(UART_DRAIN_INTERVAL) {
             self.drain_uart();
         }
-        let rebased = self
-            .vclock
-            .rebase(self.emu.clock.cycles, self.emu.bus.clock_tree.sys_clk_hz);
-        Ok((consumed, rebased))
+        let rate_changed = self.emu.bus.clock_tree.sys_clk_hz != previous_hz;
+        Ok((consumed, rate_changed))
     }
 
     fn mark_clock_stalled(&mut self) {
@@ -1698,7 +1643,7 @@ fn run_loop(
     // per-step check to one integer compare; the division only happens
     // at a poll or a clock change.
     let mut next_poll_cycles = match engine.as_deref() {
-        Some(e) => machine.vclock.cycles_at(e.next_poll_ns()),
+        Some(e) => machine.emu.bus.virtual_time_cycles_at(e.next_poll_ns()),
         None => u64::MAX,
     };
 
@@ -1730,7 +1675,7 @@ fn run_loop(
             if e.is_done() {
                 return machine.finish(StopReason::ScenarioDone, None, None);
             }
-            next_poll_cycles = machine.vclock.cycles_at(e.next_poll_ns());
+            next_poll_cycles = machine.emu.bus.virtual_time_cycles_at(e.next_poll_ns());
             // A poll that changed nothing would otherwise re-fire every
             // step until virtual time moved on.
             next_poll_cycles = next_poll_cycles.max(machine.cycles() + 1);
@@ -1751,6 +1696,7 @@ fn run_loop(
         }
 
         let external_event_cycle = next_poll_cycles.min(cycle_limit);
+        let previous_hz = machine.emu.bus.clock_tree.sys_clk_hz;
         let consumed = match machine.emu.step_until(external_event_cycle) {
             Ok(consumed) => consumed,
             Err(error) => {
@@ -1792,14 +1738,13 @@ fn run_loop(
         // mean. The pending poll deadline is expressed in nanoseconds, so
         // it moves with the rebase rather than being stranded at the old
         // rate.
-        if machine.vclock.rebase(
-            machine.emu.clock.cycles,
-            machine.emu.bus.clock_tree.sys_clk_hz,
-        ) && let Some(e) = engine.as_deref()
+        if machine.emu.bus.clock_tree.sys_clk_hz != previous_hz
+            && let Some(e) = engine.as_deref()
         {
             next_poll_cycles = machine
-                .vclock
-                .cycles_at(e.next_poll_ns())
+                .emu
+                .bus
+                .virtual_time_cycles_at(e.next_poll_ns())
                 .max(machine.cycles() + 1);
         }
     }

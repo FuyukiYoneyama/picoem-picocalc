@@ -29,6 +29,9 @@ pub use audio_sink::AudioSinkSnapshot;
 pub use dma::DmaSchedulerSnapshot;
 
 mod idle_profile;
+mod virtual_time;
+
+pub use virtual_time::VirtualClock;
 
 #[cfg(feature = "event-horizon-profiler")]
 mod running_profile;
@@ -492,6 +495,7 @@ impl Emulator {
         self.bus.pll_usb_lock_at_cycle = None;
         self.bus.master_cycle = 0;
         self.bus.clock_tree = Default::default();
+        self.bus.reset_virtual_time();
         self.bus.io_bank0.reset();
         self.bus.pads_bank0.reset();
         for pio in &mut self.bus.pio {
@@ -545,6 +549,7 @@ impl Emulator {
     /// master-cycle counter.  The caller selects the post-reset boot handoff
     /// after observing the event.
     fn apply_watchdog_warm_reset(&mut self, cycle: u64, core: usize, pc: u32, reason: u32) {
+        let virtual_time_ns = self.bus.virtual_time_ns();
         let scratch = self.bus.watchdog_tick.scratch;
         let reset_reason = self.bus.watchdog_tick.reason | reason;
         // Board-level inputs are external to the MCU reset domain.  In the
@@ -558,6 +563,7 @@ impl Emulator {
         self.reset();
         self.clock.cycles = cycle;
         self.bus.master_cycle = cycle;
+        self.bus.restore_virtual_time_after_reset(virtual_time_ns);
         self.bus.external_gpio_in_mask = external_gpio_in_mask;
         self.bus.external_gpio_in_override = external_gpio_in_override;
         self.bus.watchdog_tick.scratch = scratch;

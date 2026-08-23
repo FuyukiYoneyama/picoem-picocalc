@@ -51,6 +51,7 @@ use crate::irq::{
     IRQ_SIO_IRQ_PROC1, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_UART0_IRQ, IRQ_UART1_IRQ,
 };
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
+use crate::virtual_time::VirtualClock;
 use crate::peripherals::adc::AdcRegs;
 use crate::peripherals::i2c::I2cRegs;
 use crate::peripherals::pwm::PwmRegs;
@@ -582,6 +583,9 @@ pub struct Bus {
     pub(crate) pll_usb_lock_at_cycle: Option<u64>,
     /// Derived clock tree frequencies (recomputed on any CLOCKS/PLL write).
     pub clock_tree: ClockTree,
+    /// Single deterministic cycle-to-nanosecond snapshot shared by all
+    /// optional external I2C devices and the harness observation API.
+    virtual_time: VirtualClock,
     /// IO_BANK0 per-pin function select.
     pub io_bank0: IoBank0,
     /// PADS_BANK0 per-pin pad control.
@@ -787,6 +791,7 @@ impl Bus {
             pll_sys_lock_at_cycle: None,
             pll_usb_lock_at_cycle: None,
             clock_tree: ClockTree::default(),
+            virtual_time: VirtualClock::new(ClockTree::default().sys_clk_hz),
             io_bank0: IoBank0::new(),
             pads_bank0: PadsBank0::new(),
             xip_sram: Box::new([0u8; XIP_SRAM_SIZE]),
@@ -1003,6 +1008,50 @@ impl Bus {
     pub fn seed_sys_clk_hz(&mut self, hz: u32) {
         self.clock_tree.sys_clk_hz = hz;
         self.clock_tree.ref_clk_hz = hz;
+        self.virtual_time.rebase(self.master_cycle, hz);
+    }
+
+    /// Current deterministic virtual time in nanoseconds.
+    #[inline]
+    pub fn virtual_time_ns(&self) -> u64 {
+        self.virtual_time.ns_at(self.master_cycle)
+    }
+
+    /// Convert a virtual nanosecond deadline to the corresponding absolute
+    /// master cycle using the shared snapshot.
+    #[inline]
+    pub fn virtual_time_cycles_at(&self, ns: u64) -> u64 {
+        self.virtual_time.cycles_at(ns)
+    }
+
+    /// Reset the shared virtual-time epoch for a cold emulator reset.
+    pub(crate) fn reset_virtual_time(&mut self) {
+        self.virtual_time.reset(self.clock_tree.sys_clk_hz);
+    }
+
+    /// Restore virtual time after a watchdog warm reset. The external
+    /// module state remains attached, so elapsed time must not jump back to
+    /// zero merely because the MCU reset domain did.
+    pub(crate) fn restore_virtual_time_after_reset(&mut self, ns: u64) {
+        self.virtual_time.restore_after_reset(
+            self.master_cycle,
+            ns,
+            self.clock_tree.sys_clk_hz,
+        );
+    }
+
+    /// Advance the shared snapshot once and deliver the resulting delta to
+    /// both I2C controllers. This is called exactly once for each peripheral
+    /// window, regardless of whether the scheduler used normal ticking or
+    /// lazy fast-forward.
+    #[inline]
+    fn advance_external_virtual_time(&mut self) {
+        let nanoseconds = self
+            .virtual_time
+            .advance_to(self.master_cycle, self.clock_tree.sys_clk_hz);
+        let delta = crate::peripherals::i2c::I2cVirtualTimeDelta { nanoseconds };
+        self.i2c0.advance_virtual_time(delta);
+        self.i2c1.advance_virtual_time(delta);
     }
 
     fn recompute_clock_tree(&mut self) {
@@ -2424,6 +2473,21 @@ impl Bus {
         }
     }
 
+    /// Attach an explicitly configured I2C profile and disable the legacy
+    /// synthetic ACK fallback for that controller. Profile builders use
+    /// this entry point so unclaimed addresses remain NACKed.
+    pub fn attach_i2c_device_exclusive(
+        &mut self,
+        instance: usize,
+        device: Box<dyn crate::peripherals::i2c::I2cExternalDevice>,
+    ) -> Result<Option<Box<dyn crate::peripherals::i2c::I2cExternalDevice>>, usize> {
+        match instance {
+            0 => Ok(self.i2c0.attach_device_exclusive(device)),
+            1 => Ok(self.i2c1.attach_device_exclusive(device)),
+            other => Err(other),
+        }
+    }
+
     /// Mutably borrow the slave attached to I2C `instance`, e.g. to
     /// inject input from a scenario.
     pub fn i2c_device_mut(
@@ -2708,6 +2772,11 @@ impl Bus {
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
         self.i2c1
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
+        // External I2C devices consume the same shared virtual-time
+        // snapshot as the harness. This is deliberately one call per
+        // peripheral window; lazy scheduled advance below is the other,
+        // mutually exclusive path.
+        self.advance_external_virtual_time();
         // ADC: fixed-point clk_adc accumulator advances via tick.
         self.adc
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
@@ -2736,6 +2805,7 @@ impl Bus {
             .timer
             .poll_alarms(self.master_cycle, self.clock_tree.sys_clk_hz);
         self.irq_pending |= nvic_bits & 0xF;
+        self.advance_external_virtual_time();
     }
 
     /// Soonest scheduled lazy IRQ deadline (master-cycle space) across
@@ -2886,6 +2956,37 @@ impl CoreBus for Bus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct TimeProbe {
+        deltas: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl crate::peripherals::i2c::I2cExternalDevice for TimeProbe {
+        fn responds_to(&self, addr: u16) -> bool {
+            addr == 0x68
+        }
+
+        fn write_byte(&mut self, _byte: u8) -> bool {
+            true
+        }
+
+        fn read_byte(&mut self) -> u8 {
+            0
+        }
+
+        fn transaction_end(&mut self) {}
+
+        fn advance_virtual_time(
+            &mut self,
+            delta: crate::peripherals::i2c::I2cVirtualTimeDelta,
+        ) {
+            self.deltas
+                .lock()
+                .expect("time probe lock")
+                .push(delta.nanoseconds);
+        }
+    }
 
     #[cfg(feature = "event-horizon-profiler")]
     #[test]
@@ -2914,6 +3015,33 @@ mod tests {
     fn new_bus_all_peripherals_in_reset() {
         let bus = Bus::new();
         assert_eq!(bus.resets.state, resets::RESET_MASK);
+    }
+
+    #[test]
+    fn external_i2c_devices_receive_one_shared_delta_per_window() {
+        let mut bus = Bus::new();
+        bus.seed_sys_clk_hz(100_000_000);
+        let deltas = Arc::new(Mutex::new(Vec::new()));
+        bus.attach_i2c_device_exclusive(
+            1,
+            Box::new(TimeProbe {
+                deltas: Arc::clone(&deltas),
+            }),
+        )
+        .expect("I2C1 exists");
+
+        bus.master_cycle = 100;
+        bus.tick_peripherals(100);
+        // Calling the private helper a second time for the same absolute
+        // cycle must not double-advance the child.
+        bus.advance_external_virtual_time();
+        bus.advance_lazy_scheduled(100);
+
+        assert_eq!(
+            *deltas.lock().expect("time probe lock"),
+            vec![1_000, 1_000],
+            "100 cycles at 100 MHz must be delivered once per window"
+        );
     }
 
     #[test]

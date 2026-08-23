@@ -684,6 +684,10 @@ impl rp2040_emu::peripherals::i2c::I2cExternalDevice for Keyboard {
         addr == self.addr
     }
 
+    fn address_phase(&mut self, addr: u16) -> bool {
+        self.responds_to(addr)
+    }
+
     fn write_byte(&mut self, byte: u8) -> bool {
         // Second byte of a two-byte register write.
         if let Some(reg) = self.pending_write_reg.take() {
@@ -786,6 +790,13 @@ impl KeyboardWire {
 impl rp2040_emu::peripherals::i2c::I2cExternalDevice for KeyboardWire {
     fn responds_to(&self, addr: u16) -> bool {
         self.inner.lock().expect("keyboard mutex").responds_to(addr)
+    }
+
+    fn address_phase(&mut self, addr: u16) -> bool {
+        self.inner
+            .lock()
+            .expect("keyboard mutex")
+            .address_phase(addr)
     }
 
     fn write_byte(&mut self, byte: u8) -> bool {
