@@ -14,9 +14,9 @@ use std::time::Duration;
 use picoem_common::{Pacer, PacerSnapshot};
 use serde_json::{Value, json};
 
-use crate::MachineSession;
 use crate::preview_protocol::{Direction, Frame, FrameReader, FrameWriter, Kind, ProtocolError};
 use crate::session::PREVIEW_OBSERVATION_SCHEMA_VERSION;
+use crate::{MachineSession, ScenarioReplay, ScenarioReplayStep};
 
 const PACER_QUANTUM_CYCLES: u64 = 150;
 const FRAME_POLL_QUANTA: u64 = 1_000;
@@ -27,7 +27,10 @@ type InputMessage = Result<Option<Frame>, String>;
 /// Run the preview wire until the frontend sends `quit`, closes stdin, or a
 /// malformed frame is received.  This function is intentionally separate
 /// from the report-producing batch path: it never writes a schema-8 report.
-pub(crate) fn run(machine: &mut MachineSession) -> Result<(), String> {
+pub(crate) fn run(
+    machine: &mut MachineSession,
+    mut replay: Option<ScenarioReplay>,
+) -> Result<(), String> {
     let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
     spawn_input_reader(input_tx);
 
@@ -71,9 +74,11 @@ pub(crate) fn run(machine: &mut MachineSession) -> Result<(), String> {
         uart_rx_accepted,
         uart_rx_disabled,
         uart_rx_overrun,
+        replay.as_ref(),
     )?;
 
     let mut running = true;
+    let mut replay_finished = false;
     let mut termination_error = None;
     while running {
         loop {
@@ -90,6 +95,7 @@ pub(crate) fn run(machine: &mut MachineSession) -> Result<(), String> {
                             &mut uart_rx_disabled,
                             &mut uart_rx_overrun,
                             &mut running,
+                            replay.is_some(),
                         )?;
                         if !running {
                             break;
@@ -119,6 +125,11 @@ pub(crate) fn run(machine: &mut MachineSession) -> Result<(), String> {
             break;
         }
 
+        if replay_finished {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+
         machine.refresh_sticky_stop();
         if machine.stopped().is_some() {
             // A stopped machine cannot advance virtual time.  Keep consuming
@@ -133,6 +144,7 @@ pub(crate) fn run(machine: &mut MachineSession) -> Result<(), String> {
                     uart_rx_accepted,
                     uart_rx_disabled,
                     uart_rx_overrun,
+                    replay.as_ref(),
                 )?;
                 last_status_cycle = machine.cycles();
             }
@@ -142,9 +154,53 @@ pub(crate) fn run(machine: &mut MachineSession) -> Result<(), String> {
 
         let previous_hz = machine.preview_sys_clk_hz();
         pacer.begin_quantum();
-        let target = machine.cycles().saturating_add(pacer.quantum_cycles());
-        let advance = machine.advance_once(target);
-        let (consumed, _) = advance.map_err(|error| format!("preview emulation: {error}"))?;
+        let result = if let Some(replay_state) = replay.as_mut() {
+            replay_state.step(machine)
+        } else {
+            let target = machine.cycles().saturating_add(pacer.quantum_cycles());
+            machine
+                .advance_once(target)
+                .map(|(consumed, rate_changed)| ScenarioReplayStep::Advanced {
+                    consumed,
+                    rate_changed,
+                })
+                .map_err(|error| format!("preview emulation: {error}"))
+        };
+        let (consumed, rate_changed) = match result? {
+            ScenarioReplayStep::Advanced {
+                consumed,
+                rate_changed,
+            } => (consumed, rate_changed),
+            ScenarioReplayStep::Complete => {
+                replay_finished = true;
+                pacer.end_quantum_for_cycles(0);
+                if let Some(framebuffer) = machine.preview_framebuffer() {
+                    let sha = framebuffer.rgb565_sha256();
+                    if last_frame_sha.as_deref() != Some(sha.as_str()) {
+                        write_frame(&mut output, machine.cycles(), &framebuffer)?;
+                        last_frame_sha = Some(sha);
+                        frame_updates = frame_updates.saturating_add(1);
+                    }
+                }
+                write_status(
+                    &mut output,
+                    machine,
+                    &stats.snapshot(),
+                    frame_updates,
+                    uart_tx_bytes,
+                    uart_rx_accepted,
+                    uart_rx_disabled,
+                    uart_rx_overrun,
+                    replay.as_ref(),
+                )?;
+                last_status_cycle = machine.cycles();
+                continue;
+            }
+            ScenarioReplayStep::Failed(error) => {
+                let _ = write_error(&mut output, "replay_failed", &error);
+                return Err(error);
+            }
+        };
         pacer.end_quantum_for_cycles(consumed);
         if consumed == 0 {
             machine.mark_clock_stalled();
@@ -152,7 +208,7 @@ pub(crate) fn run(machine: &mut MachineSession) -> Result<(), String> {
             continue;
         }
         let current_hz = machine.preview_sys_clk_hz();
-        if current_hz != previous_hz {
+        if current_hz != previous_hz || rate_changed {
             pacer.update_sys_clk_hz(current_hz);
         }
 
@@ -189,6 +245,7 @@ pub(crate) fn run(machine: &mut MachineSession) -> Result<(), String> {
                 uart_rx_accepted,
                 uart_rx_disabled,
                 uart_rx_overrun,
+                replay.as_ref(),
             )?;
             last_status_cycle = machine.cycles();
         }
@@ -234,7 +291,16 @@ fn handle_input_frame<W: io::Write>(
     uart_rx_disabled: &mut u64,
     uart_rx_overrun: &mut u64,
     running: &mut bool,
+    replay_mode: bool,
 ) -> Result<(), String> {
+    if replay_mode && frame.kind != Kind::Quit {
+        write_error(
+            output,
+            "replay_input_rejected",
+            "registered-target replay accepts only quit input",
+        )?;
+        return Ok(());
+    }
     match frame.kind {
         Kind::KeyEvent => {
             let object = frame.json_value().map_err(protocol_message)?;
@@ -323,6 +389,7 @@ fn write_status<W: io::Write>(
     uart_rx_accepted: u64,
     uart_rx_disabled: u64,
     uart_rx_overrun: u64,
+    replay: Option<&ScenarioReplay>,
 ) -> Result<(), String> {
     let virtual_ns = machine.elapsed_ns();
     let wall_ns = snapshot.wall_ns;
@@ -335,39 +402,43 @@ fn write_status<W: io::Write>(
         (virtual_ns as i128 - wall_ns as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     let observation_projection = machine.preview_observation_projection();
     let observation_digest = machine.preview_observation_digest();
+    let mut status = json!({
+        "audio": {"queue_frames": 0, "state": "not_streamed"},
+        "coverage": if machine.stopped().is_some() { "stopped" } else { "ok" },
+        "framebuffer": {"updates": frame_updates},
+        "observation": {
+            "digest_sha256": observation_digest,
+            "projection": observation_projection,
+            "schema_version": PREVIEW_OBSERVATION_SCHEMA_VERSION,
+        },
+        "pacer": {
+            "behind_count": snapshot.behind_count,
+            "emulated_cycles": snapshot.emulated_cycles,
+            "emulation_ns": snapshot.emulation_ns,
+            "lag_ns": lag_ns,
+            "ratio_ppm": ratio_ppm,
+            "spin_ns": snapshot.spin_ns,
+            "wall_ns": wall_ns,
+        },
+        "uart": {
+            "rx_accepted": uart_rx_accepted,
+            "rx_disabled": uart_rx_disabled,
+            "rx_fifo": machine.preview_uart_rx_fifo_len(),
+            "rx_overrun": uart_rx_overrun,
+            "rx_raw_interrupt_status": machine.preview_uart_raw_status(),
+            "tx_bytes": uart_tx_bytes,
+        },
+        "virtual_cycle": machine.cycles(),
+        "virtual_ns": virtual_ns,
+    });
+    if let Some(replay) = replay {
+        status
+            .as_object_mut()
+            .expect("preview status is an object")
+            .insert("replay".into(), replay.status_json());
+    }
     output
-        .write_json(
-            Kind::Status,
-            &json!({
-                "audio": {"queue_frames": 0, "state": "not_streamed"},
-                "coverage": if machine.stopped().is_some() { "stopped" } else { "ok" },
-                "framebuffer": {"updates": frame_updates},
-                "observation": {
-                    "digest_sha256": observation_digest,
-                    "projection": observation_projection,
-                    "schema_version": PREVIEW_OBSERVATION_SCHEMA_VERSION,
-                },
-                "pacer": {
-                    "behind_count": snapshot.behind_count,
-                    "emulated_cycles": snapshot.emulated_cycles,
-                    "emulation_ns": snapshot.emulation_ns,
-                    "lag_ns": lag_ns,
-                    "ratio_ppm": ratio_ppm,
-                    "spin_ns": snapshot.spin_ns,
-                    "wall_ns": wall_ns,
-                },
-                "uart": {
-                    "rx_accepted": uart_rx_accepted,
-                    "rx_disabled": uart_rx_disabled,
-                    "rx_fifo": machine.preview_uart_rx_fifo_len(),
-                    "rx_overrun": uart_rx_overrun,
-                    "rx_raw_interrupt_status": machine.preview_uart_raw_status(),
-                    "tx_bytes": uart_tx_bytes,
-                },
-                "virtual_cycle": machine.cycles(),
-                "virtual_ns": virtual_ns,
-            }),
-        )
+        .write_json(Kind::Status, &status)
         .map_err(protocol_message)?;
     Ok(())
 }

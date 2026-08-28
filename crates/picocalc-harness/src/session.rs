@@ -10,6 +10,7 @@ use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{Framebuffer, KeyEvent, KeyState, pins};
 use rp2040_emu::{Emulator, RP2040_SRAM_TOP, WatchdogResetEvent};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 use super::{
     BoardHandles, BootMode, RunOutcome, SDK_VTOR_FLASH_OFFSET, StopReason, UART_DRAIN_INTERVAL,
@@ -44,6 +45,123 @@ pub(crate) struct MachineSession {
 /// schema-8 batch report: changing the preview projection must not rewrite
 /// historical validation report bytes.
 pub(crate) const PREVIEW_OBSERVATION_SCHEMA_VERSION: u32 = 1;
+
+/// A deterministic scenario driver used only by the VRP-2 registered-target
+/// digest gate.  It deliberately reuses the same `scenario::Engine` and
+/// `MachineSession::poll_scenario` boundary as the authoritative batch loop;
+/// preview and machine-api consumers therefore cannot invent a second timing
+/// interpretation for a registered scenario.
+pub(crate) struct ScenarioReplay {
+    pub(crate) engine: super::scenario::Engine,
+    cycle_limit: u64,
+    next_poll_cycles: u64,
+    initialized: bool,
+}
+
+pub(crate) enum ScenarioReplayStep {
+    Advanced { consumed: u64, rate_changed: bool },
+    Complete,
+    Failed(String),
+}
+
+impl ScenarioReplay {
+    pub(crate) fn new(
+        scenario: super::scenario::Scenario,
+        snapshot_dir: PathBuf,
+        cycle_limit: u64,
+    ) -> Self {
+        Self {
+            engine: super::scenario::Engine::new(scenario, snapshot_dir),
+            cycle_limit,
+            next_poll_cycles: 0,
+            initialized: false,
+        }
+    }
+
+    pub(crate) fn status_json(&self) -> Value {
+        json!({
+            "cycle_limit": self.cycle_limit,
+            "name": self.engine.name(),
+            "passed": self.engine.passed(),
+            "status": self.engine.status(),
+            "steps_completed": self.engine.results().len(),
+            "steps_total": self.engine.steps_total(),
+        })
+    }
+
+    pub(crate) fn step(
+        &mut self,
+        machine: &mut MachineSession,
+    ) -> Result<ScenarioReplayStep, String> {
+        if !self.initialized {
+            self.next_poll_cycles = machine
+                .emu
+                .bus
+                .virtual_time_cycles_at(self.engine.next_poll_ns());
+            self.initialized = true;
+        }
+
+        if machine.cycles() >= self.next_poll_cycles {
+            machine.poll_scenario(&mut self.engine);
+            if self.engine.is_done() {
+                return if self.engine.passed() {
+                    Ok(ScenarioReplayStep::Complete)
+                } else {
+                    Ok(ScenarioReplayStep::Failed(format!(
+                        "scenario '{}' ended with status {}",
+                        self.engine.name(),
+                        self.engine.status()
+                    )))
+                };
+            }
+            self.next_poll_cycles = machine
+                .emu
+                .bus
+                .virtual_time_cycles_at(self.engine.next_poll_ns())
+                .max(machine.cycles().saturating_add(1));
+        }
+
+        machine.refresh_sticky_stop();
+        if let Some(stop) = machine.stopped() {
+            let reason = match stop {
+                SessionStop::Exception(exception) => format!("exception {exception}"),
+                SessionStop::Error(error) => format!("error {error}"),
+            };
+            return Ok(ScenarioReplayStep::Failed(format!(
+                "scenario '{}' stopped before completion: {reason}",
+                self.engine.name()
+            )));
+        }
+        if machine.cycles() >= self.cycle_limit {
+            return Ok(ScenarioReplayStep::Failed(format!(
+                "scenario '{}' reached replay cycle limit {}",
+                self.engine.name(),
+                self.cycle_limit
+            )));
+        }
+
+        let external_event_cycle = self.next_poll_cycles.min(self.cycle_limit);
+        let (consumed, rate_changed) = machine.advance_once(external_event_cycle)?;
+        if consumed == 0 {
+            machine.mark_clock_stalled();
+            return Ok(ScenarioReplayStep::Failed(format!(
+                "scenario '{}' replay clock stalled",
+                self.engine.name()
+            )));
+        }
+        if rate_changed {
+            self.next_poll_cycles = machine
+                .emu
+                .bus
+                .virtual_time_cycles_at(self.engine.next_poll_ns())
+                .max(machine.cycles().saturating_add(1));
+        }
+        Ok(ScenarioReplayStep::Advanced {
+            consumed,
+            rate_changed,
+        })
+    }
+}
 
 #[derive(Clone)]
 pub(crate) enum SessionStop {
@@ -406,30 +524,14 @@ impl MachineSession {
 }
 
 fn audio_observation_json(snapshot: &rp2040_emu::AudioSinkSnapshot) -> Value {
-    // Keep every field that contributes to the digital DMA-to-PWM
-    // observation.  The vectors are bounded edge samples, not the retained
-    // PCM capture, so status frames remain bounded even for long runs.
+    // Keep the complete, bounded DMA-to-PWM observation surface shared with
+    // the schema-8 `audio_sink` report. The post-quantizer loudness/rail
+    // analysis fields live in the separate `--audio-analysis` artifact and
+    // are intentionally outside the VRP-2 digest until that artifact gets a
+    // versioned descriptor of its own. The vectors are bounded edge samples,
+    // not the retained PCM capture, so status frames remain bounded even for
+    // long runs.
     let mut value = serde_json::Map::new();
-    value.insert(
-        "active_abs_threshold".into(),
-        json!(snapshot.active_abs_threshold),
-    );
-    value.insert(
-        "active_frame_count".into(),
-        json!(snapshot.active_frame_count),
-    );
-    value.insert(
-        "active_frame_ratio_ppm".into(),
-        json!(snapshot.active_frame_ratio_ppm),
-    );
-    value.insert(
-        "analysis_frame_count".into(),
-        json!(snapshot.analysis_frame_count),
-    );
-    value.insert(
-        "analysis_window_frames".into(),
-        json!(snapshot.analysis_window_frames),
-    );
     value.insert(
         "block_boundary_gap_count".into(),
         json!(snapshot.block_boundary_gap_count),
@@ -452,9 +554,6 @@ fn audio_observation_json(snapshot: &rp2040_emu::AudioSinkSnapshot) -> Value {
         "block_start_count".into(),
         json!(snapshot.block_start_count),
     );
-    value.insert("channel_count".into(), json!(snapshot.channel_count));
-    value.insert("dc_offset_left".into(), json!(snapshot.dc_offset_left));
-    value.insert("dc_offset_right".into(), json!(snapshot.dc_offset_right));
     value.insert("dma_write_count".into(), json!(snapshot.dma_write_count));
     value.insert("first_words".into(), json!(snapshot.first_words));
     value.insert("gap_5208_count".into(), json!(snapshot.gap_5208_count));
@@ -465,11 +564,6 @@ fn audio_observation_json(snapshot: &rp2040_emu::AudioSinkSnapshot) -> Value {
         json!(snapshot.malformed_block_count),
     );
     value.insert(
-        "max_consecutive_rail_frames".into(),
-        json!(snapshot.max_consecutive_rail_frames),
-    );
-    value.insert("max_window_rms".into(), json!(snapshot.max_window_rms));
-    value.insert(
         "missing_due_cycle_count".into(),
         json!(snapshot.missing_due_cycle_count),
     );
@@ -477,25 +571,7 @@ fn audio_observation_json(snapshot: &rp2040_emu::AudioSinkSnapshot) -> Value {
         "other_pwm_cc_write_count".into(),
         json!(snapshot.other_pwm_cc_write_count),
     );
-    value.insert(
-        "out_of_range_duty_sample_count".into(),
-        json!(snapshot.out_of_range_duty_sample_count),
-    );
     value.insert("pcm_sha256".into(), json!(snapshot.pcm_sha256));
-    value.insert("peak_abs_left".into(), json!(snapshot.peak_abs_left));
-    value.insert("peak_abs_right".into(), json!(snapshot.peak_abs_right));
-    value.insert(
-        "rail_sample_count".into(),
-        json!(snapshot.rail_sample_count),
-    );
-    value.insert(
-        "rail_sample_ratio_ppm".into(),
-        json!(snapshot.rail_sample_ratio_ppm),
-    );
-    value.insert(
-        "reconstructed_pcm_format".into(),
-        json!(snapshot.reconstructed_pcm_format),
-    );
     value.insert("sample_rate_hz".into(), json!(snapshot.sample_rate_hz));
     value.insert(
         "service_latency_max_cycles".into(),
@@ -510,7 +586,6 @@ fn audio_observation_json(snapshot: &rp2040_emu::AudioSinkSnapshot) -> Value {
         json!(snapshot.service_latency_sha256),
     );
     value.insert("status".into(), json!(snapshot.status));
-    value.insert("stream_rms".into(), json!(snapshot.stream_rms));
     value.insert(
         "target_write_attempt_count".into(),
         json!(snapshot.target_write_attempt_count),
@@ -523,8 +598,6 @@ fn audio_observation_json(snapshot: &rp2040_emu::AudioSinkSnapshot) -> Value {
         "timer_event_count".into(),
         json!(snapshot.timer_event_count),
     );
-    value.insert("timer_fraction_x".into(), json!(snapshot.timer_fraction_x));
-    value.insert("timer_fraction_y".into(), json!(snapshot.timer_fraction_y));
     value.insert("timer_index".into(), json!(snapshot.timer_index));
     value.insert(
         "timer_miss_audio_not_busy".into(),
@@ -553,5 +626,7 @@ fn audio_observation_json(snapshot: &rp2040_emu::AudioSinkSnapshot) -> Value {
         "wrong_width_count".into(),
         json!(snapshot.wrong_width_count),
     );
+    value.insert("timer_fraction_x".into(), json!(snapshot.timer_fraction_x));
+    value.insert("timer_fraction_y".into(), json!(snapshot.timer_fraction_y));
     Value::Object(value)
 }

@@ -5,8 +5,11 @@
 //! process boundary, direction/sequence checks, UART input result, and clean
 //! quit behavior are exercised without a WSLg dependency.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use picocalc_board::sha256::sha256_hex;
 use serde_json::Value;
@@ -58,6 +61,104 @@ fn runner_with_board(board: bool) -> Child {
         .expect("spawn picocalc-run preview backend")
 }
 
+fn runner_with_firmware(firmware: &Path) -> Child {
+    let bootrom = bootrom_path();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_picocalc-run"));
+    command
+        .args([
+            "--bin",
+            firmware.to_str().expect("firmware path is UTF-8"),
+            "--bootrom",
+            bootrom.as_str(),
+            "--preview-api",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.spawn().expect("spawn UART RX preview backend")
+}
+
+fn unique_fixture_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "picocalc-preview-{name}-{}-{nanos}.bin",
+        std::process::id()
+    ))
+}
+
+/// Build a tiny RP2040 Thumb-1 firmware that enables UART0 RX/TX, emits a
+/// ready byte, then echoes every byte received from the external UART wire.
+///
+/// The fixture is deliberately generated here rather than checked in as an
+/// opaque binary. It uses only the instruction encodings already covered by
+/// the RP2040 raw-flash tests: literal loads, word MMIO loads/stores, MOVS,
+/// ANDS, CMP, and short backward branches.
+fn uart_echo_firmware() -> Vec<u8> {
+    // `bootrom.bin` is the repository's synthetic handoff and starts the
+    // reset handler at flash offset zero.  Keep this fixture in that layout;
+    // a B2 bootrom image would instead require a vector table at +0x100.
+    const CODE_OFFSET: usize = 0;
+    const RESETS_CLR: u32 = 0x4000_f000;
+    const RESET_UART0: u32 = 1 << 22;
+    const UART0_BASE: u32 = 0x4003_4000;
+
+    let literals = [RESETS_CLR, RESET_UART0, UART0_BASE, 0x70, 0x301];
+    let mut words = vec![
+        0x4800, // LDR r0, =RESETS_CLR (patched below)
+        0x4900, // LDR r1, =RESET_UART0
+        0x6001, // STR r1, [r0]
+        0x4800, // LDR r0, =UART0_BASE
+        0x4900, // LDR r1, =UARTLCR_H
+        0x62c1, // STR r1, [r0, #0x2c]
+        0x4900, // LDR r1, =UARTCR
+        0x6301, // STR r1, [r0, #0x30]
+        0x2145, // MOVS r1, #'E' (ready marker)
+        0x6001, // STR r1, [r0, #UARTDR]
+        0x2210, // MOVS r2, #UARTFR.RXFE
+        0x6981, // loop: LDR r1, [r0, #UARTFR]
+        0x4011, // ANDS r1, r2
+        0x2900, // CMP r1, #0
+        0xd1fb, // BNE loop (-10 bytes)
+        0x6801, // LDR r1, [r0, #UARTDR]
+        0x6001, // STR r1, [r0, #UARTDR]
+        0xe7f8, // B loop (-16 bytes)
+    ];
+
+    // The loop starts at word 11. The literal pool follows the code and is
+    // reachable by the first LDR with a word-scaled PC-relative immediate.
+    let pool_offset = (CODE_OFFSET + words.len() * 2 + 3) & !3;
+    for (literal_index, word_index) in [0usize, 1, 3, 4, 6].into_iter().enumerate() {
+        let instruction_offset = CODE_OFFSET + word_index * 2;
+        let pc_aligned = (instruction_offset + 4) & !3;
+        let target_offset = pool_offset + literal_index * 4;
+        let distance = target_offset
+            .checked_sub(pc_aligned)
+            .expect("literal pool follows echo program");
+        assert!(distance.is_multiple_of(4) && distance / 4 <= 0xff);
+        words[word_index] = 0x4800
+            | ((if word_index == 0 || word_index == 3 {
+                0
+            } else {
+                1
+            }) << 8)
+            | (distance / 4) as u16;
+    }
+
+    let mut image = vec![0u8; pool_offset + literals.len() * 4];
+    for (index, word) in words.into_iter().enumerate() {
+        let offset = CODE_OFFSET + index * 2;
+        image[offset..offset + 2].copy_from_slice(&word.to_le_bytes());
+    }
+    for (index, literal) in literals.into_iter().enumerate() {
+        let offset = pool_offset + index * 4;
+        image[offset..offset + 4].copy_from_slice(&literal.to_le_bytes());
+    }
+    image
+}
+
 fn machine_api_runner_with_board(board: bool) -> Child {
     let bootrom = bootrom_path();
     let firmware = firmware_path();
@@ -73,6 +174,48 @@ fn machine_api_runner_with_board(board: bool) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn picocalc-run machine API")
+}
+
+fn replay_scenario_runner(scenario: &Path, machine_api: bool) -> Child {
+    let bootrom = bootrom_path();
+    let firmware = firmware_path();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_picocalc-run"));
+    command.args([
+        "--bin",
+        firmware.as_str(),
+        "--bootrom",
+        bootrom.as_str(),
+        "--cycles",
+        "1000000",
+        "--replay-scenario",
+        scenario.to_str().expect("scenario path is UTF-8"),
+    ]);
+    command.arg(if machine_api {
+        "--machine-api"
+    } else {
+        "--preview-api"
+    });
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn replay runner")
+}
+
+fn replay_scenario_fixture() -> PathBuf {
+    let path = unique_fixture_path("scenario");
+    fs::write(
+        &path,
+        r#"{
+  "schema": 1,
+  "name": "replay-smoke",
+  "poll_ms": 5,
+  "steps": [{"op": "wait", "ms": 1}]
+}"#,
+    )
+    .expect("write replay scenario fixture");
+    path
 }
 
 fn canonical_observation_digest(projection: &Value) -> String {
@@ -342,6 +485,99 @@ fn preview_uart_direction_and_quit_are_process_safe() {
 }
 
 #[test]
+fn preview_uart_rx_echo_and_overrun_are_directional_and_bounded() {
+    let firmware = unique_fixture_path("uart-echo");
+    fs::write(&firmware, uart_echo_firmware()).expect("write UART echo fixture");
+    let mut child = runner_with_firmware(&firmware);
+    let mut stdin = child.stdin.take().expect("runner stdin");
+    let mut stdout = child.stdout.take().expect("runner stdout");
+
+    let (kind, sequence, _) = read_frame(&mut stdout);
+    assert_eq!((kind, sequence), (HELLO, 0));
+    let (kind, sequence, _) = read_frame(&mut stdout);
+    assert_eq!((kind, sequence), (STATUS, 1));
+    let mut last_output_sequence = sequence;
+
+    // The fixture emits E only after UART0 has been released and RXE/TXE are
+    // enabled. Waiting for that byte makes the positive RX assertion
+    // independent of host scheduling between startup and the first command.
+    loop {
+        let (kind, sequence, payload) = read_frame(&mut stdout);
+        assert_eq!(sequence, last_output_sequence + 1);
+        last_output_sequence = sequence;
+        if kind == UART_TX {
+            assert_eq!(payload.len(), 9);
+            assert_eq!(payload[8], b'E');
+            break;
+        }
+    }
+
+    // No stepping occurs between these queued commands: the preview input
+    // drain handles all of them in one turn. UART0's 16-byte RX FIFO therefore
+    // accepts the first sixteen bytes and reports the seventeenth as an
+    // explicit overrun rather than silently dropping it.
+    let input = b"abcdefghijklmnopq";
+    for (sequence, byte) in input.iter().copied().enumerate() {
+        send_frame(&mut stdin, UART_RX, sequence as u32, &[byte]);
+    }
+
+    let mut echoes = Vec::new();
+    let mut overrun = 0u64;
+    let mut disabled = 0u64;
+    let mut accepted = None;
+    let mut reported_overrun = None;
+    while echoes.len() < 16 || overrun == 0 || accepted != Some(16) {
+        let (kind, sequence, payload) = read_frame(&mut stdout);
+        assert_eq!(sequence, last_output_sequence + 1);
+        last_output_sequence = sequence;
+        match kind {
+            UART_TX => {
+                assert_eq!(payload.len(), 9);
+                echoes.push(payload[8]);
+            }
+            ERROR => {
+                let error: Value = serde_json::from_slice(&payload).expect("UART error JSON");
+                match error["code"].as_str() {
+                    Some("uart_rx_overrun") => overrun += 1,
+                    Some("uart_rx_disabled") => disabled += 1,
+                    other => panic!("unexpected preview UART error {other:?}: {error}"),
+                }
+            }
+            STATUS => {
+                let status: Value = serde_json::from_slice(&payload).expect("UART status JSON");
+                accepted = status["uart"]["rx_accepted"].as_u64();
+                reported_overrun = status["uart"]["rx_overrun"].as_u64();
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(disabled, 0, "RX was unexpectedly reported disabled");
+    assert_eq!(overrun, 1, "exactly one byte must overrun the RX FIFO");
+    assert_eq!(reported_overrun, Some(1));
+    assert_eq!(accepted, Some(16));
+    assert_eq!(echoes, input[..16]);
+
+    send_frame(&mut stdin, QUIT, input.len() as u32, &[]);
+    loop {
+        let (kind, sequence, payload) = read_frame(&mut stdout);
+        assert_eq!(sequence, last_output_sequence + 1);
+        last_output_sequence = sequence;
+        if kind == 11 {
+            let goodbye: Value = serde_json::from_slice(&payload).expect("goodbye JSON");
+            assert_eq!(goodbye["reason"], "quit");
+            break;
+        }
+    }
+    let output = child.wait_with_output().expect("wait for UART RX runner");
+    assert!(
+        output.status.success(),
+        "UART RX preview runner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_file(&firmware).expect("remove UART echo fixture");
+}
+
+#[test]
 fn preview_protocol_error_is_fail_closed() {
     let mut child = runner();
     let mut stdin = child.stdin.take().expect("runner stdin");
@@ -364,6 +600,88 @@ fn preview_protocol_error_is_fail_closed() {
         "stderr did not identify the protocol failure: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn registered_replay_finishes_with_a_pass_status() {
+    let scenario = replay_scenario_fixture();
+    let mut child = replay_scenario_runner(&scenario, false);
+    let mut stdin = child.stdin.take().expect("replay stdin");
+    let mut stdout = child.stdout.take().expect("replay stdout");
+
+    assert_eq!(read_frame(&mut stdout).0, HELLO);
+    let mut last_sequence = read_frame(&mut stdout).1;
+    let mut saw_pass = false;
+    let mut replay_cycle = 0;
+    while !saw_pass {
+        let (kind, sequence, payload) = read_frame(&mut stdout);
+        assert_eq!(sequence, last_sequence + 1);
+        last_sequence = sequence;
+        if kind != STATUS {
+            continue;
+        }
+        let status: Value = serde_json::from_slice(&payload).expect("replay status JSON");
+        if status["replay"]["status"] == "pass" {
+            saw_pass = true;
+            replay_cycle = status["virtual_cycle"]
+                .as_u64()
+                .expect("replay status cycle");
+            assert!(replay_cycle > 0);
+            assert_eq!(status["replay"]["steps_completed"], 1);
+            assert_eq!(status["replay"]["steps_total"], 1);
+        }
+    }
+
+    send_frame(&mut stdin, QUIT, 0, &[]);
+    loop {
+        let (kind, sequence, _) = read_frame(&mut stdout);
+        assert_eq!(sequence, last_sequence + 1);
+        last_sequence = sequence;
+        if kind == 11 {
+            break;
+        }
+    }
+    let output = child.wait_with_output().expect("wait for replay runner");
+    assert!(
+        output.status.success(),
+        "replay runner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(replay_cycle > 0);
+    fs::remove_file(&scenario).expect("remove replay scenario fixture");
+}
+
+#[test]
+fn machine_api_registered_replay_is_observable_at_final_cycle() {
+    let scenario = replay_scenario_fixture();
+    let mut child = replay_scenario_runner(&scenario, true);
+    let mut stdin = child.stdin.take().expect("machine replay stdin");
+    let stdout = child.stdout.take().expect("machine replay stdout");
+    let mut stdout = BufReader::new(stdout);
+    writeln!(
+        stdin,
+        r#"{{"schema":1,"id":"observe","op":"observe","domains":["preview"]}}"#
+    )
+    .expect("write machine replay observe");
+    stdin.flush().expect("flush machine replay observe");
+    let mut line = String::new();
+    stdout
+        .read_line(&mut line)
+        .expect("read machine replay response");
+    let response: Value = serde_json::from_str(&line).expect("machine replay JSON");
+    assert_eq!(response["ok"], true);
+    assert!(response["cycle"].as_u64().expect("machine replay cycle") > 0);
+    assert_eq!(response["result"]["preview"]["schema_version"], 1);
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .expect("wait for machine replay runner");
+    assert!(
+        output.status.success(),
+        "machine replay runner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_file(&scenario).expect("remove replay scenario fixture");
 }
 
 #[test]
@@ -610,6 +928,11 @@ fn preview_observation_matches_machine_api_at_a_shared_cycle() {
         canonical_observation_digest(&preview_common),
         canonical_observation_digest(&report_common),
         "batch and preview observation boundary digests diverged"
+    );
+    assert_eq!(
+        preview_digest,
+        canonical_observation_digest(&preview_common),
+        "preview's declared digest does not cover the report-compatible projection"
     );
     let _ = std::fs::remove_file(&analysis_path);
     let _ = std::fs::remove_file(&report_path);

@@ -103,7 +103,10 @@ digest. A local process E2E now runs a board-backed synthetic UART fixture and
 compares the report-compatible observation projection from the batch runner
 with both APIs at one exact virtual cycle, including the initial RGB565 LCD
 frame. This is a VRP-2 smoke gate, not target admission or a qualified
-realtime/GUI/audio acceptance result.
+realtime/GUI/audio acceptance result. The local compatibility suite also fixes
+the machine API schema-1 golden transcript and exercises directional UART RX
+acceptance plus bounded FIFO overrun; these remain local evidence until the
+registered-target digest admission gate is closed.
 
 The primary reference for keyboard-controller behavior is ClockworkPi's official
 [`PicoCalc/Code/picocalc_keyboard`](https://github.com/clockworkpi/PicoCalc/tree/master/Code/picocalc_keyboard)

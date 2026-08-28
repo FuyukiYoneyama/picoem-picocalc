@@ -64,7 +64,10 @@ mod preview_protocol;
 mod scenario;
 mod session;
 
-use session::{MachineSession, PREVIEW_OBSERVATION_SCHEMA_VERSION, SessionStop};
+use session::{
+    MachineSession, PREVIEW_OBSERVATION_SCHEMA_VERSION, ScenarioReplay, ScenarioReplayStep,
+    SessionStop,
+};
 
 /// Report schema version. Bump on any breaking field change.
 ///
@@ -281,6 +284,7 @@ struct Args {
     sd_format: SdFormat,
     keys: Option<String>,
     scenario: Option<PathBuf>,
+    replay_scenario: Option<PathBuf>,
     snapshot_dir: PathBuf,
     machine_api: bool,
     preview_api: bool,
@@ -550,6 +554,9 @@ fn print_usage() {
                                   'scenario' report section. Exit 1 if any step fails.\n\
                                   Milliseconds are virtual, derived from the system clock\n\
                                   the firmware has programmed.\n\
+         --replay-scenario <path> VRP-2 registered-target replay for --machine-api or\n\
+                                  --preview-api. Reuses the authoritative scenario timing\n\
+                                  boundary and emits no schema-8 report.\n\
          --snapshot-dir <path>    Where scenario 'snapshot' steps write their PNGs.\n\
                                   Default: the current directory.\n\
          --machine-api            NEXT-4 JSON Lines API on stdin/stdout. Uses the same\n\
@@ -642,6 +649,7 @@ fn parse_args() -> Result<Args, String> {
     let mut sd_format_explicit = false;
     let mut keys: Option<String> = None;
     let mut scenario: Option<PathBuf> = None;
+    let mut replay_scenario: Option<PathBuf> = None;
     let mut snapshot_dir: Option<PathBuf> = None;
     let mut machine_api = false;
     let mut preview_api = false;
@@ -750,6 +758,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--keys" => keys = Some(value("--keys")?),
             "--scenario" => scenario = Some(PathBuf::from(value("--scenario")?)),
+            "--replay-scenario" => {
+                if replay_scenario.is_some() {
+                    return Err("--replay-scenario may be specified only once".to_string());
+                }
+                replay_scenario = Some(PathBuf::from(value("--replay-scenario")?));
+            }
             "--snapshot-dir" => snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
             "--machine-api" => machine_api = true,
             "--preview-api" => preview_api = true,
@@ -885,17 +899,39 @@ fn parse_args() -> Result<Args, String> {
     if keys.is_some() {
         keyboard = true;
     }
-    if snapshot_dir.is_some() && scenario.is_none() && !machine_api {
-        return Err("--snapshot-dir requires --scenario or --machine-api".to_string());
+    if snapshot_dir.is_some() && scenario.is_none() && replay_scenario.is_none() && !machine_api {
+        return Err(
+            "--snapshot-dir requires --scenario, --replay-scenario or --machine-api".to_string(),
+        );
     }
     if expected_stop == Some(StopReason::PcMatch) && stop_pc.is_none() {
         return Err("--expect-stop pc_match requires --stop-pc".to_string());
     }
-    if expected_stop == Some(StopReason::ScenarioDone) && scenario.is_none() {
+    if expected_stop == Some(StopReason::ScenarioDone)
+        && scenario.is_none()
+        && replay_scenario.is_none()
+    {
         return Err("--expect-stop scenario_done requires --scenario".to_string());
     }
     if scenario.is_some() && stop_pc.is_some() {
         return Err("--scenario and --stop-pc define competing successful stops".to_string());
+    }
+    if scenario.is_some() && replay_scenario.is_some() {
+        return Err("--scenario and --replay-scenario are mutually exclusive".to_string());
+    }
+    if replay_scenario.is_some() && !machine_api && !preview_api {
+        return Err("--replay-scenario requires --machine-api or --preview-api".to_string());
+    }
+    if replay_scenario.is_some() && stop_pc.is_some() {
+        return Err("--replay-scenario cannot be combined with --stop-pc".to_string());
+    }
+    if replay_scenario.is_some() && expected_stop.is_some() {
+        return Err("--replay-scenario cannot be combined with --expect-stop".to_string());
+    }
+    if replay_scenario.is_some()
+        && (!expected_uart.is_empty() || expected_audio_sink_count.is_some())
+    {
+        return Err("--replay-scenario cannot be combined with report expectations".to_string());
     }
     if scenario.is_some()
         && expected_stop.is_some()
@@ -1069,6 +1105,7 @@ fn parse_args() -> Result<Args, String> {
         sd_format,
         keys,
         scenario,
+        replay_scenario,
         snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
         machine_api,
         preview_api,
@@ -2246,6 +2283,26 @@ fn run_loop(
                 .bus
                 .virtual_time_cycles_at(e.next_poll_ns())
                 .max(machine.cycles() + 1);
+        }
+    }
+}
+
+/// Run a registered scenario to completion for the VRP-2 digest gate.  The
+/// replay driver shares the exact polling/advance semantics with `run_loop`,
+/// but deliberately stops without building a schema-8 report; callers inspect
+/// the shared observation projection through machine API or preview status.
+fn run_replay_to_completion(
+    machine: &mut MachineSession,
+    replay: &mut ScenarioReplay,
+) -> Result<(), String> {
+    loop {
+        match replay.step(machine)? {
+            ScenarioReplayStep::Advanced { .. } => {}
+            ScenarioReplayStep::Complete => {
+                machine.drain_uart();
+                return Ok(());
+            }
+            ScenarioReplayStep::Failed(error) => return Err(error),
         }
     }
 }
@@ -4939,7 +4996,11 @@ fn run() -> Result<Verdict, String> {
         Some(path) => Some(scenario::load(path)?),
         None => None,
     };
-    if let Some(s) = &scenario {
+    let replay_scenario = match &args.replay_scenario {
+        Some(path) => Some(scenario::load(path)?),
+        None => None,
+    };
+    if let Some(s) = scenario.as_ref().or(replay_scenario.as_ref()) {
         if s.needs_lcd() && args.board != Board::PicoCalc {
             return Err(format!(
                 "scenario '{}' looks at the panel, which needs --board picocalc",
@@ -5067,6 +5128,8 @@ fn run() -> Result<Verdict, String> {
     };
     let mut machine = MachineSession::new(emu, handles);
     machine.set_boot_mode(boot_mode);
+    let mut replay = replay_scenario
+        .map(|scenario| ScenarioReplay::new(scenario, args.snapshot_dir.clone(), args.cycles));
     if args.preview_api {
         machine.enable_preview_uart_cycle_tap();
     }
@@ -5075,10 +5138,13 @@ fn run() -> Result<Verdict, String> {
         machine.arm_event_profile_after_uart(marker);
     }
     if args.preview_api {
-        preview_api::run(&mut machine)?;
+        preview_api::run(&mut machine, replay.take())?;
         return Ok(Verdict::Pass);
     }
     if args.machine_api {
+        if let Some(mut replay) = replay.take() {
+            run_replay_to_completion(&mut machine, &mut replay)?;
+        }
         run_machine_api(&mut machine, &args.snapshot_dir)?;
         return Ok(Verdict::Pass);
     }

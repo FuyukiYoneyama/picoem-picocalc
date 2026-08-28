@@ -39,7 +39,10 @@ Startup emits `hello` and an initial `status`.  The loop then emits:
 - status snapshots containing virtual cycle/time, pacer ratio/lag/behind count,
   framebuffer update count, UART RX/TX/drop state, and the versioned
   observation projection/digest for UART, framebuffer, unsupported-MMIO, and
-  audio-sink state;
+  audio-sink state.  The projection's audio member is the complete bounded
+  DMA-to-PWM surface shared with schema-8 `audio_sink`; post-quantizer
+  loudness/rail metrics remain in the separate `--audio-analysis` artifact and
+  are not silently folded into the VRP-2 digest;
 - RGB565 framebuffer snapshots when the LCD model changes;
 - `error` messages for rejected key input, disabled/overrun UART RX, or a full
   keyboard queue;
@@ -58,11 +61,13 @@ work package.  The backend therefore must not be described as an audio player.
 The existing JSON Lines machine API can request the same projection with
 `{"schema":1,"id":"obs","op":"observe","domains":["preview"]}`.
 The response carries `schema_version`, `virtual_cycle`, `projection`, and its
-canonical `digest_sha256`.  This is an observation surface only: a board-backed
-synthetic same-cycle comparison is already covered by the local smoke gate, but
-VRP-2 still needs the comparison to be connected to a versioned registered
-target and admission gate before the projection can be called a qualification
-result.
+canonical `digest_sha256`.  This is an observation surface only.  The
+`--replay-scenario` option drives a registered scenario to completion before a
+machine-API `observe` request or preview status is served; it is intended for
+the `picocalc.py preview-digest-gate` comparison and is not a replacement for
+the schema-8 batch report.  A board-backed synthetic same-cycle comparison is
+covered by the local smoke gate.  Registered-target admission and the
+four-way digest decision remain owned by `picocalc_emu`.
 
 ## Verification boundary
 
@@ -73,7 +78,8 @@ cargo test -p picoem-common --locked
 cargo test -p rp2040-emu --locked
 cargo test -p picocalc-harness --locked
 cargo test -p picocalc-harness --test preview_api_e2e --locked
-cargo clippy -p picocalc-harness --locked -- -D warnings
+cargo test -p picocalc-harness --test machine_api_schema1_golden --locked
+cargo clippy -p picocalc-harness --tests --locked -- -D warnings
 ```
 
 The preview E2E test speaks the wire directly, confirms UART direction and
@@ -81,19 +87,26 @@ clean quit, injects an unknown message kind to verify fail-closed exit, and
 compares a board-backed synthetic UART fixture against the batch report and
 machine API at one exact virtual cycle. The comparison covers the complete
 report-compatible UART, initial RGB565 framebuffer, unsupported-MMIO, and
-audio-sink observation projection. This is a local backend smoke gate; it is
+audio-sink DMA-to-PWM observation projection. This is a local backend smoke gate; it is
 not target admission, realtime qualification, or a GitHub Actions trigger.
+The `machine_api_schema1_golden` test replays the repository-owned
+`crates/picocalc-harness/tests/fixtures/machine-api-schema1-golden.jsonl`
+transcript against the real runner and protects the established schema-1
+`run`/`step`/`run_until`/`input`/`observe`/`subscribe`/`snapshot` responses.
+The UART RX positive/overrun case is part of `preview_api_e2e`; its generated
+fixture is temporary and does not change the authoritative firmware report.
 
 ## Current qualification status
 
 VRP-2 provides a deterministic preview backend API on the existing Serial
-emulator.  The board-backed report-compatible cross-API smoke gate is present,
-but it does not yet provide:
+emulator.  The board-backed report-compatible cross-API smoke gate, the
+machine-API schema-1 golden transcript, and the directional UART RX
+positive/overrun evidence are present. It does not yet provide:
 
-- target-admission integration for the cross-API boundary digest (the shared
-  `src/session.rs` owns the session state and stepping boundary, and the
-  preview/machine APIs expose a versioned projection and digest; the smoke
-  fixture is synthetic and is not a registered validation target);
+- the real registered-target digest result (the backend now exposes the
+  replay-only boundary consumed by `picocalc.py preview-digest-gate`, but the
+  currently recorded VRP-2 targets predate complete `audio_sink` observation
+  and the gate must not fill that data by inference);
 - a GUI, PicoCalc device skin, or automatic UART window (VRP-3);
 - bounded host PCM streaming (VRP-4);
 - a `REALTIME OK` or `realtime-1x-qualified` capability (VRP-5 and
