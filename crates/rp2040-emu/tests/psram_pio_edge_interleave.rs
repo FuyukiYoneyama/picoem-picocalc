@@ -108,7 +108,7 @@ fn assemble_spi_psram_fudge() -> [u16; 10] {
         insn(OP_JMP, jmp_operand(COND_NOT_Y, 0), 0b00, 0), // 5: jmp !y, 0
         insn(OP_MOV, mov_operand(DEST_Y, 0, DEST_Y), 0b10, 0), // 6: nop (mov y, y)
         insn(OP_JMP, jmp_operand(COND_ALWAYS, 9), 0b00, 0), // 7: jmp 9
-        insn(OP_IN, in_operand(DEST_PINS, 1), 0b00, 0),  // 8: in pins, 1
+        insn(OP_IN, in_operand(DEST_PINS, 1), 0b00, 0), // 8: in pins, 1
         insn(OP_JMP, jmp_operand(COND_Y_DEC, 8), 0b10, 0), // 9: jmp y--, 8
     ]
 }
@@ -130,7 +130,14 @@ const PIN_MOSI: u8 = 3;
 /// what `pico_sdk`'s `pio_sm_set_consecutive_pindirs` does on real
 /// hardware (and `bus_pio_instr_mem_write_is_observable_via_force_exec`
 /// / `blinky_emulator` in `src/pio_tests.rs`).
-fn force_set_pindirs(emu: &mut Emulator, base: u32, pio_base: u32, pin_base: u8, count: u8, value: u8) {
+fn force_set_pindirs(
+    emu: &mut Emulator,
+    base: u32,
+    pio_base: u32,
+    pin_base: u8,
+    count: u8,
+    value: u8,
+) {
     let pinctrl = ((count as u32) << 26) | ((pin_base as u32) << 5);
     emu.bus.write32(pio_base + 0x0DC, pinctrl);
     const SET_PINDIRS_DEST: u8 = 4;
@@ -162,7 +169,10 @@ fn park_core0_on_nops(emu: &mut Emulator) {
 /// can probe both a bulk-unsafe quantum (>1) and the quantum=1
 /// always-safe baseline.
 fn build_psram_pio_emulator(step_quantum: u32) -> Emulator {
-    build_psram_pio_emulator_with(Psram::new(PIN_MISO, PIN_CS, PIN_SCK, PIN_MOSI), step_quantum)
+    build_psram_pio_emulator_with(
+        Psram::new(PIN_MISO, PIN_CS, PIN_SCK, PIN_MOSI),
+        step_quantum,
+    )
 }
 
 /// Same as [`build_psram_pio_emulator`] but takes a caller-configured
@@ -322,7 +332,10 @@ fn bulk_quantum_write_frame_lands_correct_byte_with_psram_attached() {
          — a value other than 1 here means edges were lost inside the quantum, \
          exactly the Gate 3 bug"
     );
-    assert_eq!(psram.bytes_written, 1, "exactly one data byte must be written");
+    assert_eq!(
+        psram.bytes_written, 1,
+        "exactly one data byte must be written"
+    );
     assert_eq!(
         psram.buffer[0x10], 0xAB,
         "the byte must land at the address the frame specified"

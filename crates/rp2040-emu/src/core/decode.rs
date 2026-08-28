@@ -287,7 +287,11 @@ impl CortexM0Plus {
         let entry = {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
             let e = self.decode_cache[slot];
-            if e.matches_pc(pc, slot) { Some(e) } else { None }
+            if e.matches_pc(pc, slot) {
+                Some(e)
+            } else {
+                None
+            }
         };
         #[cfg(not(feature = "unconditional-cache-lookup-prototype"))]
         let entry = if is_cacheable_pc(pc) {
@@ -922,11 +926,11 @@ mod compact_dispatch_key_tests {
     use crate::bus::DecodedOp;
 
     use super::{
-        compact_dispatch_key_narrow, compact_dispatch_key_wide, DISPATCH_KEY_NARROW_COND_BRANCH,
-        DISPATCH_KEY_NARROW_DATA_PROCESSING, DISPATCH_KEY_NARROW_LDR_LITERAL,
-        DISPATCH_KEY_NARROW_LOAD_STORE_REG, DISPATCH_KEY_NARROW_MISC,
-        DISPATCH_KEY_NARROW_SPECIAL_DATA, DISPATCH_KEY_WIDE_BL, DISPATCH_KEY_WIDE_MISC,
-        DISPATCH_KEY_WIDE_UNDEFINED,
+        DISPATCH_KEY_NARROW_COND_BRANCH, DISPATCH_KEY_NARROW_DATA_PROCESSING,
+        DISPATCH_KEY_NARROW_LDR_LITERAL, DISPATCH_KEY_NARROW_LOAD_STORE_REG,
+        DISPATCH_KEY_NARROW_MISC, DISPATCH_KEY_NARROW_SPECIAL_DATA, DISPATCH_KEY_WIDE_BL,
+        DISPATCH_KEY_WIDE_MISC, DISPATCH_KEY_WIDE_UNDEFINED, compact_dispatch_key_narrow,
+        compact_dispatch_key_wide,
     };
 
     #[test]

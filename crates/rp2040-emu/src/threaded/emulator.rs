@@ -1494,10 +1494,7 @@ mod tests {
         assert_eq!(r0, 1u32 << 0);
         assert_eq!(r5, 1u32 << 5);
         assert_eq!(r31, 1u32 << 31);
-        assert_eq!(
-            emu.bus.sio.spinlock_bits(),
-            (1 << 0) | (1 << 5) | (1 << 31)
-        );
+        assert_eq!(emu.bus.sio.spinlock_bits(), (1 << 0) | (1 << 5) | (1 << 31));
         emu.cores[0].halt();
         emu.cores[1].halt();
 

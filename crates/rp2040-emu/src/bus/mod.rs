@@ -51,14 +51,14 @@ use crate::irq::{
     IRQ_SIO_IRQ_PROC1, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_UART0_IRQ, IRQ_UART1_IRQ,
 };
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
-use crate::virtual_time::VirtualClock;
 use crate::peripherals::adc::AdcRegs;
 use crate::peripherals::i2c::I2cRegs;
 use crate::peripherals::pwm::PwmRegs;
 use crate::peripherals::spi::SpiRegs;
 use crate::peripherals::timer::TimerRegs;
-use crate::peripherals::uart::UartRegs;
+use crate::peripherals::uart::{UartRegs, UartRxResult};
 use crate::peripherals::watchdog_tick::WatchdogTickRegs;
+use crate::virtual_time::VirtualClock;
 use clocks::{ClockTree, ClocksRegs, PLL_RESET, PllRegs, ROSC_FREQ_HZ, RoscRegs, XoscRegs};
 use io_bank0::IoBank0;
 use pads_bank0::PadsBank0;
@@ -372,7 +372,11 @@ impl DecodedOp {
             if wide {
                 tag_flags |= Self::WIDE_MASK;
             }
-            Self { tag_flags, hw0, hw1 }
+            Self {
+                tag_flags,
+                hw0,
+                hw1,
+            }
         }
         #[cfg(not(feature = "decoded-op-8byte-prototype"))]
         {
@@ -1033,11 +1037,8 @@ impl Bus {
     /// module state remains attached, so elapsed time must not jump back to
     /// zero merely because the MCU reset domain did.
     pub(crate) fn restore_virtual_time_after_reset(&mut self, ns: u64) {
-        self.virtual_time.restore_after_reset(
-            self.master_cycle,
-            ns,
-            self.clock_tree.sys_clk_hz,
-        );
+        self.virtual_time
+            .restore_after_reset(self.master_cycle, ns, self.clock_tree.sys_clk_hz);
     }
 
     /// Advance the shared snapshot once and deliver the resulting delta to
@@ -1254,6 +1255,38 @@ impl Bus {
     /// `UART0.DR` since the previous call. See `UartRegs::drain_tx_log`.
     pub fn drain_uart0_tx_log(&mut self) -> Vec<u8> {
         self.uart0.drain_tx_log()
+    }
+
+    /// Drain UART0 TX writes with their exact virtual bus cycles. The
+    /// byte-only accessor remains the compatibility path for reports; this
+    /// richer tap is used by the realtime preview transport.
+    pub fn drain_uart0_tx_log_with_cycles(&mut self) -> Vec<(u64, u8)> {
+        self.uart0.drain_tx_log_with_cycles()
+    }
+
+    /// Enable virtual-cycle metadata on the UART0 TX diagnostic tap. This is
+    /// preview-only and leaves the authoritative byte-only runner path
+    /// unchanged.
+    pub fn enable_uart0_tx_cycle_tap(&mut self) {
+        self.uart0.enable_wire_cycle_tap();
+    }
+
+    /// Inject one byte on the external UART0 RX wire.  This is a harness /
+    /// preview operation; ordinary guest MMIO and authoritative batch runs
+    /// remain unchanged.  The UART model applies its enable, FIFO-capacity,
+    /// IRQ and overrun semantics before returning the result.
+    pub fn inject_uart0_rx(&mut self, byte: u8) -> UartRxResult {
+        self.uart0.inject_rx(byte, &mut self.irq_pending)
+    }
+
+    /// Return the number of bytes waiting in the UART0 guest RX FIFO.
+    pub fn uart0_rx_fifo_len(&self) -> usize {
+        self.uart0.rx_fifo_len()
+    }
+
+    /// Return UART0's raw interrupt status for preview diagnostics.
+    pub fn uart0_raw_interrupt_status(&self) -> u32 {
+        self.uart0.raw_interrupt_status()
     }
 
     #[cfg(feature = "behavior-trace")]
@@ -1528,12 +1561,16 @@ impl Bus {
                     self.watchdog_reset_requested = true;
                 }
             }
-            UART0_BASE => self
-                .uart0
-                .write32(offset, val, alias, &mut self.irq_pending),
-            UART1_BASE => self
-                .uart1
-                .write32(offset, val, alias, &mut self.irq_pending),
+            UART0_BASE => {
+                self.uart0.set_wire_cycle(self.master_cycle);
+                self.uart0
+                    .write32(offset, val, alias, &mut self.irq_pending);
+            }
+            UART1_BASE => {
+                self.uart1.set_wire_cycle(self.master_cycle);
+                self.uart1
+                    .write32(offset, val, alias, &mut self.irq_pending);
+            }
             SPI0_BASE => self.spi0.write32(offset, val, alias, &mut self.irq_pending),
             SPI1_BASE => self.spi1.write32(offset, val, alias, &mut self.irq_pending),
             I2C0_BASE => self.i2c0.write32(offset, val, alias, &mut self.irq_pending),
@@ -1765,8 +1802,14 @@ impl Bus {
             return;
         }
         match base {
-            UART0_BASE => self.uart0.write8(offset, val, &mut self.irq_pending),
-            UART1_BASE => self.uart1.write8(offset, val, &mut self.irq_pending),
+            UART0_BASE => {
+                self.uart0.set_wire_cycle(self.master_cycle);
+                self.uart0.write8(offset, val, &mut self.irq_pending);
+            }
+            UART1_BASE => {
+                self.uart1.set_wire_cycle(self.master_cycle);
+                self.uart1.write8(offset, val, &mut self.irq_pending);
+            }
             SPI0_BASE => self.spi0.write8(offset, val, &mut self.irq_pending),
             SPI1_BASE => self.spi1.write8(offset, val, &mut self.irq_pending),
             I2C0_BASE => self.i2c0.write8(offset, val, &mut self.irq_pending),
@@ -1785,8 +1828,14 @@ impl Bus {
         match base {
             SPI0_BASE => self.spi0.write16(offset, val, &mut self.irq_pending),
             SPI1_BASE => self.spi1.write16(offset, val, &mut self.irq_pending),
-            UART0_BASE => self.uart0.write8(offset, val as u8, &mut self.irq_pending),
-            UART1_BASE => self.uart1.write8(offset, val as u8, &mut self.irq_pending),
+            UART0_BASE => {
+                self.uart0.set_wire_cycle(self.master_cycle);
+                self.uart0.write8(offset, val as u8, &mut self.irq_pending);
+            }
+            UART1_BASE => {
+                self.uart1.set_wire_cycle(self.master_cycle);
+                self.uart1.write8(offset, val as u8, &mut self.irq_pending);
+            }
             I2C0_BASE => self
                 .i2c0
                 .write32(offset, val as u32, 0, &mut self.irq_pending),
@@ -2977,10 +3026,7 @@ mod tests {
 
         fn transaction_end(&mut self) {}
 
-        fn advance_virtual_time(
-            &mut self,
-            delta: crate::peripherals::i2c::I2cVirtualTimeDelta,
-        ) {
+        fn advance_virtual_time(&mut self, delta: crate::peripherals::i2c::I2cVirtualTimeDelta) {
             self.deltas
                 .lock()
                 .expect("time probe lock")

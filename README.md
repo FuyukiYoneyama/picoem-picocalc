@@ -90,6 +90,21 @@ used by the canonical BSP are modelled: SPI1/RGB666 for compatibility and PIO0/R
 the recommended configuration. The scenario runner can inject timed keys and assert UART,
 pixel, and framebuffer-region conditions while firmware is executing.
 
+The VRP-2 preview backend is available as an opt-in headless process. It
+speaks the frozen `PCRP` framed protocol on stdin/stdout and keeps diagnostics
+on stderr; it does not add a GUI or claim realtime-1x support. See
+[`docs/VALIDATED_REALTIME_PREVIEW_BACKEND.md`](docs/VALIDATED_REALTIME_PREVIEW_BACKEND.md)
+for the wire boundary, commands, fail-closed rules, and local verification
+commands. Use `--preview-api` only from a validated preview supervisor; the
+normal report-producing runner and machine API remain separate contracts. The
+preview status and machine API `observe` operation expose the same versioned
+UART/framebuffer/unsupported-MMIO/audio observation projection and canonical
+digest. A local process E2E now runs a board-backed synthetic UART fixture and
+compares the report-compatible observation projection from the batch runner
+with both APIs at one exact virtual cycle, including the initial RGB565 LCD
+frame. This is a VRP-2 smoke gate, not target admission or a qualified
+realtime/GUI/audio acceptance result.
+
 The primary reference for keyboard-controller behavior is ClockworkPi's official
 [`PicoCalc/Code/picocalc_keyboard`](https://github.com/clockworkpi/PicoCalc/tree/master/Code/picocalc_keyboard)
 STM32F103R8T6 firmware. In this workspace it is checked out at

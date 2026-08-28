@@ -49,6 +49,9 @@ workspace = true
 # Serial as the correctness reference (see picocalc_emu
 # docs/IMPLEMENTATION_PLAN.md §3.1). No `threading` feature.
 rp2040-emu = { path = "../rp2040-emu" }
+# The realtime preview reuses the workspace pacer; it does not own an
+# emulator clock or add pacing semantics to the authoritative runner.
+picoem-common = { path = "../picoem-common" }
 # Board models (ST7365P display, pin map, framebuffer/PNG, shared sha256).
 picocalc-board = { path = "../picocalc-board", default-features = false }
 # Scenario files are JSON *input*. Reports stay hand-written so field

@@ -11836,7 +11836,8 @@ mod stage4_core_residue_v2 {
         // The slot must NOT have been populated with `pc_sio` as the tag
         // — non-cacheable PCs skip the cache writeback.
         assert_ne!(
-            cpu.decode_cache[slot].tag_for_slot(slot), pc_sio,
+            cpu.decode_cache[slot].tag_for_slot(slot),
+            pc_sio,
             "non-cacheable PC must not populate cache slot"
         );
         // (If decode_execute didn't bus-fault, the slot keeps its initial
@@ -11919,15 +11920,21 @@ mod stage4_core_residue_v2 {
     #[test]
     fn is_wide_rejects_m33_only_prefixes() {
         // 0b11101 (0xE800..0xEFFF) — Thumb-32 on M33 only.
-        for hw0 in [0xE800u16, 0xE900, 0xEA00, 0xEB00, 0xEC00, 0xED00, 0xEE00, 0xEF00] {
+        for hw0 in [
+            0xE800u16, 0xE900, 0xEA00, 0xEB00, 0xEC00, 0xED00, 0xEE00, 0xEF00,
+        ] {
             assert!(!is_wide(hw0), "{hw0:#06x} is M33-only wide");
         }
         // 0b11111 (0xF800..0xFFFF) — Thumb-32 on M33 only.
-        for hw0 in [0xF800u16, 0xF900, 0xFA00, 0xFB00, 0xFC00, 0xFD00, 0xFE00, 0xFF00] {
+        for hw0 in [
+            0xF800u16, 0xF900, 0xFA00, 0xFB00, 0xFC00, 0xFD00, 0xFE00, 0xFF00,
+        ] {
             assert!(!is_wide(hw0), "{hw0:#06x} is M33-only wide");
         }
         // 0b11110 IS the M0+ wide prefix.
-        for hw0 in [0xF000u16, 0xF100, 0xF200, 0xF300, 0xF400, 0xF500, 0xF600, 0xF700] {
+        for hw0 in [
+            0xF000u16, 0xF100, 0xF200, 0xF300, 0xF400, 0xF500, 0xF600, 0xF700,
+        ] {
             assert!(is_wide(hw0), "{hw0:#06x} is the M0+ wide prefix");
         }
     }
@@ -12023,11 +12030,14 @@ mod stage4_core_residue_v2 {
         cpu.decode_cache[11].set_tag_for_slot(11, 0x2000_0016); // SRAM
         // BULK alongside other region bits — the BULK guard must win.
         cpu.invalidate_decode_cache_regions(
-            crate::bus::invalidation_regions::BULK
-                | crate::bus::invalidation_regions::ROM,
+            crate::bus::invalidation_regions::BULK | crate::bus::invalidation_regions::ROM,
         );
         for (slot_index, slot) in cpu.decode_cache.iter().enumerate() {
-            assert_eq!(slot.tag_for_slot(slot_index), u32::MAX, "BULK clears every slot");
+            assert_eq!(
+                slot.tag_for_slot(slot_index),
+                u32::MAX,
+                "BULK clears every slot"
+            );
         }
     }
 
@@ -12048,9 +12058,21 @@ mod stage4_core_residue_v2 {
         cpu.decode_cache[6].hw0 = 0xCCCC;
         // Sweep ROM only — the SRAM and XIP slots must survive.
         cpu.invalidate_decode_cache_regions(crate::bus::invalidation_regions::ROM);
-        assert_eq!(cpu.decode_cache[2].tag_for_slot(2), u32::MAX, "ROM slot cleared");
-        assert_eq!(cpu.decode_cache[4].tag_for_slot(4), 0x1000_0008, "XIP slot survives");
-        assert_eq!(cpu.decode_cache[6].tag_for_slot(6), 0x2000_000C, "SRAM slot survives");
+        assert_eq!(
+            cpu.decode_cache[2].tag_for_slot(2),
+            u32::MAX,
+            "ROM slot cleared"
+        );
+        assert_eq!(
+            cpu.decode_cache[4].tag_for_slot(4),
+            0x1000_0008,
+            "XIP slot survives"
+        );
+        assert_eq!(
+            cpu.decode_cache[6].tag_for_slot(6),
+            0x2000_000C,
+            "SRAM slot survives"
+        );
     }
 
     /// Combined region mask: ROM | XIP must clear both, leaving SRAM.
@@ -12060,8 +12082,7 @@ mod stage4_core_residue_v2 {
         cpu.decode_cache[2].set_tag_for_slot(2, 0x0000_0004); // ROM
         cpu.decode_cache[4].set_tag_for_slot(4, 0x1000_0008); // XIP
         cpu.decode_cache[6].set_tag_for_slot(6, 0x2000_000C); // SRAM
-        let regions = crate::bus::invalidation_regions::ROM
-            | crate::bus::invalidation_regions::XIP;
+        let regions = crate::bus::invalidation_regions::ROM | crate::bus::invalidation_regions::XIP;
         cpu.invalidate_decode_cache_regions(regions);
         assert_eq!(cpu.decode_cache[2].tag_for_slot(2), u32::MAX);
         assert_eq!(cpu.decode_cache[4].tag_for_slot(4), u32::MAX);
@@ -12715,7 +12736,9 @@ mod stage4_lib_residue_v2 {
     fn load_image_unknown_top_nibble_drops_silently() {
         let mut emu = Emulator::new(Config::default());
         let data = [0xDEu8, 0xAD, 0xBE, 0xEF];
-        for top in [0x3u32, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF] {
+        for top in [
+            0x3u32, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF,
+        ] {
             emu.load_image(top << 28, &data);
         }
         // ROM bytes untouched.
@@ -13174,8 +13197,7 @@ mod stage6_periph_long_tail {
     mod uart {
         use super::tree;
         use crate::peripherals::uart::{
-            UART_INT_TX, UARTCR, UARTDR, UARTIBRD, UARTIFLS, UARTIMSC, UARTLCR_H, UARTRIS,
-            UartRegs,
+            UART_INT_TX, UARTCR, UARTDR, UARTIBRD, UARTIFLS, UARTIMSC, UARTLCR_H, UARTRIS, UartRegs,
         };
 
         const IRQ: u32 = 20;
@@ -13230,7 +13252,11 @@ mod stage6_periph_long_tail {
             }
             // Drain everything. lvl=0 <= thresh=2 → TXIS latches.
             u.tick(100, &tree(), &mut irqs);
-            assert_ne!(u.read32(UARTRIS) & UART_INT_TX, 0, "TXIS must latch on drain");
+            assert_ne!(
+                u.read32(UARTRIS) & UART_INT_TX,
+                0,
+                "TXIS must latch on drain"
+            );
             assert_ne!(irqs & (1u32 << IRQ), 0, "NVIC fire on TXIS");
         }
 
@@ -13462,9 +13488,7 @@ mod stage6_periph_long_tail {
 
     mod pwm {
         use super::tree;
-        use crate::peripherals::pwm::{
-            CSR_EN, EN, INTR, PWM_SLICE_COUNT, PwmRegs, SLICE_STRIDE,
-        };
+        use crate::peripherals::pwm::{CSR_EN, EN, INTR, PWM_SLICE_COUNT, PwmRegs, SLICE_STRIDE};
 
         const IRQ: u32 = 4;
 
@@ -13931,13 +13955,13 @@ mod stage8_lib_residue {
 
 #[cfg(test)]
 mod stage9_residue {
-    use crate::{Config, Emulator};
     #[cfg(all(
         feature = "threading",
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
     use crate::EmulatorBuilder;
+    use crate::{Config, Emulator};
 
     // ============================================================
     // lib.rs §1
@@ -14704,7 +14728,10 @@ mod stage10_lib_precision {
             || emu.bus.nvics[0].is_pending(8)
             || emu.bus.nvics[0].is_pending(9)
             || emu.bus.nvics[0].is_pending(10);
-        assert!(routed, "PIO INT0/INT1 INTF should route to NVIC IRQ pending");
+        assert!(
+            routed,
+            "PIO INT0/INT1 INTF should route to NVIC IRQ pending"
+        );
     }
 
     // ------------------- line 886: PIO0 SM0 max-PC tracker advance -------------------

@@ -48,9 +48,10 @@
 //!
 //! # Receive model
 //!
-//! RX FIFO is present as `VecDeque<u8>` but no stimulus source is wired
-//! in Phase 2 (per the plan's deferral). Reads of `UARTDR` return 0 with
-//! `UARTFR.RXFE=1`. External RX stimulus belongs to a future phase.
+//! RX FIFO is present as `VecDeque<u8>`.  Firmware-facing reads retain the
+//! normal PL011 FIFO semantics; harnesses may inject a bounded host byte via
+//! [`UartRegs::inject_rx`].  Injection is an explicit external stimulus and
+//! does not occur during ordinary conformance runs.
 //!
 //! # IRQ line aggregation
 //!
@@ -61,7 +62,6 @@
 //!
 //! # Deferred from Phase 2
 //!
-//! * External RX stimulus path (FIFO source).
 //! * CTS / DCD / DSR / RI modem-flow-control pins.
 //! * Break-condition timing (`LBE` in `UARTLCR_H.BRK`).
 //! * DMA DREQ generation (`UARTDMACR` is storage-only; Phase 4).
@@ -115,7 +115,6 @@ pub const UARTPCELLID3: u32 = 0xFFC;
 // --- UARTCR bits ------------------------------------------------------
 const UARTCR_UARTEN: u32 = 1 << 0;
 const UARTCR_TXE: u32 = 1 << 8;
-#[allow(dead_code)] // documented bit; RX path not yet wired (Phase 2 deferral)
 const UARTCR_RXE: u32 = 1 << 9;
 
 // --- UARTLCR_H bits ---------------------------------------------------
@@ -162,6 +161,17 @@ const UART_INT_MASK: u32 = UART_INT_CTS
 /// FIFO depth (both TX and RX) when `UARTLCR_H.FEN=1`.
 pub const UART_FIFO_DEPTH: usize = 16;
 
+/// Result of injecting one byte at the host-facing UART RX wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UartRxResult {
+    /// The byte entered the guest-visible RX FIFO.
+    Accepted,
+    /// UARTEN/RXE was not enabled, so the external byte was ignored.
+    Disabled,
+    /// The guest-visible RX FIFO was full; the byte was dropped and OE set.
+    Overrun,
+}
+
 /// PL011 peripheral ID bytes (PID0..3). PL011 r1p5 canonical values.
 const PERIPH_ID: [u32; 4] = [0x11, 0x10, 0x34, 0x00];
 /// PrimeCell ID constants — identical across all PrimeCell peripherals.
@@ -188,10 +198,20 @@ pub struct UartRegs {
     /// NVIC IRQ number this UART raises into `bus.irq_pending`
     /// (UART0=20, UART1=21).
     nvic_irq: u32,
+    /// Bus master cycle associated with the next diagnostic TX event.
+    wire_cycle: u64,
+    /// The richer cycle tap is opt-in so ordinary batch/report runs retain
+    /// the byte-only hot path and do not accumulate a second event queue.
+    wire_cycle_tap_enabled: bool,
     /// Diagnostic tap — every byte firmware writes to `UARTDR` (after the
     /// enable gate) is appended here so harnesses can mirror the wire to
     /// stderr. Drained by `drain_tx_log`. Invisible to guest software.
     tx_wire_log: VecDeque<u8>,
+    /// The same diagnostic TX events with the bus master cycle at which the
+    /// guest wrote UARTDR.  Keeping this beside the legacy byte-only tap lets
+    /// preview attach exact virtual-time metadata without changing the
+    /// authoritative report path.
+    tx_wire_cycle_log: VecDeque<(u64, u8)>,
     #[cfg(feature = "behavior-trace")]
     /// Canonical serial-event tap — drained as behavior events by
     /// `drain_behavior_tx_log`.
@@ -218,7 +238,10 @@ impl UartRegs {
             rx_fifo: VecDeque::with_capacity(UART_FIFO_DEPTH),
             tx_cycle_accum: 0,
             nvic_irq,
+            wire_cycle: 0,
+            wire_cycle_tap_enabled: false,
             tx_wire_log: VecDeque::new(),
+            tx_wire_cycle_log: VecDeque::new(),
             #[cfg(feature = "behavior-trace")]
             tx_behavior_log: VecDeque::new(),
         }
@@ -228,7 +251,36 @@ impl UartRegs {
     /// call. Harness-only diagnostic; returns empty if nothing was
     /// written. Does not affect the real TX FIFO / baud-rate model.
     pub fn drain_tx_log(&mut self) -> Vec<u8> {
-        self.tx_wire_log.drain(..).collect()
+        let bytes = self.tx_wire_log.drain(..).collect();
+        // Keep the richer diagnostic queue bounded even if a caller uses the
+        // legacy byte-only accessor for a preview-enabled UART.
+        self.tx_wire_cycle_log.clear();
+        bytes
+    }
+
+    /// Drain TX writes together with the virtual bus cycle at which each
+    /// UARTDR write occurred.  This is a harness/preview diagnostic tap and
+    /// does not affect FIFO timing or guest-visible UART state.
+    pub fn drain_tx_log_with_cycles(&mut self) -> Vec<(u64, u8)> {
+        // The two taps are populated together. Drain the compatibility byte
+        // queue as well so switching consumers cannot retain unbounded data.
+        self.tx_wire_log.clear();
+        self.tx_wire_cycle_log.drain(..).collect()
+    }
+
+    /// Enable the cycle-rich TX tap for the realtime preview adapter. This
+    /// is intentionally not enabled by default for authoritative batch runs.
+    pub(crate) fn enable_wire_cycle_tap(&mut self) {
+        self.wire_cycle_tap_enabled = true;
+    }
+
+    /// Set the cycle associated with the next bus-dispatched UART write.
+    /// Direct peripheral unit tests leave the value at the reset default of
+    /// zero; the RP2040 bus updates it immediately before dispatch.
+    pub(crate) fn set_wire_cycle(&mut self, cycle: u64) {
+        if self.wire_cycle_tap_enabled {
+            self.wire_cycle = cycle;
+        }
     }
 
     #[cfg(feature = "behavior-trace")]
@@ -287,6 +339,43 @@ impl UartRegs {
     #[inline]
     pub fn rx_dreq(&self) -> bool {
         self.is_enabled() && !self.rx_fifo.is_empty()
+    }
+
+    /// Inject one externally received byte into the guest-visible RX FIFO.
+    ///
+    /// This is intentionally a harness-facing operation rather than a new
+    /// MMIO shortcut.  It observes UARTEN/RXE and the FEN-dependent FIFO
+    /// capacity, raises RX/OE interrupts using the same aggregate IRQ route
+    /// as register-driven state, and reports disabled/overrun distinctly so a
+    /// preview frontend cannot mistake a dropped byte for accepted input.
+    pub fn inject_rx(&mut self, byte: u8, irqs: &mut u32) -> UartRxResult {
+        if !self.is_enabled() || (self.cr & UARTCR_RXE) == 0 {
+            return UartRxResult::Disabled;
+        }
+        let cap = self.tx_capacity();
+        if self.rx_fifo.len() >= cap {
+            self.rsr_ecr |= 1 << 3; // PL011 OE in the low nibble.
+            self.ris |= UART_INT_OE;
+            self.route_irq(irqs);
+            return UartRxResult::Overrun;
+        }
+        self.rx_fifo.push_back(byte);
+        let threshold = self.tx_fill_threshold();
+        if self.rx_fifo.len() > threshold {
+            self.ris |= UART_INT_RX;
+        }
+        self.route_irq(irqs);
+        UartRxResult::Accepted
+    }
+
+    /// Number of bytes currently waiting in the guest RX FIFO.
+    pub fn rx_fifo_len(&self) -> usize {
+        self.rx_fifo.len()
+    }
+
+    /// Current raw receive/error interrupt status, for diagnostics.
+    pub fn raw_interrupt_status(&self) -> u32 {
+        self.ris
     }
 
     /// Enabled state: UARTEN bit in UARTCR.
@@ -364,7 +453,8 @@ impl UartRegs {
     /// the FIFO level drops to at or below the configured trigger level.
     /// RX interrupt latches when FIFO level rises above the threshold.
     ///
-    /// Phase 2 only models TX. RX path is deferred.
+    /// The TX and RX paths share the same level-driven interrupt register;
+    /// RX bytes are normally inserted through [`Self::inject_rx`].
     fn refresh_tx_interrupt(&mut self) {
         let lvl = self.tx_fifo.len();
         let thresh = self.tx_fill_threshold();
@@ -561,6 +651,9 @@ impl UartRegs {
         // Tap the byte before the overflow check so the diagnostic log
         // captures firmware *intent* even under simulated FIFO drops.
         self.tx_wire_log.push_back(byte);
+        if self.wire_cycle_tap_enabled {
+            self.tx_wire_cycle_log.push_back((self.wire_cycle, byte));
+        }
         #[cfg(feature = "behavior-trace")]
         self.tx_behavior_log.push_back(byte);
         let cap = self.tx_capacity();
@@ -715,6 +808,51 @@ mod tests {
         u.write32(UARTDR, 0xA5, 0, &mut irqs);
         assert_eq!(u.tx_fifo.len(), 1);
         assert_eq!(u.tx_fifo.front().copied(), Some(0xA5));
+    }
+
+    #[test]
+    fn tx_cycle_tap_tracks_the_bus_cycle_without_changing_byte_tap() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let mut irqs = 0;
+        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_TXE, 0, &mut irqs);
+        u.enable_wire_cycle_tap();
+        u.set_wire_cycle(1234);
+        u.write32(UARTDR, 0xA5, 0, &mut irqs);
+        assert_eq!(u.drain_tx_log_with_cycles(), vec![(1234, 0xA5)]);
+
+        // The cycle-rich drain also clears the compatibility queue, so use a
+        // second write to prove the legacy byte tap remains available to
+        // existing consumers.
+        u.set_wire_cycle(5678);
+        u.write32(UARTDR, 0x5A, 0, &mut irqs);
+        assert_eq!(u.drain_tx_log(), vec![0x5A]);
+        assert!(u.drain_tx_log_with_cycles().is_empty());
+    }
+
+    #[test]
+    fn external_rx_requires_uart_and_rx_enable() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let mut irqs = 0;
+        assert_eq!(u.inject_rx(b'X', &mut irqs), UartRxResult::Disabled);
+        u.write32(UARTCR, UARTCR_UARTEN, 0, &mut irqs);
+        assert_eq!(u.inject_rx(b'X', &mut irqs), UartRxResult::Disabled);
+        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_RXE, 0, &mut irqs);
+        assert_eq!(u.inject_rx(b'X', &mut irqs), UartRxResult::Accepted);
+        assert_eq!(u.read32(UARTDR), b'X' as u32);
+    }
+
+    #[test]
+    fn external_rx_reports_fifo_overrun_and_sets_oe() {
+        let mut u = UartRegs::new(UART0_IRQ);
+        let mut irqs = 0;
+        u.write32(UARTLCR_H, UARTLCR_H_FEN, 0, &mut irqs);
+        u.write32(UARTCR, UARTCR_UARTEN | UARTCR_RXE, 0, &mut irqs);
+        for byte in 0..UART_FIFO_DEPTH as u8 {
+            assert_eq!(u.inject_rx(byte, &mut irqs), UartRxResult::Accepted);
+        }
+        assert_eq!(u.inject_rx(0xFF, &mut irqs), UartRxResult::Overrun);
+        assert_ne!(u.read32(UARTRIS) & UART_INT_OE, 0);
+        assert_eq!(u.rx_fifo_len(), UART_FIFO_DEPTH);
     }
 
     #[test]

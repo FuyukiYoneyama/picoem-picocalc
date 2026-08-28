@@ -267,10 +267,7 @@ fn threaded_adc_cs_loop() {
 #[test]
 fn threaded_pad_control_loop() {
     let mut emu = build_threaded();
-    release_resets(
-        &mut emu,
-        (1 << RESET_IO_BANK0) | (1 << RESET_PADS_BANK0),
-    );
+    release_resets(&mut emu, (1 << RESET_IO_BANK0) | (1 << RESET_PADS_BANK0));
     // Two pointers: R2 = IO_BANK0_GPIO0_CTRL, R3 = PADS_BANK0_GPIO0.
     //   LDR R2, [PC, #0x10]   -> 0x4A04
     //   LDR R3, [PC, #0x10]   -> 0x4B04

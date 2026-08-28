@@ -1849,6 +1849,7 @@ name = "picocalc-harness"
 version = "0.1.0"
 dependencies = [
  "picocalc-board",
+ "picoem-common",
  "rp2040-emu",
  "serde_json",
 ]

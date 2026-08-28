@@ -253,7 +253,10 @@ fn assert_scheduler_invariant(
 ) {
     // These are cumulative or final hardware-visible observations and must
     // be identical when the actual master-cycle boundary is identical.
-    assert_eq!(reference.timer, actual.timer, "{name}: timer registers at quantum={quantum}");
+    assert_eq!(
+        reference.timer, actual.timer,
+        "{name}: timer registers at quantum={quantum}"
+    );
     assert_eq!(
         reference.timer_accum, actual.timer_accum,
         "{name}: timer accumulators at quantum={quantum}"
@@ -462,8 +465,7 @@ fn dma_audio_timer_paced_observation_is_quantum_invariant() {
             .into_iter()
             .enumerate()
         {
-            emu.bus
-                .write32(SRAM_BASE + 0xb00 + i as u32 * 4, value);
+            emu.bus.write32(SRAM_BASE + 0xb00 + i as u32 * 4, value);
         }
         // One timer event every eight master cycles; four writes form one
         // complete observed block and exercise due-cycle/PCM/block digests.
@@ -492,9 +494,19 @@ fn dma_audio_timer_paced_observation_is_quantum_invariant() {
         .collect::<Vec<_>>();
     assert_invariant("audio timer-paced observation", &states);
     for (quantum, state) in &states {
-        assert_eq!(state.scheduler.audio_sink.dma_write_count, 4, "quantum={quantum}");
-        assert_eq!(state.scheduler.audio_sink.pcm_sha256.len(), 64, "quantum={quantum}");
-        assert_eq!(state.scheduler.audio_sink.block_start_count, 1, "quantum={quantum}");
+        assert_eq!(
+            state.scheduler.audio_sink.dma_write_count, 4,
+            "quantum={quantum}"
+        );
+        assert_eq!(
+            state.scheduler.audio_sink.pcm_sha256.len(),
+            64,
+            "quantum={quantum}"
+        );
+        assert_eq!(
+            state.scheduler.audio_sink.block_start_count, 1,
+            "quantum={quantum}"
+        );
     }
 }
 
@@ -536,7 +548,11 @@ fn dma_high_priority_force_beats_normal_force() {
         .collect::<Vec<_>>();
     assert_invariant("HIGH_PRIORITY versus FORCE", &states);
     for (quantum, state) in &states {
-        assert_eq!(state.destination_words, vec![0xe100_0000], "quantum={quantum}");
+        assert_eq!(
+            state.destination_words,
+            vec![0xe100_0000],
+            "quantum={quantum}"
+        );
         assert_eq!(state.channels[0].trans_count, 0, "quantum={quantum}");
         assert_eq!(state.channels[1].trans_count, 0, "quantum={quantum}");
     }
@@ -583,7 +599,10 @@ fn dma_high_priority_timer_beats_normal_force_at_due_event() {
     for (quantum, state) in &states {
         assert_eq!(state.channels[0].trans_count, 0, "quantum={quantum}");
         assert_eq!(state.channels[1].trans_count, 1, "quantum={quantum}");
-        assert_eq!(state.scheduler.timer_event_count[0], 24, "quantum={quantum}");
+        assert_eq!(
+            state.scheduler.timer_event_count[0], 24,
+            "quantum={quantum}"
+        );
         assert_eq!(state.scheduler.timer_miss_count[0], 23, "quantum={quantum}");
     }
 }
@@ -633,8 +652,14 @@ fn dma_same_cycle_timer_tie_uses_lowest_channel() {
         );
         assert_eq!(state.channels[0].trans_count, 0, "quantum={quantum}");
         assert_eq!(state.channels[1].trans_count, 0, "quantum={quantum}");
-        assert_eq!(state.scheduler.timer_event_count[0], 24, "quantum={quantum}");
-        assert_eq!(state.scheduler.timer_event_count[1], 24, "quantum={quantum}");
+        assert_eq!(
+            state.scheduler.timer_event_count[0], 24,
+            "quantum={quantum}"
+        );
+        assert_eq!(
+            state.scheduler.timer_event_count[1], 24,
+            "quantum={quantum}"
+        );
         assert_eq!(state.scheduler.timer_miss_count[0], 20, "quantum={quantum}");
         assert_eq!(state.scheduler.timer_miss_count[1], 20, "quantum={quantum}");
     }

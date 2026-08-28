@@ -59,7 +59,12 @@ use rp2040_emu::{
 };
 
 mod machine_protocol;
+mod preview_api;
+mod preview_protocol;
 mod scenario;
+mod session;
+
+use session::{MachineSession, PREVIEW_OBSERVATION_SCHEMA_VERSION, SessionStop};
 
 /// Report schema version. Bump on any breaking field change.
 ///
@@ -278,6 +283,7 @@ struct Args {
     scenario: Option<PathBuf>,
     snapshot_dir: PathBuf,
     machine_api: bool,
+    preview_api: bool,
     run_id: Option<String>,
     progress_interval: Option<u64>,
     expected_stop: Option<StopReason>,
@@ -548,6 +554,9 @@ fn print_usage() {
                                   Default: the current directory.\n\
          --machine-api            NEXT-4 JSON Lines API on stdin/stdout. Uses the same\n\
                                   startup artifact/device options; no scenario/final report.\n\
+         --preview-api            VRP-2 framed realtime preview backend on stdin/stdout.\n\
+                                  Uses the shared MachineSession and Pacer; GUI is a separate\n\
+                                  process. Mutually exclusive with --machine-api/scenario.\n\
          --run-id <ID>            Optional diagnostic ID; requires --progress-interval.\n\
          --progress-interval <N> Emit stderr heartbeat lines every N seconds (opt-in).\n\
          --expect-stop <reason>   Required stop: cycle_limit, pc_match, or scenario_done.\n\
@@ -635,6 +644,7 @@ fn parse_args() -> Result<Args, String> {
     let mut scenario: Option<PathBuf> = None;
     let mut snapshot_dir: Option<PathBuf> = None;
     let mut machine_api = false;
+    let mut preview_api = false;
     let mut run_id: Option<String> = None;
     let mut progress_interval: Option<u64> = None;
     let mut expected_stop: Option<StopReason> = None;
@@ -742,6 +752,7 @@ fn parse_args() -> Result<Args, String> {
             "--scenario" => scenario = Some(PathBuf::from(value("--scenario")?)),
             "--snapshot-dir" => snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
             "--machine-api" => machine_api = true,
+            "--preview-api" => preview_api = true,
             "--run-id" => {
                 if run_id.is_some() {
                     return Err("--run-id may be specified only once".to_string());
@@ -940,22 +951,75 @@ fn parse_args() -> Result<Args, String> {
             return Err(format!("--machine-api cannot be combined with {name}"));
         }
     }
+    if preview_api {
+        if machine_api {
+            return Err("--preview-api cannot be combined with --machine-api".to_string());
+        }
+        if boot_mode == BootRequest::Boot2 {
+            return Err("--preview-api cannot be combined with --boot-mode boot2".to_string());
+        }
+        let conflicts = [
+            (scenario.is_some(), "--scenario"),
+            (stop_pc.is_some(), "--stop-pc"),
+            (json.is_some(), "--json"),
+            (uart.is_some(), "--uart"),
+            (flash_image_out.is_some(), "--flash-image-out"),
+            (fb_png.is_some(), "--fb-png"),
+            (expected_stop.is_some(), "--expect-stop"),
+            (!expected_uart.is_empty(), "--expect-uart"),
+            (
+                expected_audio_sink_count.is_some(),
+                "audio sink expectations",
+            ),
+            (audio_analysis.is_some(), "--audio-analysis"),
+            (audio_wav.is_some(), "--audio-wav"),
+            (keys.is_some(), "--keys"),
+            (sd_image_out.is_some(), "--sd-image-out"),
+            (sd_trace.is_some(), "--sd-trace"),
+            (i2c_profile.is_some(), "--i2c-profile"),
+            (i2c_fixture.is_some(), "--i2c-fixture"),
+            (i2c_report.is_some(), "--i2c-report"),
+            (run_id.is_some(), "--run-id"),
+            (progress_interval.is_some(), "--progress-interval"),
+        ];
+        if let Some((_, name)) = conflicts.into_iter().find(|(present, _)| *present) {
+            return Err(format!("--preview-api cannot be combined with {name}"));
+        }
+    }
     #[cfg(feature = "idle-profiler")]
     if machine_api && idle_profile.is_some() {
         return Err("--machine-api cannot be combined with --idle-profile".to_string());
     }
+    #[cfg(feature = "idle-profiler")]
+    if preview_api && idle_profile.is_some() {
+        return Err("--preview-api cannot be combined with --idle-profile".to_string());
+    }
     #[cfg(feature = "behavior-trace")]
     if machine_api && behavior_trace.is_some() {
         return Err("--machine-api cannot be combined with --behavior-trace".to_string());
+    }
+    #[cfg(feature = "behavior-trace")]
+    if preview_api && behavior_trace.is_some() {
+        return Err("--preview-api cannot be combined with --behavior-trace".to_string());
     }
     #[cfg(feature = "event-horizon-profiler")]
     if machine_api && event_horizon_profile.is_some() {
         return Err("--machine-api cannot be combined with --event-horizon-profile".to_string());
     }
     #[cfg(feature = "event-horizon-profiler")]
+    if preview_api && event_horizon_profile.is_some() {
+        return Err("--preview-api cannot be combined with --event-horizon-profile".to_string());
+    }
+    #[cfg(feature = "event-horizon-profiler")]
     if machine_api && event_horizon_profile_after_uart.is_some() {
         return Err(
             "--machine-api cannot be combined with --event-horizon-profile-after-uart".to_string(),
+        );
+    }
+    #[cfg(feature = "event-horizon-profiler")]
+    if preview_api && event_horizon_profile_after_uart.is_some() {
+        return Err(
+            "--preview-api cannot be combined with --event-horizon-profile-after-uart".to_string(),
         );
     }
     #[cfg(all(feature = "idle-profiler", feature = "behavior-trace"))]
@@ -1007,6 +1071,7 @@ fn parse_args() -> Result<Args, String> {
         scenario,
         snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
         machine_api,
+        preview_api,
         run_id,
         progress_interval,
         expected_stop,
@@ -2062,199 +2127,6 @@ struct BoardHandles {
     sd: Option<Arc<Mutex<SdCard>>>,
 }
 
-/// One persistent, deterministic headless machine session.
-///
-/// This is the shared execution boundary for the batch scenario runner and
-/// NEXT-4's JSONL adapter.  Keeping UART accumulation and the virtual clock
-/// here prevents either client from inventing subtly different stepping,
-/// clock-rebase, or observation semantics.
-struct MachineSession {
-    emu: Emulator,
-    uart_bytes: Vec<u8>,
-    dispatches: u64,
-    board: BoardHandles,
-    boot_mode: Option<BootMode>,
-    watchdog_resets: Vec<WatchdogResetEvent>,
-    sticky_stop: Option<SessionStop>,
-    #[cfg(feature = "event-horizon-profiler")]
-    event_profile_after_uart: Option<String>,
-    #[cfg(feature = "event-horizon-profiler")]
-    event_profile_start_cycle: Option<u64>,
-}
-
-#[derive(Clone)]
-enum SessionStop {
-    Exception(&'static str),
-    Error(String),
-}
-
-impl MachineSession {
-    #[inline]
-    fn new(emu: Emulator, board: BoardHandles) -> Self {
-        Self {
-            emu,
-            uart_bytes: Vec::new(),
-            dispatches: 0,
-            board,
-            boot_mode: None,
-            watchdog_resets: Vec::new(),
-            sticky_stop: None,
-            #[cfg(feature = "event-horizon-profiler")]
-            event_profile_after_uart: None,
-            #[cfg(feature = "event-horizon-profiler")]
-            event_profile_start_cycle: None,
-        }
-    }
-
-    #[inline]
-    fn set_boot_mode(&mut self, boot_mode: BootMode) {
-        self.boot_mode = Some(boot_mode);
-    }
-
-    /// Re-enter the selected firmware handoff after an emulated watchdog
-    /// bite.  The emulator has already performed the MCU warm reset and
-    /// retained flash/SD/scratch; this method only selects the same entry
-    /// path that was used for the initial run.
-    fn handle_watchdog_reset(&mut self) -> Result<bool, String> {
-        let Some(event) = self.emu.take_watchdog_reset_event() else {
-            return Ok(false);
-        };
-        self.watchdog_resets.push(event);
-        match self.boot_mode {
-            Some(BootMode::Boot2FromFlash) => self
-                .emu
-                .boot2_from_flash(RP2040_SRAM_TOP, 0)
-                .map_err(|error| {
-                    format!("re-entering flash boot2 after watchdog reset: {error}")
-                })?,
-            Some(BootMode::DirectBootFromFlash) => {
-                self.emu.direct_boot_from_flash(SDK_VTOR_FLASH_OFFSET);
-            }
-            Some(BootMode::BootromResetVector) | None => {}
-        }
-        Ok(true)
-    }
-
-    #[inline(always)]
-    fn cycles(&self) -> u64 {
-        self.emu.clock.cycles
-    }
-
-    #[inline(always)]
-    fn elapsed_ns(&self) -> u64 {
-        self.emu.bus.virtual_time_ns()
-    }
-
-    fn fatal_exception(&self) -> Option<&'static str> {
-        self.emu
-            .cores
-            .iter()
-            .enumerate()
-            .find_map(|(core, state)| fatal_exception_name(core, state.regs.xpsr & 0x1FF))
-    }
-
-    fn refresh_sticky_stop(&mut self) {
-        if self.sticky_stop.is_none()
-            && let Some(exception) = self.fatal_exception()
-        {
-            self.sticky_stop = Some(SessionStop::Exception(exception));
-        }
-    }
-
-    fn stopped(&self) -> Option<&SessionStop> {
-        self.sticky_stop.as_ref()
-    }
-
-    #[inline(always)]
-    fn drain_uart(&mut self) {
-        self.uart_bytes
-            .extend_from_slice(&self.emu.drain_uart0_tx_log());
-        #[cfg(feature = "event-horizon-profiler")]
-        self.maybe_start_event_profile();
-    }
-
-    #[cfg(feature = "event-horizon-profiler")]
-    fn arm_event_profile_after_uart(&mut self, marker: String) {
-        self.event_profile_after_uart = Some(marker);
-    }
-
-    #[cfg(feature = "event-horizon-profiler")]
-    fn maybe_start_event_profile(&mut self) {
-        let Some(marker) = self.event_profile_after_uart.as_deref() else {
-            return;
-        };
-        if self
-            .uart_bytes
-            .windows(marker.len())
-            .any(|window| window == marker.as_bytes())
-        {
-            self.emu
-                .enable_running_event_profiler()
-                .expect("deferred event profiler is enabled on Serial emulator");
-            self.event_profile_start_cycle = Some(self.cycles());
-            self.event_profile_after_uart = None;
-        }
-    }
-
-    fn poll_scenario(&mut self, engine: &mut scenario::Engine) {
-        self.drain_uart();
-        engine.poll(&scenario::Observation {
-            now_ns: self.elapsed_ns(),
-            cycles: self.cycles(),
-            lcd: self.board.lcd.as_deref(),
-            keyboard: self.board.keyboard.as_deref(),
-            uart: &self.uart_bytes,
-        });
-    }
-
-    /// Execute one scheduler dispatch without crossing a proven idle
-    /// external boundary. Returns `(cycles_consumed, clock_rate_changed)`.
-    #[inline(always)]
-    fn advance_once(&mut self, external_event_cycle: u64) -> Result<(u64, bool), String> {
-        let previous_hz = self.emu.bus.clock_tree.sys_clk_hz;
-        let consumed = self.emu.step_until(external_event_cycle).map_err(|error| {
-            let message = error.to_string();
-            self.sticky_stop = Some(SessionStop::Error(message.clone()));
-            message
-        })?;
-        self.handle_watchdog_reset()?;
-        self.dispatches = self.dispatches.saturating_add(1);
-        if self.dispatches.is_multiple_of(UART_DRAIN_INTERVAL) {
-            self.drain_uart();
-        }
-        let rate_changed = self.emu.bus.clock_tree.sys_clk_hz != previous_hz;
-        Ok((consumed, rate_changed))
-    }
-
-    fn mark_clock_stalled(&mut self) {
-        let detail = format!(
-            "clock stalled: core0 {}, core1 {} — no wake source can fire while the master clock is frozen",
-            park_state(&self.emu, 0),
-            park_state(&self.emu, 1)
-        );
-        self.sticky_stop = Some(SessionStop::Error(detail));
-    }
-
-    fn finish(
-        &mut self,
-        stop_reason: StopReason,
-        exception: Option<&'static str>,
-        error: Option<String>,
-    ) -> RunOutcome {
-        self.drain_uart();
-        RunOutcome {
-            stop_reason,
-            cycles: self.cycles(),
-            elapsed_ns: self.elapsed_ns(),
-            pc: self.emu.cores[0].regs.pc(),
-            exception,
-            error,
-            uart_bytes: std::mem::take(&mut self.uart_bytes),
-            watchdog_resets: std::mem::take(&mut self.watchdog_resets),
-        }
-    }
-}
-
 fn run_loop(
     machine: &mut MachineSession,
     cycle_limit: u64,
@@ -2525,6 +2397,22 @@ fn observe_domain(
             }))
         }
         "framebuffer" => framebuffer_json(machine),
+        "preview" => {
+            machine.drain_uart();
+            let projection = machine.preview_observation_projection();
+            let canonical = serde_json::to_vec(&projection).map_err(|error| {
+                protocol_error(
+                    machine_protocol::ErrorCode::ModelError,
+                    format!("serializing preview observation: {error}"),
+                )
+            })?;
+            Ok(serde_json::json!({
+                "digest_sha256": sha256_hex(&canonical),
+                "projection": projection,
+                "schema_version": PREVIEW_OBSERVATION_SCHEMA_VERSION,
+                "virtual_cycle": machine.cycles(),
+            }))
+        }
         "keyboard" => {
             let keyboard = machine.board.keyboard.as_ref().ok_or_else(|| {
                 protocol_error(
@@ -5179,9 +5067,16 @@ fn run() -> Result<Verdict, String> {
     };
     let mut machine = MachineSession::new(emu, handles);
     machine.set_boot_mode(boot_mode);
+    if args.preview_api {
+        machine.enable_preview_uart_cycle_tap();
+    }
     #[cfg(feature = "event-horizon-profiler")]
     if let Some(marker) = args.event_horizon_profile_after_uart.clone() {
         machine.arm_event_profile_after_uart(marker);
+    }
+    if args.preview_api {
+        preview_api::run(&mut machine)?;
+        return Ok(Verdict::Pass);
     }
     if args.machine_api {
         run_machine_api(&mut machine, &args.snapshot_dir)?;

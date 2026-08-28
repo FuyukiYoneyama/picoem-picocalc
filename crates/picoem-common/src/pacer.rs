@@ -448,19 +448,34 @@ impl Pacer {
     /// Call after stepping the emulator for `quantum_cycles()` cycles.
     #[inline(always)]
     pub fn end_quantum(&mut self) {
+        self.end_quantum_for_cycles(self.quantum_cycles);
+    }
+
+    /// End a quantum while recording the number of cycles the emulator
+    /// actually consumed.
+    ///
+    /// Most callers execute exactly [`Self::quantum_cycles`] cycles and
+    /// should use [`Self::end_quantum`].  Event-horizon driven callers may
+    /// stop at an earlier boundary; they use this method so the monitoring
+    /// counters describe the real virtual progress instead of attributing a
+    /// full nominal quantum to a short advance.  The pacing target is scaled
+    /// to the same consumed-cycle count, preserving the configured emulator
+    /// clock without adding a semantic dependency to the emulation loop.
+    #[inline(always)]
+    pub fn end_quantum_for_cycles(&mut self, emulated_cycles: u64) {
         #[cfg(target_arch = "x86_64")]
         {
-            self.end_quantum_tsc();
+            self.end_quantum_tsc(emulated_cycles);
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            self.end_quantum_instant();
+            self.end_quantum_instant(emulated_cycles);
         }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    fn end_quantum_tsc(&mut self) {
+    fn end_quantum_tsc(&mut self, emulated_cycles: u64) {
         debug_assert!(
             self.quantum_start_tsc != 0,
             "begin_quantum() must be called before end_quantum()"
@@ -472,10 +487,19 @@ impl Pacer {
         let emu_end = rdtscp();
         let emulation_tsc = emu_end - self.quantum_start_tsc;
 
-        let final_tsc = if emulation_tsc < self.quantum_tsc_ticks {
+        let target_ticks = if emulated_cycles == self.quantum_cycles {
+            // Preserve the calibrated nominal path for the common caller.
+            self.quantum_tsc_ticks
+        } else {
+            let nominal = (self.tsc_freq_hz as u128 * emulated_cycles as u128
+                / self.sys_clk_hz as u128) as u64;
+            let effective_overhead = self.overhead.min(nominal / 4);
+            nominal.saturating_sub(effective_overhead)
+        };
+        let final_tsc = if target_ticks > 0 && emulation_tsc < target_ticks {
             // Ahead of real-time — spin wait.
             // Capture exit TSC inside the loop to avoid post-loop measurement skew.
-            let target_tsc = self.quantum_start_tsc + self.quantum_tsc_ticks;
+            let target_tsc = self.quantum_start_tsc + target_ticks;
             let mut now = emu_end;
             while now < target_tsc {
                 std::hint::spin_loop();
@@ -502,20 +526,25 @@ impl Pacer {
             .expect("begin_quantum() must be called before end_quantum()");
         let wall_tsc = final_tsc - first;
         self.stats.set_wall_ns(self.tsc_to_ns(wall_tsc));
-        self.stats.add_emulated_cycles(self.quantum_cycles);
+        self.stats.add_emulated_cycles(emulated_cycles);
     }
 
     #[cfg(not(target_arch = "x86_64"))]
     #[inline(always)]
-    fn end_quantum_instant(&mut self) {
+    fn end_quantum_instant(&mut self, emulated_cycles: u64) {
         let start = self
             .quantum_start
             .expect("begin_quantum() must be called before end_quantum()");
         let emu_end = Instant::now();
         let emulation_ns = duration_ns(emu_end.duration_since(start));
 
-        let final_time = if emulation_ns < self.quantum_ns {
-            let target = start + Duration::from_nanos(self.quantum_ns);
+        let target_ns = if emulated_cycles == self.quantum_cycles {
+            self.quantum_ns
+        } else {
+            (1_000_000_000u128 * emulated_cycles as u128 / self.sys_clk_hz as u128) as u64
+        };
+        let final_time = if target_ns > 0 && emulation_ns < target_ns {
+            let target = start + Duration::from_nanos(target_ns);
             let mut now = emu_end;
             while now < target {
                 std::hint::spin_loop();
@@ -536,7 +565,7 @@ impl Pacer {
             .expect("begin_quantum() must be called before end_quantum()");
         self.stats
             .set_wall_ns(duration_ns(final_time.duration_since(first)));
-        self.stats.add_emulated_cycles(self.quantum_cycles);
+        self.stats.add_emulated_cycles(emulated_cycles);
     }
 
     /// Convert TSC ticks to nanoseconds.
@@ -754,6 +783,26 @@ mod tests {
         let snap = pacer.stats().snapshot();
         assert!(snap.emulation_ns > 0, "emulation_ns should be non-zero");
         assert_eq!(snap.emulated_cycles, 150);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_pacer_records_short_event_boundary_cycles() {
+        let mut pacer = Pacer::with_quantum(150_000_000, 150);
+        pacer.begin_quantum();
+        pacer.end_quantum_for_cycles(7);
+        let snap = pacer.stats().snapshot();
+        assert_eq!(snap.emulated_cycles, 7);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "x86_64"))]
+    fn test_pacer_records_short_event_boundary_cycles_instant_backend() {
+        let mut pacer = Pacer::with_quantum(150_000_000, 150);
+        pacer.begin_quantum();
+        pacer.end_quantum_for_cycles(7);
+        let snap = pacer.stats().snapshot();
+        assert_eq!(snap.emulated_cycles, 7);
     }
 
     #[test]

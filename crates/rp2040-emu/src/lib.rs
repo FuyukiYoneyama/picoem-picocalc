@@ -1731,7 +1731,7 @@ impl Emulator {
             }
             let mask = 1u32 << pin;
             match mode {
-                1 => out ^= mask, // GPIO_OVERRIDE_INVERT
+                1 => out ^= mask,  // GPIO_OVERRIDE_INVERT
                 2 => out &= !mask, // GPIO_OVERRIDE_LOW
                 3 => out |= mask,  // GPIO_OVERRIDE_HIGH
                 _ => unreachable!(),
@@ -2005,6 +2005,41 @@ impl Emulator {
     pub fn drain_uart0_tx_log(&mut self) -> Vec<u8> {
         self.assert_not_placeholder();
         self.bus.drain_uart0_tx_log()
+    }
+
+    /// Drain UART0 TX writes together with the exact virtual bus cycle at
+    /// which the guest wrote each byte. This is used by the preview adapter;
+    /// the byte-only accessor remains the stable report path.
+    pub fn drain_uart0_tx_log_with_cycles(&mut self) -> Vec<(u64, u8)> {
+        self.assert_not_placeholder();
+        self.bus.drain_uart0_tx_log_with_cycles()
+    }
+
+    /// Enable exact virtual-cycle metadata on the UART0 TX preview tap.
+    /// Ordinary batch/report runs keep this tap disabled.
+    pub fn enable_uart0_tx_cycle_tap(&mut self) {
+        self.assert_not_placeholder();
+        self.bus.enable_uart0_tx_cycle_tap();
+    }
+
+    /// Inject one byte on the external UART0 RX wire for the interactive
+    /// preview.  The result reports whether the guest RX FIFO accepted it,
+    /// ignored it while disabled, or dropped it on FIFO overrun.
+    pub fn inject_uart0_rx(&mut self, byte: u8) -> peripherals::uart::UartRxResult {
+        self.assert_not_placeholder();
+        self.bus.inject_uart0_rx(byte)
+    }
+
+    /// Number of bytes currently waiting in UART0's guest RX FIFO.
+    pub fn uart0_rx_fifo_len(&self) -> usize {
+        self.assert_not_placeholder();
+        self.bus.uart0_rx_fifo_len()
+    }
+
+    /// UART0 raw interrupt status, exposed for preview status diagnostics.
+    pub fn uart0_raw_interrupt_status(&self) -> u32 {
+        self.assert_not_placeholder();
+        self.bus.uart0_raw_interrupt_status()
     }
 
     /// Enable and reset the OPT0-B streaming event trace.
@@ -3562,7 +3597,10 @@ mod stage5_lib_residue {
 
         emu.gpio_write(0, false);
 
-        assert!(emu.gpio_read(pin), "active-low card detect must invert to high");
+        assert!(
+            emu.gpio_read(pin),
+            "active-low card detect must invert to high"
+        );
     }
 
     // ------------------- wake_checks (lines 1148, 1155) -------------------
