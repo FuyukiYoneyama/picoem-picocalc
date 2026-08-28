@@ -58,9 +58,11 @@ work package.  The backend therefore must not be described as an audio player.
 The existing JSON Lines machine API can request the same projection with
 `{"schema":1,"id":"obs","op":"observe","domains":["preview"]}`.
 The response carries `schema_version`, `virtual_cycle`, `projection`, and its
-canonical `digest_sha256`.  This is an observation surface only: VRP-2 still
-needs a deterministic same-cycle runner comparison and admission gate before
-the projection can be called a qualification result.
+canonical `digest_sha256`.  This is an observation surface only: a board-backed
+synthetic same-cycle comparison is already covered by the local smoke gate, but
+VRP-2 still needs the comparison to be connected to a versioned registered
+target and admission gate before the projection can be called a qualification
+result.
 
 ## Verification boundary
 
