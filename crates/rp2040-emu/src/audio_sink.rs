@@ -4,6 +4,8 @@
 //! value that the DMA engine actually commits to PWM slice 5 CC. CPU setup writes and
 //! producer buffers are deliberately outside this boundary.
 
+use std::collections::VecDeque;
+
 use sha2::{Digest, Sha256};
 
 use crate::bus::PWM_BASE;
@@ -26,8 +28,47 @@ const DEFAULT_AUDIO_SYS_CLK_HZ: u32 = 250_000_000;
 const EDGE_WORDS: usize = 8;
 const PWM_MAX_DUTY: u16 = 255;
 const PCM_CHANNELS: u64 = 2;
+/// Preview transport blocks are deliberately small enough to keep latency
+/// bounded, while the queue itself is fixed so host playback can never make
+/// the emulator retain an unbounded PCM stream.
+pub const PREVIEW_AUDIO_BLOCK_FRAMES: usize = 128;
+pub const PREVIEW_AUDIO_QUEUE_BLOCKS: usize = 8;
 const ANALYSIS_WINDOW_FRAMES: u64 = 1024;
 const ACTIVE_ABS_THRESHOLD: u32 = 512;
+
+/// One bounded PCM block produced by the emulated DMA-to-PWM audio sink.
+/// `cycle` is the virtual due-cycle of the first frame; it is metadata for
+/// the host monitor and is not used to alter emulation timing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioPreviewBlock {
+    pub cycle: u64,
+    pub sample_rate_hz: u32,
+    pub channels: u8,
+    pub samples: Vec<i16>,
+}
+
+impl AudioPreviewBlock {
+    pub fn frames(&self) -> usize {
+        self.samples.len() / usize::from(self.channels.max(1))
+    }
+}
+
+/// Host-transport counters kept separate from `AudioSinkSnapshot`, whose
+/// fields are part of the authoritative schema-8/exactness projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioPreviewSnapshot {
+    pub enabled: bool,
+    pub queued_blocks: usize,
+    pub queued_frames: usize,
+    pub capacity_blocks: usize,
+    pub capacity_frames: usize,
+    pub produced_blocks: u64,
+    pub drained_blocks: u64,
+    pub drained_frames: u64,
+    pub dropped_blocks: u64,
+    pub source_sample_rate_hz: u32,
+    pub channels: u8,
+}
 
 /// Stable, clone-free report projection of the streaming audio sink.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +175,16 @@ pub(crate) struct AudioSink {
     max_consecutive_rail_frames: u64,
     out_of_range_duty_sample_count: u64,
     captured_pcm: Option<Vec<i16>>,
+    preview_enabled: bool,
+    preview_blocks: VecDeque<AudioPreviewBlock>,
+    preview_current_cycle: Option<u64>,
+    preview_current_rate: u32,
+    preview_current: Vec<i16>,
+    preview_queue_capacity: usize,
+    preview_produced_blocks: u64,
+    preview_drained_blocks: u64,
+    preview_drained_frames: u64,
+    preview_dropped_blocks: u64,
 }
 
 impl Default for AudioSink {
@@ -185,6 +236,16 @@ impl Default for AudioSink {
             max_consecutive_rail_frames: 0,
             out_of_range_duty_sample_count: 0,
             captured_pcm: None,
+            preview_enabled: false,
+            preview_blocks: VecDeque::with_capacity(PREVIEW_AUDIO_QUEUE_BLOCKS),
+            preview_current_cycle: None,
+            preview_current_rate: 0,
+            preview_current: Vec::with_capacity(PREVIEW_AUDIO_BLOCK_FRAMES * 2),
+            preview_queue_capacity: PREVIEW_AUDIO_QUEUE_BLOCKS,
+            preview_produced_blocks: 0,
+            preview_drained_blocks: 0,
+            preview_drained_frames: 0,
+            preview_dropped_blocks: 0,
         }
     }
 }
@@ -198,6 +259,63 @@ impl AudioSink {
 
     pub(crate) fn take_pcm_capture(&mut self) -> Option<Vec<i16>> {
         self.captured_pcm.take()
+    }
+
+    /// Enable the bounded preview tap. This is intentionally independent of
+    /// the diagnostic whole-run PCM capture used by `--audio-wav`.
+    pub(crate) fn enable_preview_pcm_tap(&mut self) {
+        self.preview_enabled = true;
+    }
+
+    /// Drain complete preview blocks without waiting for a host consumer.
+    /// The caller owns the returned blocks and may forward or discard them.
+    pub(crate) fn drain_preview_pcm_blocks(&mut self) -> Vec<AudioPreviewBlock> {
+        let mut blocks = Vec::with_capacity(self.preview_blocks.len());
+        while let Some(block) = self.preview_blocks.pop_front() {
+            self.preview_drained_blocks = self.preview_drained_blocks.saturating_add(1);
+            self.preview_drained_frames = self
+                .preview_drained_frames
+                .saturating_add(block.frames() as u64);
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    /// Flush the final partial block at preview shutdown/reset boundaries.
+    pub(crate) fn finish_preview_pcm_blocks(&mut self) -> Vec<AudioPreviewBlock> {
+        self.flush_preview_block();
+        self.drain_preview_pcm_blocks()
+    }
+
+    pub(crate) fn preview_pcm_snapshot(&self) -> AudioPreviewSnapshot {
+        let queued_frames = self
+            .preview_blocks
+            .iter()
+            .map(AudioPreviewBlock::frames)
+            .sum::<usize>()
+            .saturating_add(self.preview_current.len() / 2);
+        AudioPreviewSnapshot {
+            enabled: self.preview_enabled,
+            queued_blocks: self.preview_blocks.len(),
+            queued_frames,
+            capacity_blocks: self.preview_queue_capacity,
+            capacity_frames: self.preview_queue_capacity * PREVIEW_AUDIO_BLOCK_FRAMES,
+            produced_blocks: self.preview_produced_blocks,
+            drained_blocks: self.preview_drained_blocks,
+            drained_frames: self.preview_drained_frames,
+            dropped_blocks: self.preview_dropped_blocks,
+            source_sample_rate_hz: self.sample_rate_hz,
+            channels: PCM_CHANNELS as u8,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_preview_queue_capacity_for_test(&mut self, capacity: usize) {
+        // Keep production capacity fixed. Tests use this hook only to prove
+        // that a full host queue drops audio blocks without stopping the
+        // emulated sink.
+        self.preview_blocks.clear();
+        self.preview_queue_capacity = capacity;
     }
 
     #[inline]
@@ -273,7 +391,7 @@ impl AudioSink {
         }
         self.block_word_count = self.block_word_count.saturating_add(1);
         self.pcm.update(value.to_le_bytes());
-        self.observe_audio_frame(value);
+        let (left, right) = self.observe_audio_frame(value);
         if self.first_words.len() < EDGE_WORDS {
             self.first_words.push(value);
         }
@@ -335,6 +453,8 @@ impl AudioSink {
             self.service_latency_max_cycles
                 .map_or(latency, |current| current.max(latency)),
         );
+        let sample_rate_hz = self.sample_rate_hz;
+        self.enqueue_preview_frame(left, right, due_cycle, sample_rate_hz);
     }
 
     #[cfg(test)]
@@ -472,7 +592,7 @@ impl AudioSink {
         );
     }
 
-    fn observe_audio_frame(&mut self, value: u32) {
+    fn observe_audio_frame(&mut self, value: u32) -> (i16, i16) {
         let left_duty = value as u16;
         let right_duty = (value >> 16) as u16;
         self.out_of_range_duty_sample_count = self
@@ -526,6 +646,46 @@ impl AudioSink {
                 .max(rms(self.window_sum_square, self.window_frame_count));
             self.window_frame_count = 0;
             self.window_sum_square = 0;
+        }
+        (left as i16, right as i16)
+    }
+
+    fn enqueue_preview_frame(&mut self, left: i16, right: i16, cycle: u64, sample_rate_hz: u32) {
+        if !self.preview_enabled {
+            return;
+        }
+        let rate_changed =
+            self.preview_current_cycle.is_some() && self.preview_current_rate != sample_rate_hz;
+        if rate_changed || self.preview_current.len() / 2 >= PREVIEW_AUDIO_BLOCK_FRAMES {
+            self.flush_preview_block();
+        }
+        if self.preview_current_cycle.is_none() {
+            self.preview_current_cycle = Some(cycle);
+            self.preview_current_rate = sample_rate_hz;
+        }
+        self.preview_current.push(left);
+        self.preview_current.push(right);
+        if self.preview_current.len() / 2 == PREVIEW_AUDIO_BLOCK_FRAMES {
+            self.flush_preview_block();
+        }
+    }
+
+    fn flush_preview_block(&mut self) {
+        if self.preview_current.is_empty() {
+            return;
+        }
+        let block = AudioPreviewBlock {
+            cycle: self.preview_current_cycle.take().unwrap_or_default(),
+            sample_rate_hz: self.preview_current_rate,
+            channels: PCM_CHANNELS as u8,
+            samples: std::mem::take(&mut self.preview_current),
+        };
+        self.preview_current = Vec::with_capacity(PREVIEW_AUDIO_BLOCK_FRAMES * 2);
+        self.preview_produced_blocks = self.preview_produced_blocks.saturating_add(1);
+        if self.preview_blocks.len() >= self.preview_queue_capacity {
+            self.preview_dropped_blocks = self.preview_dropped_blocks.saturating_add(1);
+        } else {
+            self.preview_blocks.push_back(block);
         }
     }
 }
@@ -660,6 +820,7 @@ mod tests {
     #[test]
     fn accepts_parameterized_22050hz_streams_and_reports_the_observed_block() {
         let mut sink = AudioSink::default();
+        sink.enable_preview_pcm_tap();
         // 5/56689 is the RP2040 DMA timer fraction used for the
         // approximately 22,050 Hz NESco stream at a 250 MHz sys clock.
         let mut due = 11338u64;
@@ -685,6 +846,11 @@ mod tests {
         assert_eq!(snapshot.block_frame_min, Some(32));
         assert_eq!(snapshot.block_frame_max, Some(32));
         assert_eq!(snapshot.unexpected_gap_count, 0);
+        let preview_blocks = sink.finish_preview_pcm_blocks();
+        assert_eq!(preview_blocks.len(), 1);
+        assert_eq!(preview_blocks[0].frames(), 32);
+        assert_eq!(preview_blocks[0].sample_rate_hz, 22_050);
+        assert_eq!(preview_blocks[0].channels, 2);
     }
 
     #[test]
@@ -785,6 +951,48 @@ mod tests {
         let snapshot = sink.snapshot();
         assert_eq!(snapshot.status, "fail");
         assert_eq!(snapshot.out_of_range_duty_sample_count, 1);
+    }
+
+    #[test]
+    fn preview_audio_tap_is_bounded_and_separate_from_authoritative_snapshot() {
+        let mut sink = AudioSink::default();
+        sink.enable_preview_pcm_tap();
+        sink.set_preview_queue_capacity_for_test(1);
+        for index in 0..(PREVIEW_AUDIO_BLOCK_FRAMES * 3) as u64 {
+            let due = 5_208 + index * 5_208;
+            sink.observe_dma_write(
+                PICOCALC_AUDIO_PWM_CC,
+                4,
+                0x0080_0080,
+                PICOCALC_AUDIO_TIMER_TREQ,
+                Some((3, 15_625)),
+                Some(due),
+                due,
+                index == 0,
+            );
+        }
+
+        let authoritative_before = sink.snapshot();
+        let preview = sink.preview_pcm_snapshot();
+        assert!(preview.enabled);
+        assert_eq!(preview.capacity_blocks, 1);
+        assert_eq!(preview.queued_blocks, 1);
+        assert_eq!(preview.queued_frames, PREVIEW_AUDIO_BLOCK_FRAMES);
+        assert_eq!(preview.produced_blocks, 3);
+        assert_eq!(preview.dropped_blocks, 2);
+
+        let blocks = sink.drain_preview_pcm_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].frames(), PREVIEW_AUDIO_BLOCK_FRAMES);
+        assert_eq!(blocks[0].sample_rate_hz, 48_000);
+        assert_eq!(blocks[0].channels, 2);
+        let preview_after = sink.preview_pcm_snapshot();
+        assert_eq!(preview_after.drained_blocks, 1);
+        assert_eq!(
+            preview_after.drained_frames,
+            PREVIEW_AUDIO_BLOCK_FRAMES as u64
+        );
+        assert_eq!(authoritative_before, sink.snapshot());
     }
 
     #[test]

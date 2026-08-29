@@ -25,7 +25,9 @@ pub mod irq;
 pub mod memory;
 pub mod peripherals;
 
-pub use audio_sink::AudioSinkSnapshot;
+pub use audio_sink::{
+    AudioPreviewBlock, AudioPreviewSnapshot, AudioSinkSnapshot, PREVIEW_AUDIO_BLOCK_FRAMES,
+};
 pub use dma::DmaSchedulerSnapshot;
 
 mod idle_profile;

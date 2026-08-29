@@ -14,6 +14,7 @@ pub const MAGIC: [u8; 4] = *b"PCRP";
 pub const VERSION: u16 = 1;
 pub const HEADER_SIZE: usize = 16;
 pub const MAX_PAYLOAD: usize = 8 * 1024 * 1024;
+pub const MAX_AUDIO_FRAMES_PER_BLOCK: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -97,11 +98,6 @@ impl Frame {
         Ok(frame)
     }
 
-    pub fn json(kind: Kind, sequence: u32, value: &Value) -> Result<Self, ProtocolError> {
-        let payload = canonical_json(value)?;
-        Self::new(kind, sequence, payload)
-    }
-
     pub fn json_value(&self) -> Result<Value, ProtocolError> {
         match self.kind {
             Kind::Hello | Kind::Status | Kind::KeyEvent | Kind::Error | Kind::Goodbye => {
@@ -114,7 +110,7 @@ impl Frame {
         }
     }
 
-    fn validate_for_direction(&self, direction: Direction) -> Result<(), ProtocolError> {
+    pub(crate) fn validate_for_direction(&self, direction: Direction) -> Result<(), ProtocolError> {
         if !self.kind.accepts(direction) {
             return Err(ProtocolError::new(format!(
                 "message kind {:?} is invalid for {:?}",
@@ -201,6 +197,11 @@ impl Frame {
                         "audio_pcm_s16 channels must be non-zero",
                     ));
                 }
+                if frames > MAX_AUDIO_FRAMES_PER_BLOCK {
+                    return Err(ProtocolError::new(format!(
+                        "audio_pcm_s16 frames exceed per-block limit {MAX_AUDIO_FRAMES_PER_BLOCK}"
+                    )));
+                }
                 let samples = frames
                     .checked_mul(channels)
                     .and_then(|n| n.checked_mul(2))
@@ -244,7 +245,7 @@ pub struct ProtocolError {
 }
 
 impl ProtocolError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -369,14 +370,6 @@ impl<W: Write> FrameWriter<W> {
             .ok_or_else(|| ProtocolError::new("preview sequence exhausted"))?;
         Ok(sequence)
     }
-
-    pub fn write_json(&mut self, kind: Kind, value: &Value) -> Result<u32, ProtocolError> {
-        self.write_frame(Frame::json(kind, 0, value)?)
-    }
-
-    pub fn write_bytes(&mut self, kind: Kind, payload: Vec<u8>) -> Result<u32, ProtocolError> {
-        self.write_frame(Frame::new(kind, 0, payload)?)
-    }
 }
 
 fn canonical_json(value: &Value) -> Result<Vec<u8>, ProtocolError> {
@@ -458,5 +451,16 @@ mod tests {
         let canonical = canonical_json(&value).unwrap();
         assert!(parse_canonical_json(&canonical).is_ok());
         assert!(parse_canonical_json(br#"{"b":2,"a":1}"#).is_err());
+    }
+
+    #[test]
+    fn audio_block_frame_count_is_bounded_by_schema() {
+        let mut payload = Vec::with_capacity(16 + 129 * 2);
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&48_000u32.to_le_bytes());
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&129u16.to_le_bytes());
+        payload.resize(16 + 129 * 2, 0);
+        assert!(Frame::new(Kind::AudioPcmS16, 0, payload).is_err());
     }
 }

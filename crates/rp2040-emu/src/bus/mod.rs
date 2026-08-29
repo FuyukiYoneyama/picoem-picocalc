@@ -1343,6 +1343,29 @@ impl Bus {
         self.dma.take_audio_pcm_capture()
     }
 
+    /// Enable the bounded PCM tap used by the realtime preview frontend.
+    /// This is independent of the optional whole-run diagnostic capture.
+    pub fn enable_audio_preview_tap(&mut self) {
+        self.dma.enable_audio_preview_tap();
+    }
+
+    /// Drain complete bounded preview PCM blocks without waiting for a host
+    /// audio device.  Dropped blocks are accounted for by the sink snapshot.
+    pub fn drain_audio_preview_blocks(&mut self) -> Vec<crate::AudioPreviewBlock> {
+        self.dma.drain_audio_preview_blocks()
+    }
+
+    /// Flush and drain the final partial preview block at session shutdown.
+    pub fn finish_audio_preview_blocks(&mut self) -> Vec<crate::AudioPreviewBlock> {
+        self.dma.finish_audio_preview_blocks()
+    }
+
+    /// Read bounded preview transport counters.  These values are diagnostic
+    /// status only and are intentionally excluded from exactness digests.
+    pub fn audio_preview_snapshot(&self) -> crate::AudioPreviewSnapshot {
+        self.dma.audio_preview_snapshot()
+    }
+
     /// Base read latency for an address region (cycles).
     #[inline]
     fn read_latency(region: u32) -> u32 {

@@ -43,7 +43,7 @@ use crate::dreq::DREQ_FORCE;
 use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1};
 use crate::{
     AudioSinkSnapshot,
-    audio_sink::{AudioSink, PICOCALC_AUDIO_TIMER_INDEX},
+    audio_sink::{AudioPreviewBlock, AudioPreviewSnapshot, AudioSink, PICOCALC_AUDIO_TIMER_INDEX},
 };
 
 /// Total number of DMA channels on RP2040 (datasheet §2.5).
@@ -461,6 +461,27 @@ impl Dma {
     /// Move the optional interleaved stereo PCM capture out of the DMA observer.
     pub fn take_audio_pcm_capture(&mut self) -> Option<Vec<i16>> {
         self.audio_sink.take_pcm_capture()
+    }
+
+    /// Enable the fixed-capacity PCM tap used only by the realtime preview.
+    pub fn enable_audio_preview_tap(&mut self) {
+        self.audio_sink.enable_preview_pcm_tap();
+    }
+
+    /// Drain complete preview PCM blocks without waiting for a host sink.
+    pub fn drain_audio_preview_blocks(&mut self) -> Vec<AudioPreviewBlock> {
+        self.audio_sink.drain_preview_pcm_blocks()
+    }
+
+    /// Flush and drain the final partial preview block at session shutdown.
+    pub fn finish_audio_preview_blocks(&mut self) -> Vec<AudioPreviewBlock> {
+        self.audio_sink.finish_preview_pcm_blocks()
+    }
+
+    /// Snapshot bounded preview transport counters. These are not part of the
+    /// authoritative schema-8 audio observation projection.
+    pub fn audio_preview_snapshot(&self) -> AudioPreviewSnapshot {
+        self.audio_sink.preview_pcm_snapshot()
     }
 
     /// True iff no channel is currently transferring (no `BUSY`) and no

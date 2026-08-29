@@ -54,9 +54,13 @@ time is not written into the emulated clock.  UART input goes to the guest's
   stdin.  `reset` resets CPU/peripheral state and re-enters the selected boot
   handoff while retaining attached flash and SD media.
 
-PCM framing is reserved by the schema, but VRP-2 reports
-`audio.state=not_streamed`; bounded host audio transport is the separate VRP-4
-work package.  The backend therefore must not be described as an audio player.
+PCM framing is now emitted by the preview runner as bounded 128-frame source
+blocks.  The backend uses a bounded audio tap and asynchronous PCRP output
+writer; a slow host reader or player cannot block emulated virtual time.  The
+host frontend owns resampling, playback, and presentation-drop accounting.
+`audio.state=not_streamed` remains the legacy authoritative digest field, while
+host monitor state is reported separately.  The backend is still not an audio
+player and does not claim speaker-quality or hardware-audio qualification.
 
 The existing JSON Lines machine API can request the same projection with
 `{"schema":1,"id":"obs","op":"observe","domains":["preview"]}`.
@@ -108,7 +112,10 @@ positive/overrun evidence are present. It does not yet provide:
   currently recorded VRP-2 targets predate complete `audio_sink` observation
   and the gate must not fill that data by inference);
 - a GUI, PicoCalc device skin, or automatic UART window (VRP-3);
-- bounded host PCM streaming (VRP-4);
+- a formally qualified host PCM monitor: VRP-4's bounded tap, asynchronous
+  transport, variable-rate resampling, and drop states are implemented and
+  locally tested, but the registered-target off/on/forced-drop evidence gate is
+  still pending;
 - a `REALTIME OK` or `realtime-1x-qualified` capability (VRP-5 and
   `VRP-NES-0` are still required).
 

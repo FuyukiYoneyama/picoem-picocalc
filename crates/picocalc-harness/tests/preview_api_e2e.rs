@@ -428,6 +428,9 @@ fn preview_uart_direction_and_quit_are_process_safe() {
     let mut last_output_sequence = sequence;
     let status: Value = serde_json::from_slice(&payload).expect("status JSON");
     assert_eq!(status["audio"]["state"], "not_streamed");
+    assert_eq!(status["audio_monitor"]["enabled"], true);
+    assert_eq!(status["audio_monitor"]["state"], "inactive");
+    assert_eq!(status["audio_monitor"]["capacity_blocks"], 8);
     assert_eq!(status["virtual_cycle"], 0);
     assert_eq!(status["observation"]["schema_version"], 1);
     let digest = status["observation"]["digest_sha256"]

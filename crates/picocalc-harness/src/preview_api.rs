@@ -6,9 +6,10 @@
 //! expected to be a separate process; stdout is therefore reserved for
 //! framed protocol bytes and diagnostics stay on stderr.
 
-use std::io;
-use std::sync::mpsc::{self, SyncSender, TryRecvError};
-use std::thread;
+use std::io::{self, BufWriter, Write};
+use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use picoem_common::{Pacer, PacerSnapshot};
@@ -21,8 +22,168 @@ use crate::{MachineSession, ScenarioReplay, ScenarioReplayStep};
 const PACER_QUANTUM_CYCLES: u64 = 150;
 const FRAME_POLL_QUANTA: u64 = 1_000;
 const INPUT_QUEUE_CAPACITY: usize = 256;
+const OUTPUT_QUEUE_CAPACITY: usize = 256;
 
 type InputMessage = Result<Option<Frame>, String>;
+
+struct OutboundFrame {
+    frame: Frame,
+}
+
+/// Serialize preview frames off the emulation thread.  Presentation frames
+/// and audio are explicitly lossy under backpressure; control/diagnostic
+/// frames remain fail-closed.  This keeps a slow GUI/audio reader from
+/// turning host transport latency into virtual-clock latency.
+struct PreviewWriter {
+    sender: Option<mpsc::SyncSender<OutboundFrame>>,
+    writer: Option<JoinHandle<()>>,
+    error: Arc<Mutex<Option<String>>>,
+    next_sequence: u32,
+    dropped_audio_blocks: u64,
+    dropped_frames: u64,
+    dropped_status: u64,
+}
+
+impl PreviewWriter {
+    fn new() -> Self {
+        Self::with_writer(Box::new(io::stdout()))
+    }
+
+    fn with_writer(writer: Box<dyn Write + Send>) -> Self {
+        Self::with_capacity_writer(OUTPUT_QUEUE_CAPACITY, writer)
+    }
+
+    fn with_capacity_writer(capacity: usize, writer: Box<dyn Write + Send>) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<OutboundFrame>(capacity);
+        let error = Arc::new(Mutex::new(None));
+        let thread_error = Arc::clone(&error);
+        let writer = thread::spawn(move || {
+            let mut frame_writer =
+                FrameWriter::new(BufWriter::new(writer), Direction::RunnerToPreview);
+            while let Ok(outbound) = receiver.recv() {
+                if let Err(protocol_error) = frame_writer.write_frame(outbound.frame) {
+                    if let Ok(mut slot) = thread_error.lock() {
+                        *slot = Some(protocol_error.to_string());
+                    }
+                    break;
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            writer: Some(writer),
+            error,
+            next_sequence: 0,
+            dropped_audio_blocks: 0,
+            dropped_frames: 0,
+            dropped_status: 0,
+        }
+    }
+
+    fn stored_error(&self) -> Option<ProtocolError> {
+        self.error
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .map(ProtocolError::new)
+    }
+
+    fn enqueue(
+        &mut self,
+        kind: Kind,
+        payload: Vec<u8>,
+        droppable: bool,
+    ) -> Result<bool, ProtocolError> {
+        if let Some(error) = self.stored_error() {
+            return Err(error);
+        }
+        let sequence = self.next_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| ProtocolError::new("preview sequence exhausted"))?;
+        let frame = Frame::new(kind, sequence, payload)?;
+        frame.validate_for_direction(Direction::RunnerToPreview)?;
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| ProtocolError::new("preview output writer is closed"))?;
+        match sender.try_send(OutboundFrame { frame }) {
+            Ok(()) => {
+                self.next_sequence = next_sequence;
+                Ok(true)
+            }
+            Err(TrySendError::Full(_)) if droppable => {
+                match kind {
+                    Kind::AudioPcmS16 => {
+                        self.dropped_audio_blocks = self.dropped_audio_blocks.saturating_add(1)
+                    }
+                    Kind::FrameRgb565 => {
+                        self.dropped_frames = self.dropped_frames.saturating_add(1)
+                    }
+                    Kind::Status => self.dropped_status = self.dropped_status.saturating_add(1),
+                    _ => {}
+                }
+                Ok(false)
+            }
+            Err(TrySendError::Full(_)) => Err(ProtocolError::new(
+                "preview output queue is full for a non-droppable frame",
+            )),
+            Err(TrySendError::Disconnected(_)) => {
+                Err(ProtocolError::new("preview output writer disconnected"))
+            }
+        }
+    }
+
+    fn write_json(&mut self, kind: Kind, value: &Value) -> Result<u32, ProtocolError> {
+        let payload = serde_json::to_vec(value)
+            .map_err(|error| ProtocolError::new(format!("serializing preview JSON: {error}")))?;
+        let sequence = self.next_sequence;
+        let _ = self.enqueue(kind, payload, matches!(kind, Kind::Status))?;
+        Ok(sequence)
+    }
+
+    fn write_bytes(&mut self, kind: Kind, payload: Vec<u8>) -> Result<u32, ProtocolError> {
+        let sequence = self.next_sequence;
+        let droppable = matches!(kind, Kind::FrameRgb565 | Kind::Status | Kind::AudioPcmS16);
+        let _ = self.enqueue(kind, payload, droppable)?;
+        Ok(sequence)
+    }
+
+    fn write_audio_bytes(&mut self, payload: Vec<u8>) -> Result<bool, ProtocolError> {
+        self.enqueue(Kind::AudioPcmS16, payload, true)
+    }
+
+    fn dropped_audio_blocks(&self) -> u64 {
+        self.dropped_audio_blocks
+    }
+
+    fn dropped_frames(&self) -> u64 {
+        self.dropped_frames
+    }
+
+    fn dropped_status(&self) -> u64 {
+        self.dropped_status
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.sender.take();
+        if let Some(writer) = self.writer.take() {
+            writer
+                .join()
+                .map_err(|_| "preview output writer thread panicked".to_string())?;
+        }
+        if let Some(error) = self.stored_error() {
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PreviewWriter {
+    fn drop(&mut self) {
+        self.sender.take();
+    }
+}
 
 /// Run the preview wire until the frontend sends `quit`, closes stdin, or a
 /// malformed frame is received.  This function is intentionally separate
@@ -31,11 +192,14 @@ pub(crate) fn run(
     machine: &mut MachineSession,
     mut replay: Option<ScenarioReplay>,
 ) -> Result<(), String> {
+    // The emulated sink always advances independently of the host player.  A
+    // bounded tap is enabled only for this preview process; ordinary batch
+    // reports retain their zero-allocation audio path.
+    machine.emu.bus.enable_audio_preview_tap();
     let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
     spawn_input_reader(input_tx);
 
-    let stdout = io::stdout();
-    let mut output = FrameWriter::new(stdout.lock(), Direction::RunnerToPreview);
+    let mut output = PreviewWriter::new();
     output
         .write_json(
             Kind::Hello,
@@ -182,6 +346,7 @@ pub(crate) fn run(
                         frame_updates = frame_updates.saturating_add(1);
                     }
                 }
+                write_audio_blocks(&mut output, machine.emu.bus.finish_audio_preview_blocks())?;
                 write_status(
                     &mut output,
                     machine,
@@ -224,6 +389,10 @@ pub(crate) fn run(
             uart_tx_bytes = uart_tx_bytes.saturating_add(1);
         }
 
+        let audio_blocks = machine.emu.bus.drain_audio_preview_blocks();
+        let had_audio = !audio_blocks.is_empty();
+        write_audio_blocks(&mut output, audio_blocks)?;
+
         quanta = quanta.saturating_add(1);
         if quanta.is_multiple_of(FRAME_POLL_QUANTA)
             && let Some(framebuffer) = machine.preview_framebuffer()
@@ -235,7 +404,7 @@ pub(crate) fn run(
                 frame_updates = frame_updates.saturating_add(1);
             }
         }
-        if had_uart || quanta.is_multiple_of(FRAME_POLL_QUANTA) {
+        if had_uart || had_audio || quanta.is_multiple_of(FRAME_POLL_QUANTA) {
             write_status(
                 &mut output,
                 machine,
@@ -255,10 +424,11 @@ pub(crate) fn run(
         return Err(error);
     }
 
+    write_audio_blocks(&mut output, machine.emu.bus.finish_audio_preview_blocks())?;
     output
         .write_json(Kind::Goodbye, &json!({"reason": "quit"}))
         .map_err(protocol_message)?;
-    Ok(())
+    output.finish()
 }
 
 fn spawn_input_reader(sender: SyncSender<InputMessage>) {
@@ -281,10 +451,10 @@ fn spawn_input_reader(sender: SyncSender<InputMessage>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_input_frame<W: io::Write>(
+fn handle_input_frame(
     frame: Frame,
     machine: &mut MachineSession,
-    output: &mut FrameWriter<W>,
+    output: &mut PreviewWriter,
     last_frame_sha: &mut Option<String>,
     frame_updates: &mut u64,
     uart_rx_accepted: &mut u64,
@@ -358,8 +528,8 @@ fn handle_input_frame<W: io::Write>(
     Ok(())
 }
 
-fn write_frame<W: io::Write>(
-    output: &mut FrameWriter<W>,
+fn write_frame(
+    output: &mut PreviewWriter,
     cycle: u64,
     framebuffer: &picocalc_board::Framebuffer,
 ) -> Result<(), String> {
@@ -379,9 +549,47 @@ fn write_frame<W: io::Write>(
     Ok(())
 }
 
+fn write_audio_blocks(
+    output: &mut PreviewWriter,
+    blocks: Vec<rp2040_emu::AudioPreviewBlock>,
+) -> Result<(), String> {
+    for block in blocks {
+        let payload = audio_block_payload(&block)?;
+        let _ = output
+            .write_audio_bytes(payload)
+            .map_err(protocol_message)?;
+    }
+    Ok(())
+}
+
+fn audio_block_payload(block: &rp2040_emu::AudioPreviewBlock) -> Result<Vec<u8>, String> {
+    let channels = usize::from(block.channels);
+    if channels == 0 || !block.samples.len().is_multiple_of(channels) {
+        return Err("preview audio block has invalid channel/sample shape".to_string());
+    }
+    let frame_count = block.samples.len() / channels;
+    if frame_count > rp2040_emu::PREVIEW_AUDIO_BLOCK_FRAMES {
+        return Err(format!(
+            "preview audio block has {frame_count} frames, limit is {}",
+            rp2040_emu::PREVIEW_AUDIO_BLOCK_FRAMES
+        ));
+    }
+    let frames = u16::try_from(frame_count)
+        .map_err(|_| "preview audio block has too many frames".to_string())?;
+    let mut payload = Vec::with_capacity(16 + block.samples.len() * 2);
+    payload.extend_from_slice(&block.cycle.to_le_bytes());
+    payload.extend_from_slice(&block.sample_rate_hz.to_le_bytes());
+    payload.extend_from_slice(&u16::from(block.channels).to_le_bytes());
+    payload.extend_from_slice(&frames.to_le_bytes());
+    for sample in &block.samples {
+        payload.extend_from_slice(&sample.to_le_bytes());
+    }
+    Ok(payload)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn write_status<W: io::Write>(
-    output: &mut FrameWriter<W>,
+fn write_status(
+    output: &mut PreviewWriter,
     machine: &MachineSession,
     snapshot: &PacerSnapshot,
     frame_updates: u64,
@@ -402,8 +610,37 @@ fn write_status<W: io::Write>(
         (virtual_ns as i128 - wall_ns as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     let observation_projection = machine.preview_observation_projection();
     let observation_digest = machine.preview_observation_digest();
+    let audio_preview = machine.emu.bus.audio_preview_snapshot();
+    let ipc_audio_drops = output.dropped_audio_blocks();
+    let audio_monitor_state = if audio_preview.dropped_blocks != 0 || ipc_audio_drops != 0 {
+        "degraded"
+    } else if audio_preview.produced_blocks != 0 {
+        "streaming"
+    } else {
+        "inactive"
+    };
     let mut status = json!({
         "audio": {"queue_frames": 0, "state": "not_streamed"},
+        "audio_monitor": {
+            "capacity_blocks": audio_preview.capacity_blocks,
+            "capacity_frames": audio_preview.capacity_frames,
+            "channels": audio_preview.channels,
+            "drained_blocks": audio_preview.drained_blocks,
+            "drained_frames": audio_preview.drained_frames,
+            "drop_count": audio_preview.dropped_blocks,
+            "dropped_blocks": audio_preview.dropped_blocks,
+            "enabled": audio_preview.enabled,
+            "produced_blocks": audio_preview.produced_blocks,
+            "queue_frames": audio_preview.queued_frames,
+            "queued_blocks": audio_preview.queued_blocks,
+            "overrun_count": audio_preview.dropped_blocks,
+            "ipc_dropped_audio_blocks": ipc_audio_drops,
+            "ipc_dropped_frame_count": output.dropped_frames(),
+            "ipc_dropped_status_count": output.dropped_status(),
+            "source_sample_rate_hz": audio_preview.source_sample_rate_hz,
+            "state": audio_monitor_state,
+            "underrun_count": 0,
+        },
         "coverage": if machine.stopped().is_some() { "stopped" } else { "ok" },
         "framebuffer": {"updates": frame_updates},
         "observation": {
@@ -443,11 +680,7 @@ fn write_status<W: io::Write>(
     Ok(())
 }
 
-fn write_error<W: io::Write>(
-    output: &mut FrameWriter<W>,
-    code: &str,
-    message: &str,
-) -> Result<(), String> {
+fn write_error(output: &mut PreviewWriter, code: &str, message: &str) -> Result<(), String> {
     output
         .write_json(Kind::Error, &json!({"code": code, "message": message}))
         .map_err(protocol_message)?;
@@ -456,4 +689,116 @@ fn write_error<W: io::Write>(
 
 fn protocol_message(error: ProtocolError) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn audio_preview_block_is_encoded_as_schema_one_pcm() {
+        let block = rp2040_emu::AudioPreviewBlock {
+            cycle: 42,
+            sample_rate_hz: 22_050,
+            channels: 2,
+            samples: vec![-1, 2, 3, -4],
+        };
+        let mut bytes = Vec::new();
+        {
+            let mut writer = FrameWriter::new(&mut bytes, Direction::RunnerToPreview);
+            let payload = audio_block_payload(&block).expect("encode audio block");
+            writer
+                .write_frame(Frame::new(Kind::AudioPcmS16, 0, payload).expect("audio frame"))
+                .expect("write audio block");
+        }
+        let mut reader = FrameReader::new(Cursor::new(bytes), Direction::RunnerToPreview);
+        let frame = reader
+            .read_frame()
+            .expect("read audio frame")
+            .expect("frame");
+        assert_eq!(frame.kind, Kind::AudioPcmS16);
+        assert_eq!(
+            u64::from_le_bytes(frame.payload[0..8].try_into().unwrap()),
+            42
+        );
+        assert_eq!(
+            u32::from_le_bytes(frame.payload[8..12].try_into().unwrap()),
+            22_050
+        );
+        assert_eq!(
+            u16::from_le_bytes(frame.payload[12..14].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            u16::from_le_bytes(frame.payload[14..16].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            &frame.payload[16..],
+            &[
+                (-1i16).to_le_bytes(),
+                2i16.to_le_bytes(),
+                3i16.to_le_bytes(),
+                (-4i16).to_le_bytes()
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn malformed_audio_block_is_rejected_before_writing() {
+        let block = rp2040_emu::AudioPreviewBlock {
+            cycle: 0,
+            sample_rate_hz: 48_000,
+            channels: 0,
+            samples: vec![0],
+        };
+        assert!(audio_block_payload(&block).is_err());
+    }
+
+    #[test]
+    fn output_queue_drops_presentation_frames_without_waiting_for_sink() {
+        struct BlockingWriter {
+            started: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
+
+        impl Write for BlockingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.started.store(true, Ordering::SeqCst);
+                while !self.release.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut output = PreviewWriter::with_capacity_writer(
+            1,
+            Box::new(BlockingWriter {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+        );
+
+        let payload = b"{}".to_vec();
+        assert!(output.enqueue(Kind::Status, payload.clone(), true).unwrap());
+        while !started.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        assert!(output.enqueue(Kind::Status, payload.clone(), true).unwrap());
+        assert!(!output.enqueue(Kind::Status, payload, true).unwrap());
+        assert_eq!(output.dropped_status(), 1);
+
+        release.store(true, Ordering::SeqCst);
+        output.finish().expect("blocking output writer finishes");
+    }
 }

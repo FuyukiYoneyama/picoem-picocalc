@@ -382,6 +382,7 @@ impl MachineSession {
     pub(crate) fn reset_for_preview(&mut self) -> Result<(), String> {
         self.emu.reset();
         self.enable_preview_uart_cycle_tap();
+        self.emu.bus.enable_audio_preview_tap();
         self.uart_bytes.clear();
         self.dispatches = 0;
         self.watchdog_resets.clear();
