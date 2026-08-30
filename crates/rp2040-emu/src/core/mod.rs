@@ -497,7 +497,9 @@ impl CortexM0Plus {
     /// `((addr >> 1) & (DECODE_CACHE_SIZE - 1))` for each cacheable
     /// address, plus the preceding slot (so a wide instruction's `hw0`
     /// at `addr - 2` whose `hw1` is rewritten gets evicted too).
-    /// Non-cacheable addresses are skipped.
+    /// Non-cacheable addresses are skipped.  The P1-A feature adds a full
+    /// tag check before clearing either slot; the default path intentionally
+    /// keeps the historical index-only invalidation semantics.
     pub fn invalidate_decode_cache_entries(&mut self, addrs: &[u32]) {
         use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
         const MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
@@ -514,7 +516,10 @@ impl CortexM0Plus {
             let prev = aligned.wrapping_sub(2);
             if is_cacheable_pc(prev) {
                 let slot = ((prev >> 1) & MASK) as usize;
-                #[cfg(feature = "cpu-application-profiler")]
+                #[cfg(any(
+                    feature = "cpu-application-profiler",
+                    feature = "decode-invalidation-tag-guard"
+                ))]
                 let entry = self.decode_cache[slot];
                 #[cfg(feature = "cpu-application-profiler")]
                 if let Some(profiler) = self.cpu_application_profiler.as_mut() {
@@ -524,11 +529,21 @@ impl CortexM0Plus {
                         entry.matches_pc(prev, slot) && entry.is_wide(),
                     );
                 }
-                self.decode_cache[slot] = empty;
+                #[cfg(feature = "decode-invalidation-tag-guard")]
+                if entry.matches_pc(prev, slot) && entry.is_wide() {
+                    self.decode_cache[slot] = empty;
+                }
+                #[cfg(not(feature = "decode-invalidation-tag-guard"))]
+                {
+                    self.decode_cache[slot] = empty;
+                }
             }
             if is_cacheable_pc(aligned) {
                 let slot = ((aligned >> 1) & MASK) as usize;
-                #[cfg(feature = "cpu-application-profiler")]
+                #[cfg(any(
+                    feature = "cpu-application-profiler",
+                    feature = "decode-invalidation-tag-guard"
+                ))]
                 let entry = self.decode_cache[slot];
                 #[cfg(feature = "cpu-application-profiler")]
                 if let Some(profiler) = self.cpu_application_profiler.as_mut() {
@@ -538,7 +553,14 @@ impl CortexM0Plus {
                         false,
                     );
                 }
-                self.decode_cache[slot] = empty;
+                #[cfg(feature = "decode-invalidation-tag-guard")]
+                if entry.matches_pc(aligned, slot) {
+                    self.decode_cache[slot] = empty;
+                }
+                #[cfg(not(feature = "decode-invalidation-tag-guard"))]
+                {
+                    self.decode_cache[slot] = empty;
+                }
             }
         }
     }

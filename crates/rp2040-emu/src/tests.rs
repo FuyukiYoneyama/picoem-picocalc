@@ -9189,6 +9189,87 @@ mod decode_cache {
         assert_eq!(cpu.decode_cache[slot].hw0, 0x3005);
     }
 
+    #[cfg(feature = "decode-invalidation-tag-guard")]
+    #[test]
+    fn tag_guard_preserves_unrelated_same_index_entry_on_both_cores() {
+        // The SRAM write and XIP entry deliberately hash to the same direct-
+        // mapped slot.  P1-A must leave the XIP entry hot on either active
+        // core; the default index-only path would clear it.
+        let write_pc = 0x2000_0000u32;
+        let unrelated_pc = 0x1000_0000u32;
+        let slot = ((write_pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        assert_eq!(
+            slot,
+            ((unrelated_pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize
+        );
+        for core_id in [0u8, 1u8] {
+            let mut cpu = CortexM0Plus::with_id(core_id);
+            cpu.decode_cache[slot] = DecodedOp::from_parts(unrelated_pc, 0x3001, 0, false);
+            cpu.invalidate_decode_cache_entries(&[write_pc]);
+            assert_eq!(
+                cpu.decode_cache[slot].tag_for_slot(slot),
+                unrelated_pc,
+                "unrelated XIP tag must survive on core {core_id}"
+            );
+        }
+    }
+
+    #[cfg(feature = "decode-invalidation-tag-guard")]
+    #[test]
+    fn tag_guard_clears_matching_narrow_entry() {
+        let pc = 0x2000_0000u32;
+        let slot = ((pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        let mut cpu = CortexM0Plus::new();
+        cpu.decode_cache[slot] = DecodedOp::from_parts(pc, 0x3001, 0, false);
+        cpu.invalidate_decode_cache_entries(&[pc]);
+        assert_eq!(cpu.decode_cache[slot].tag_for_slot(slot), u32::MAX);
+    }
+
+    #[cfg(feature = "decode-invalidation-tag-guard")]
+    #[test]
+    fn tag_guard_only_clears_wide_predecessor() {
+        let pc = 0x2000_0000u32;
+        let slot = ((pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+
+        let mut wide_cpu = CortexM0Plus::new();
+        wide_cpu.decode_cache[slot] = DecodedOp::from_parts(pc, 0xF000, 0xF800, true);
+        wide_cpu.invalidate_decode_cache_entries(&[pc + 2]);
+        assert_eq!(wide_cpu.decode_cache[slot].tag_for_slot(slot), u32::MAX);
+
+        let mut narrow_cpu = CortexM0Plus::new();
+        narrow_cpu.decode_cache[slot] = DecodedOp::from_parts(pc, 0x3001, 0, false);
+        narrow_cpu.invalidate_decode_cache_entries(&[pc + 2]);
+        assert_eq!(narrow_cpu.decode_cache[slot].tag_for_slot(slot), pc);
+    }
+
+    #[cfg(feature = "decode-invalidation-tag-guard")]
+    #[test]
+    fn tag_guard_covers_all_slots_of_a_four_byte_write() {
+        let pc = 0x2000_0010u32;
+        let mut cpu = CortexM0Plus::new();
+        let mut bus = Bus::new();
+        let predecessor_slot = (((pc - 2) >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        let first_slot = ((pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        let second_slot = (((pc + 2) >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        cpu.decode_cache[predecessor_slot] = DecodedOp::from_parts(pc - 2, 0xF000, 0xF800, true);
+        cpu.decode_cache[first_slot] = DecodedOp::from_parts(pc, 0x3001, 0, false);
+        cpu.decode_cache[second_slot] = DecodedOp::from_parts(pc + 2, 0x3002, 0, false);
+        bus.write32(pc, 0x3002_3001);
+        assert_eq!(bus.pending_cache_invalidations.as_slice(), &[pc, pc + 2]);
+        cpu.invalidate_decode_cache_entries(&bus.pending_cache_invalidations);
+        for (slot, name) in [
+            (predecessor_slot, "wide predecessor"),
+            (first_slot, "first halfword"),
+            (second_slot, "second halfword"),
+        ] {
+            assert_eq!(
+                cpu.decode_cache[slot].tag_for_slot(slot),
+                u32::MAX,
+                "{name} cleared"
+            );
+        }
+    }
+
     #[test]
     fn region_invalidate_clears_only_target_region() {
         let mut cpu = CortexM0Plus::new();

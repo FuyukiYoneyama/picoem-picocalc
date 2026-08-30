@@ -73,6 +73,10 @@ compact-dispatch-key-prototype = []
 # P0-B application profiler. Diagnostic-only counters are compiled into the
 # CPU core only when explicitly requested; normal builds have no hooks.
 cpu-application-profiler = []
+# P1-A experimental full-tag guard for per-address decode-cache invalidation.
+# Default invalidation semantics remain unchanged until correctness and
+# application A/B evidence promote this candidate.
+decode-invalidation-tag-guard = []
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }
