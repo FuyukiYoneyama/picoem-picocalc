@@ -878,10 +878,7 @@ fn pio_narrow_writes_to_fdebug_dont_corrupt() {
     // write 1's via the plain alias because that's W1C clear.
     bus.write32(0x5020_2008, 0x1234_5678, 0);
     let pre = bus.read32(0x5020_0008, 0);
-    assert_eq!(
-        pre, 0x1234_5678,
-        "seed via SET alias must land at FDEBUG"
-    );
+    assert_eq!(pre, 0x1234_5678, "seed via SET alias must land at FDEBUG");
 
     // Narrow byte-0 write to FDEBUG. With the broken RMW path this
     // would (a) read 0x1234_5678, (b) splice byte 0 to 0xFF, (c) write

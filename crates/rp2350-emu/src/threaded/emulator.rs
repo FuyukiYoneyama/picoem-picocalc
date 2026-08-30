@@ -3266,9 +3266,8 @@ mod tests {
             // First call panics through the worker → instance poisoned.
             // We catch_unwind to keep the test stable across the
             // expected-substring matchers.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                threaded.run_quanta(1)
-            }));
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| threaded.run_quanta(1)));
             assert!(threaded.poisoned);
 
             // Second call hits the entry-point assert and panics with

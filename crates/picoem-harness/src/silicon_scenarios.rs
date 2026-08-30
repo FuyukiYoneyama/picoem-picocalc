@@ -4415,11 +4415,7 @@ mod tests {
             );
         }
         // DMA INTR bit 0 must be set (CH0 transfer complete).
-        assert_ne!(
-            emu.mmio_read32(DMA_INTR) & 0x0000_0001,
-            0,
-            "DMA INTR bit 0",
-        );
+        assert_ne!(emu.mmio_read32(DMA_INTR) & 0x0000_0001, 0, "DMA INTR bit 0",);
         // CH0 BUSY must be clear (busy-poll only exits when BUSY=0).
         assert_eq!(
             emu.mmio_read32(DMA_BASE + 0x0C) & 0x0400_0000,
@@ -4455,11 +4451,7 @@ mod tests {
             flevel,
         );
         // DMA INTR bit 0 must be set.
-        assert_ne!(
-            emu.mmio_read32(DMA_INTR) & 0x0000_0001,
-            0,
-            "DMA INTR bit 0",
-        );
+        assert_ne!(emu.mmio_read32(DMA_INTR) & 0x0000_0001, 0, "DMA INTR bit 0",);
         // CH0 BUSY must be clear.
         assert_eq!(
             emu.mmio_read32(DMA_BASE + 0x0C) & 0x0400_0000,

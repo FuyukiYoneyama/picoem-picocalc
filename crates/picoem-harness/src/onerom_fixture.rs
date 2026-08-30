@@ -1441,7 +1441,9 @@ mod tests {
                     "reason should mention 32-pin: {reason:?}"
                 );
             }
-            other => panic!("expected UnknownLayout for unsupported 32-pin rom_type, got {other:?}"),
+            other => {
+                panic!("expected UnknownLayout for unsupported 32-pin rom_type, got {other:?}")
+            }
         }
     }
 

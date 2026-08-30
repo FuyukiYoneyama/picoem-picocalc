@@ -8362,10 +8362,7 @@ mod tests {
             fpscr: 0x0000_0000,
         };
         let err = compare_probe(&tc, &hw, &emu).unwrap_err();
-        assert!(
-            err.contains("FPSCR"),
-            "expected FPSCR diff in err: {err}",
-        );
+        assert!(err.contains("FPSCR"), "expected FPSCR diff in err: {err}",);
     }
 
     // ----------------------------------------------------------------------
@@ -8487,14 +8484,8 @@ mod tests {
             .collect();
         // Store cases have a non-empty mem_check; load cases have a non-empty
         // mem_pre. Confirm both populations appear.
-        let store_seen = lsreg
-            .iter()
-            .filter(|tc| !tc.mem_check.is_empty())
-            .count();
-        let load_seen = lsreg
-            .iter()
-            .filter(|tc| !tc.mem_pre.is_empty())
-            .count();
+        let store_seen = lsreg.iter().filter(|tc| !tc.mem_check.is_empty()).count();
+        let load_seen = lsreg.iter().filter(|tc| !tc.mem_pre.is_empty()).count();
         assert!(store_seen > 0, "no LSREG stores in 300 mem cases");
         assert!(load_seen > 0, "no LSREG loads in 300 mem cases");
     }
@@ -8510,14 +8501,8 @@ mod tests {
             .iter()
             .filter(|tc| tc.name.starts_with("FUZZ:LSIMM:"))
             .collect();
-        let stores = lsimm
-            .iter()
-            .filter(|tc| !tc.mem_check.is_empty())
-            .count();
-        let loads = lsimm
-            .iter()
-            .filter(|tc| !tc.mem_pre.is_empty())
-            .count();
+        let stores = lsimm.iter().filter(|tc| !tc.mem_check.is_empty()).count();
+        let loads = lsimm.iter().filter(|tc| !tc.mem_pre.is_empty()).count();
         assert!(stores > 0, "no LSIMM stores in 300 mem cases");
         assert!(loads > 0, "no LSIMM loads in 300 mem cases");
     }

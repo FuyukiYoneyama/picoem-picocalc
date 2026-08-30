@@ -24409,7 +24409,11 @@ mod stage2_exceptions_corecasecoverage {
         cpu.ppb.sau_regions[0] = (0x0000_0000, 0xFFFF_FFE1);
         // Address well above the region limit.
         let r = cpu.execute_tt(0x2000_8000);
-        assert_eq!(r & (1 << 16), 0, "MRVALID must be clear for above-limit addr");
+        assert_eq!(
+            r & (1 << 16),
+            0,
+            "MRVALID must be clear for above-limit addr"
+        );
         assert_eq!(r & 0xFF, 0, "MREGION must default to 0 (no match)");
     }
 
@@ -24636,8 +24640,7 @@ mod stage2_exceptions_corecasecoverage {
         bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
         bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
         cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 16; // ext IRQ 0 active
-        cpu.ppb.icsr |=
-            crate::bus::ppb::ICSR_PENDSVSET | crate::bus::ppb::ICSR_PENDSTSET;
+        cpu.ppb.icsr |= crate::bus::ppb::ICSR_PENDSVSET | crate::bus::ppb::ICSR_PENDSTSET;
         let exc_return = 0xFFFF_FFF1u32;
         let cycles = cpu.exit_exception(exc_return, &mut bus);
         assert_eq!(cycles, 6, "tail-chain cost (= 6) when a candidate fires");
@@ -29283,7 +29286,11 @@ mod core_mod_branches {
         assert_eq!(s.read32(0x078) & 0x2, 0x2, "DIRTY still set after one read");
         // Second read: line 109 true → clears DIRTY.
         assert_eq!(s.read32(0x074), 0);
-        assert_eq!(s.read32(0x078) & 0x2, 0x0, "DIRTY cleared after second read");
+        assert_eq!(
+            s.read32(0x078) & 0x2,
+            0x0,
+            "DIRTY cleared after second read"
+        );
     }
 
     /// `divider_result_read` on a non-dirty divider does NOT increment
@@ -29654,8 +29661,7 @@ mod core_mod_branches {
         // Tag 0x2000_0010 → slot index ((0x2000_0010 >> 1) & MASK).
         // Region nibble = 0x2 → SRAM bit (1<<2) = 0x04.
         let pc = 0x2000_0010u32;
-        let slot = ((pc >> 1) as usize)
-            & (crate::bus::DECODE_CACHE_SIZE - 1);
+        let slot = ((pc >> 1) as usize) & (crate::bus::DECODE_CACHE_SIZE - 1);
         let entry = DecodedOp {
             tag: pc,
             hw0: 0xBF00, // NOP
@@ -29683,8 +29689,7 @@ mod core_mod_branches {
         use crate::bus::DecodedOp;
         let mut cpu = CortexM33::for_test(0);
         let pc = 0x2000_0020u32;
-        let slot = ((pc >> 1) as usize)
-            & (crate::bus::DECODE_CACHE_SIZE - 1);
+        let slot = ((pc >> 1) as usize) & (crate::bus::DECODE_CACHE_SIZE - 1);
         let entry = DecodedOp {
             tag: pc,
             hw0: 0xBF00,
@@ -29774,18 +29779,19 @@ mod coprocessor_branches {
     /// kept private here so this module is self-contained.
     fn encode_cdp_dcp(opc1: u8, opc2: u8, crd: u8, crn: u8, crm: u8) -> (u16, u16) {
         let hw0: u16 = 0xEE00 | ((opc1 as u16 & 0xF) << 4) | (crn as u16 & 0xF);
-        let hw1: u16 = ((crd as u16) << 12)
-            | (4u16 << 8)
-            | ((opc2 as u16 & 0x7) << 5)
-            | (crm as u16 & 0xF);
+        let hw1: u16 =
+            ((crd as u16) << 12) | (4u16 << 8) | ((opc2 as u16 & 0x7) << 5) | (crm as u16 & 0xF);
         (hw0, hw1)
     }
 
     /// MCR2 encoder for CP7 RCP tests.
     fn encode_mcr2(opc1: u8, opc2: u8, rt: u8, crn: u8, crm: u8) -> (u16, u16) {
         let hw0: u16 = 0xFE00 | ((opc1 as u16 & 0x7) << 5) | (crn as u16 & 0xF);
-        let hw1: u16 =
-            ((rt as u16) << 12) | (7u16 << 8) | ((opc2 as u16 & 0x7) << 5) | 0x10 | (crm as u16 & 0xF);
+        let hw1: u16 = ((rt as u16) << 12)
+            | (7u16 << 8)
+            | ((opc2 as u16 & 0x7) << 5)
+            | 0x10
+            | (crm as u16 & 0xF);
         (hw0, hw1)
     }
 
@@ -30056,7 +30062,7 @@ mod stage3_ppb_dma_branches {
     #[test]
     fn systick_advance_delta_above_u32_max_saturates() {
         let mut ppb = Ppb {
-            syst_csr: 1,    // ENABLE only (TICKINT=0)
+            syst_csr: 1, // ENABLE only (TICKINT=0)
             syst_rvr: 100,
             syst_cvr: 50,
             last_systick_cycles: 0,
@@ -30065,7 +30071,11 @@ mod stage3_ppb_dma_branches {
         // delta = u64::MAX + 1 wraps so we just pick a value > u32::MAX.
         ppb.systick_advance(u64::from(u32::MAX) + 1_000);
         // COUNTFLAG must have latched at least once.
-        assert_ne!(ppb.syst_csr & (1 << 16), 0, "saturated advance must underflow");
+        assert_ne!(
+            ppb.syst_csr & (1 << 16),
+            0,
+            "saturated advance must underflow"
+        );
         // ICSR.PENDSTSET stays clear (TICKINT=0).
         assert_eq!(ppb.icsr & (1 << 26), 0);
         // CVR must be a valid 24-bit value.
@@ -30078,7 +30088,7 @@ mod stage3_ppb_dma_branches {
     #[test]
     fn systick_cvr_positive_rvr_zero_breaks_after_first_underflow() {
         let mut ppb = Ppb {
-            syst_csr: 1 | 2,    // ENABLE + TICKINT
+            syst_csr: 1 | 2, // ENABLE + TICKINT
             syst_rvr: 0,
             syst_cvr: 5,
             last_systick_cycles: 0,
@@ -30297,11 +30307,7 @@ mod stage3_ppb_dma_branches {
             bus.write32(src + i * 4, 0xAB00_0000 + i, 0);
         }
         // EN=1, DATA_SIZE=2, INCR_READ=1, INCR_WRITE=1, TREQ=63 (FORCE).
-        let ctrl = 1
-            | (2 << 2)
-            | (1 << 4)
-            | (1 << 6)
-            | ((DREQ_FORCE as u32 & 0x3F) << 17);
+        let ctrl = 1 | (2 << 2) | (1 << 4) | (1 << 6) | ((DREQ_FORCE as u32 & 0x3F) << 17);
         bus.write32(DMA_BASE, src, 0);
         bus.write32(DMA_BASE + 0x04, dst, 0);
         bus.write32(DMA_BASE + 0x08, 10, 0); // 10 transfers
@@ -30366,11 +30372,7 @@ mod stage3_ppb_dma_branches {
         use crate::bus::RESET_DMA;
         bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
         // CTRL: EN=1, DATA_SIZE=2, TREQ=63.
-        let ctrl = 1
-            | (2 << 2)
-            | (1 << 4)
-            | (1 << 6)
-            | ((DREQ_FORCE as u32 & 0x3F) << 17);
+        let ctrl = 1 | (2 << 2) | (1 << 4) | (1 << 6) | ((DREQ_FORCE as u32 & 0x3F) << 17);
         bus.write32(DMA_BASE, 0x2000_0B00, 0);
         bus.write32(DMA_BASE + 0x04, 0x2000_0C00, 0);
         bus.write32(DMA_BASE + 0x08, 0, 0); // count=0
@@ -30387,10 +30389,7 @@ mod stage3_ppb_dma_branches {
         use crate::bus::RESET_DMA;
         bus.write32(0x4002_0000 + 0x3000, 1u32 << RESET_DMA, 0);
         // CTRL: EN=0, DATA_SIZE=2, TREQ=63.
-        let ctrl = (2 << 2)
-            | (1 << 4)
-            | (1 << 6)
-            | ((DREQ_FORCE as u32 & 0x3F) << 17);
+        let ctrl = (2 << 2) | (1 << 4) | (1 << 6) | ((DREQ_FORCE as u32 & 0x3F) << 17);
         bus.write32(DMA_BASE, 0x2000_0D00, 0);
         bus.write32(DMA_BASE + 0x04, 0x2000_0E00, 0);
         bus.write32(DMA_BASE + 0x08, 4, 0);
@@ -30608,7 +30607,11 @@ mod stage4_lib_residue_v2 {
         emu.cores.expect_riscv_mut()[1].set_halted(true);
         let _ = emu.step().unwrap();
         let mip0 = emu.cores.expect_riscv()[0].mip();
-        assert_ne!(mip0 & (1 << 11), 0, "MEIP must be set when IRQ pending and enabled");
+        assert_ne!(
+            mip0 & (1 << 11),
+            0,
+            "MEIP must be set when IRQ pending and enabled"
+        );
     }
 
     // ------------------- wake_checks: RiscV unparks on enabled MIP (line 1172) -------------------
@@ -31440,7 +31443,11 @@ mod stage5_thumb32_corners {
 
         // STREXB R0, R1, [R2]: hw0=0xE8C2, hw1=0x1F40
         c.execute_one_wide_with_bus(0xE8C2, 0x1F40, &mut bus);
-        assert_eq!(c.reg(0), 0, "STREXB with matching word-aligned monitor succeeds");
+        assert_eq!(
+            c.reg(0),
+            0,
+            "STREXB with matching word-aligned monitor succeeds"
+        );
         assert_eq!(bus.read8(0x2000_0402, 0), 0xC3);
         assert_eq!(c.exclusive_address, None);
     }
@@ -31554,11 +31561,10 @@ mod stage5_fpu_corners {
             let mut fpscr = preserve | (NZCV_MASK ^ ((nzcv) << 28));
             fpscr_set_nzcv_for_test(&mut fpscr, n, z, c, v);
 
-            let expected_nzcv =
-                (if n { FPSCR_N } else { 0 })
-                    | (if z { FPSCR_Z } else { 0 })
-                    | (if c { FPSCR_C } else { 0 })
-                    | (if v { FPSCR_V } else { 0 });
+            let expected_nzcv = (if n { FPSCR_N } else { 0 })
+                | (if z { FPSCR_Z } else { 0 })
+                | (if c { FPSCR_C } else { 0 })
+                | (if v { FPSCR_V } else { 0 });
             assert_eq!(
                 fpscr & NZCV_MASK,
                 expected_nzcv,
@@ -31634,7 +31640,11 @@ mod stage5_fpu_corners {
         let (hw0, hw1) = enc_vdiv(0, 2, 4);
         c.execute_one_wide(hw0, hw1);
         assert!(c.regs.fpscr & FPSCR_IOC != 0, "inf/inf must set IOC");
-        assert_eq!(c.regs.fpscr & FPSCR_DZC, 0, "DZC must NOT be set for inf/inf");
+        assert_eq!(
+            c.regs.fpscr & FPSCR_DZC,
+            0,
+            "DZC must NOT be set for inf/inf"
+        );
         assert!(c.regs.s[0].is_nan());
     }
 
@@ -31692,7 +31702,11 @@ mod stage5_fpu_corners {
         let (hw0, hw1) = enc_vsqrt(0, 2);
         c.execute_one_wide(hw0, hw1);
         assert_eq!(c.regs.s[0].to_bits(), 0x8000_0000, "sqrt(-0) = -0");
-        assert_eq!(c.regs.fpscr & FPSCR_IOC, 0, "IOC must be clear for sqrt(-0)");
+        assert_eq!(
+            c.regs.fpscr & FPSCR_IOC,
+            0,
+            "IOC must be clear for sqrt(-0)"
+        );
     }
 
     #[test]
@@ -33144,7 +33158,7 @@ mod stage6_periph_long_tail {
 mod stage8_fpu_helper_sweep {
     use super::{FPSCR_DN, FPSCR_FZ, FPSCR_IDC, FPSCR_IOC, FPSCR_IXC};
     use crate::core::execute_fpu::{
-        apply_dn_for_test, canonicalize_nan_for_test, canonicalize_nan_fma_for_test,
+        apply_dn_for_test, canonicalize_nan_fma_for_test, canonicalize_nan_for_test,
         canonicalize_nan_unary_for_test, f16_bits_to_f32_for_test, f32_to_f16_bits_for_test,
         f32_to_i32_rmode_for_test, f32_to_i32_rtz_for_test, f32_to_u32_rmode_for_test,
         f32_to_u32_rtz_for_test, fpu_maxnum_for_test, fpu_minnum_for_test, fpu_vrint_for_test,
@@ -34110,12 +34124,12 @@ mod stage9_residue {
     // execute_fpu.rs — helper-side branches Stage 8 didn't reach.
     // -----------------------------------------------------------------
     mod execute_fpu_residue {
-        use super::super::{enc_vmaxnm, enc_vminnm, enc_vsel, FPSCR_IDC, FPSCR_IOC, FPSCR_IXC};
+        use super::super::{FPSCR_IDC, FPSCR_IOC, FPSCR_IXC, enc_vmaxnm, enc_vminnm, enc_vsel};
+        use crate::core::CortexM33;
         use crate::core::execute_fpu::{
             canonicalize_nan_fma_for_test, fpu_maxnum_for_test, fpu_minnum_for_test,
             fpu_vrint_for_test,
         };
-        use crate::core::CortexM33;
 
         const QNAN_BITS: u32 = 0x7FC0_0001;
         const SNAN_BITS_A: u32 = 0x7F80_0001;
@@ -34664,7 +34678,11 @@ mod stage9_residue {
             // PendSV wins.
             cpu.ppb.icsr |= crate::bus::ppb::ICSR_PENDSVSET | crate::bus::ppb::ICSR_PENDSTSET;
             let _ = cpu.exit_exception(0xFFFF_FFF1u32, &mut bus);
-            assert_eq!(cpu.regs.ipsr(), 14, "PendSV (14) wins tie over SysTick (15)");
+            assert_eq!(
+                cpu.regs.ipsr(),
+                14,
+                "PendSV (14) wins tie over SysTick (15)"
+            );
         }
 
         // -- pick_tail_chain_target external IRQ wins over PendSV ---------

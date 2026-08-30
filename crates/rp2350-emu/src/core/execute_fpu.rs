@@ -1638,12 +1638,7 @@ pub(crate) fn canonicalize_nan_unary_for_test(result: f32, a: f32) -> f32 {
 }
 
 #[cfg(test)]
-pub(crate) fn canonicalize_nan_fma_for_test(
-    result: f32,
-    addend: f32,
-    op1: f32,
-    op2: f32,
-) -> f32 {
+pub(crate) fn canonicalize_nan_fma_for_test(result: f32, addend: f32, op1: f32, op2: f32) -> f32 {
     canonicalize_nan_fma(result, addend, op1, op2)
 }
 

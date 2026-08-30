@@ -2257,7 +2257,11 @@ mod tests {
             assert_eq!(bus.read32(dst1 + i * 4, 0), 0xBBBB_0000 + i, "ch1 word {i}");
         }
         // Both BUSY bits clear.
-        assert_eq!(bus.read32(DMA_BASE + 0x0C, 0) & CTRL_BUSY, 0, "ch0 BUSY clear");
+        assert_eq!(
+            bus.read32(DMA_BASE + 0x0C, 0) & CTRL_BUSY,
+            0,
+            "ch0 BUSY clear"
+        );
         assert_eq!(
             bus.read32(DMA_BASE + 0x40 + 0x0C, 0) & CTRL_BUSY,
             0,

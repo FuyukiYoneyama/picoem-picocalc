@@ -3444,10 +3444,7 @@ impl Bus {
     /// method for the reader contract. Gated behind `testing` so
     /// release builds don't expose the bookkeeping.
     #[cfg(feature = "testing")]
-    pub fn dma_channel_transfer_event(
-        &self,
-        ch_idx: usize,
-    ) -> crate::dma::ChannelTransferEvent {
+    pub fn dma_channel_transfer_event(&self, ch_idx: usize) -> crate::dma::ChannelTransferEvent {
         self.dma.channel_transfer_event(ch_idx)
     }
 }

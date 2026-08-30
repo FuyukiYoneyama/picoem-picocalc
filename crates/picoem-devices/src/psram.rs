@@ -818,7 +818,10 @@ mod tests {
         clock_byte(&mut psram, &mut pins, 0xAB);
         cs_rise(&mut psram, &mut pins);
         assert_eq!(psram.cmd_write_count, 1);
-        assert_eq!(psram.buffer[0x00], 0xAB, "counters must not change behaviour");
+        assert_eq!(
+            psram.buffer[0x00], 0xAB,
+            "counters must not change behaviour"
+        );
 
         cs_fall(&mut psram, &mut pins);
         clock_byte(&mut psram, &mut pins, 0x0B); // Fast Read

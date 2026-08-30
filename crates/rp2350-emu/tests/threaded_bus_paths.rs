@@ -301,7 +301,12 @@ fn threaded_dma_channel_program() {
     emu.core_mut(1).halt();
     // Suppress unused constant warnings for the blob parameters that the
     // simpler version doesn't reference.
-    let _ = (DMA_DST, DMA_CH0_WRITE_ADDR, DMA_CH0_TRANS_COUNT, DMA_CH0_CTRL_TRIG);
+    let _ = (
+        DMA_DST,
+        DMA_CH0_WRITE_ADDR,
+        DMA_CH0_TRANS_COUNT,
+        DMA_CH0_CTRL_TRIG,
+    );
 
     let (c0, _c1) = run_n_quanta(&mut emu, QUANTA_PER_TEST);
     assert!(c0 > 0, "DMA program loop must advance core 0");

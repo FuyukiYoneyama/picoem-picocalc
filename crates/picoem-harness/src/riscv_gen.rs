@@ -3622,9 +3622,7 @@ mod tests {
         let cs = gen_fuzz_zicsr(&mut rng, 200);
         let saw_rd_zero_register = cs.iter().any(|tc| {
             let w = tc.words[0];
-            rd_field(w) == 0
-                && (1..=3).contains(&funct3_field(w))
-                && rs1_field(w) != 0
+            rd_field(w) == 0 && (1..=3).contains(&funct3_field(w)) && rs1_field(w) != 0
         });
         assert!(
             saw_rd_zero_register,
@@ -3691,10 +3689,7 @@ mod tests {
             let w = tc.words[0];
             rd_field(w) != 0 && (1..=3).contains(&funct3_field(w))
         });
-        assert!(
-            saw_rd_nonzero,
-            "no Zicsr case with rd != x0 in 200 draws",
-        );
+        assert!(saw_rd_nonzero, "no Zicsr case with rd != x0 in 200 draws",);
     }
 
     #[test]
@@ -3762,8 +3757,7 @@ mod tests {
         let cs = gen_fuzz_rv32i_alu(&mut rng, 200);
         let saw_shift_imm = cs.iter().any(|tc| {
             let w = tc.words[0];
-            (w & 0x7F) == OPC_OP_IMM
-                && matches!(funct3_field(w), 1 | 5)
+            (w & 0x7F) == OPC_OP_IMM && matches!(funct3_field(w), 1 | 5)
         });
         assert!(
             saw_shift_imm,
@@ -3780,9 +3774,7 @@ mod tests {
         let cs = gen_fuzz_rv32i_alu(&mut rng, 500);
         let saw_sub = cs.iter().any(|tc| {
             let w = tc.words[0];
-            (w & 0x7F) == OPC_OP
-                && funct3_field(w) == 0
-                && ((w >> 25) & 0x7F) == 0x20
+            (w & 0x7F) == OPC_OP && funct3_field(w) == 0 && ((w >> 25) & 0x7F) == 0x20
         });
         assert!(saw_sub, "no R-type SUB (funct7=0x20) in 500 ALU cases");
     }
@@ -4054,11 +4046,7 @@ mod tests {
                     saw_readback = true;
                     let rd1 = rd_field(tc.words[0]);
                     let rd2 = rd_field(tc.words[1]);
-                    assert_ne!(
-                        rd1, rd2,
-                        "rd1/rd2 collision in PMP read-back: {}",
-                        tc.name,
-                    );
+                    assert_ne!(rd1, rd2, "rd1/rd2 collision in PMP read-back: {}", tc.name,);
                 }
                 n => panic!("unexpected pmp word count {n} in {}", tc.name),
             }

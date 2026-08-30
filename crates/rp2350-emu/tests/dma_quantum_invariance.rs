@@ -308,9 +308,7 @@ fn setup_force_64_words(emu: &mut Emulator) {
     emu.bus.write32(ch_base(0) + CH_READ_ADDR, src, 0);
     emu.bus.write32(ch_base(0) + CH_WRITE_ADDR, dst, 0);
     emu.bus.write32(ch_base(0) + CH_TRANS_COUNT, 64, 0);
-    let ctrl = make_ctrl(
-        true, 2, true, true, TREQ_FORCE, 0, 0, false,
-    );
+    let ctrl = make_ctrl(true, 2, true, true, TREQ_FORCE, 0, 0, false);
     emu.bus.write32(ch_base(0) + CH_CTRL_TRIG, ctrl, 0);
 }
 
@@ -322,8 +320,7 @@ fn setup_force_64_words(emu: &mut Emulator) {
 /// across quanta — it must be the same at quantum 1 and quantum 256.
 fn setup_timer_paced(emu: &mut Emulator) {
     // TIMER0 register: X[31:16] = 1, Y[15:0] = 10.
-    emu.bus
-        .write32(DMA_BASE + REG_TIMER0, (1u32 << 16) | 10, 0);
+    emu.bus.write32(DMA_BASE + REG_TIMER0, (1u32 << 16) | 10, 0);
 
     let src: u32 = SRAM_BASE + 0x100;
     let dst: u32 = SRAM_BASE + 0x500;
@@ -338,9 +335,7 @@ fn setup_timer_paced(emu: &mut Emulator) {
     // 200 is comfortably more than (TOTAL_CYCLES/Y) = 76, so the
     // channel never completes during the run.
     emu.bus.write32(ch_base(0) + CH_TRANS_COUNT, 200, 0);
-    let ctrl = make_ctrl(
-        true, 2, true, true, TREQ_TIMER0, 0, 0, false,
-    );
+    let ctrl = make_ctrl(true, 2, true, true, TREQ_TIMER0, 0, 0, false);
     emu.bus.write32(ch_base(0) + CH_CTRL_TRIG, ctrl, 0);
 }
 
@@ -376,9 +371,7 @@ fn setup_pio_rx_paced(emu: &mut Emulator) {
     emu.bus.write32(ch_base(0) + CH_WRITE_ADDR, dst, 0);
     emu.bus.write32(ch_base(0) + CH_TRANS_COUNT, 16, 0);
     // INCR_READ=false (FIFO MMIO), INCR_WRITE=true.
-    let ctrl = make_ctrl(
-        true, 2, false, true, TREQ_PIO0_RX0, 0, 0, false,
-    );
+    let ctrl = make_ctrl(true, 2, false, true, TREQ_PIO0_RX0, 0, 0, false);
     emu.bus.write32(ch_base(0) + CH_CTRL_TRIG, ctrl, 0);
 }
 
@@ -410,9 +403,7 @@ fn setup_chain_4_then_4(emu: &mut Emulator) {
     emu.bus.write32(ch_base(1) + CH_READ_ADDR, src1, 0);
     emu.bus.write32(ch_base(1) + CH_WRITE_ADDR, dst1, 0);
     emu.bus.write32(ch_base(1) + CH_TRANS_COUNT, 4, 0);
-    let ctrl1 = make_ctrl(
-        true, 2, true, true, TREQ_FORCE, 1, 0, false,
-    );
+    let ctrl1 = make_ctrl(true, 2, true, true, TREQ_FORCE, 1, 0, false);
     emu.bus.write32(ch_base(1) + CH_AL1_CTRL, ctrl1, 0);
 
     // CH0: program and trigger. CHAIN_TO=1 → CH1 fires when CH0's
@@ -420,9 +411,7 @@ fn setup_chain_4_then_4(emu: &mut Emulator) {
     emu.bus.write32(ch_base(0) + CH_READ_ADDR, src0, 0);
     emu.bus.write32(ch_base(0) + CH_WRITE_ADDR, dst0, 0);
     emu.bus.write32(ch_base(0) + CH_TRANS_COUNT, 4, 0);
-    let ctrl0 = make_ctrl(
-        true, 2, true, true, TREQ_FORCE, 1, 0, false,
-    );
+    let ctrl0 = make_ctrl(true, 2, true, true, TREQ_FORCE, 1, 0, false);
     emu.bus.write32(ch_base(0) + CH_CTRL_TRIG, ctrl0, 0);
 }
 
@@ -451,17 +440,13 @@ fn setup_two_channels_armed(emu: &mut Emulator) {
     emu.bus.write32(ch_base(0) + CH_READ_ADDR, src0, 0);
     emu.bus.write32(ch_base(0) + CH_WRITE_ADDR, dst0, 0);
     emu.bus.write32(ch_base(0) + CH_TRANS_COUNT, 16, 0);
-    let ctrl0 = make_ctrl(
-        true, 2, true, true, TREQ_FORCE, 0, 0, false,
-    );
+    let ctrl0 = make_ctrl(true, 2, true, true, TREQ_FORCE, 0, 0, false);
 
     // CH2 (skip CH1 to avoid overlap with the chain workload's CH1).
     emu.bus.write32(ch_base(2) + CH_READ_ADDR, src2, 0);
     emu.bus.write32(ch_base(2) + CH_WRITE_ADDR, dst2, 0);
     emu.bus.write32(ch_base(2) + CH_TRANS_COUNT, 16, 0);
-    let ctrl2 = make_ctrl(
-        true, 2, true, true, TREQ_FORCE, 2, 0, false,
-    );
+    let ctrl2 = make_ctrl(true, 2, true, true, TREQ_FORCE, 2, 0, false);
 
     // Order: arm CH2 first, then CH0. Once CH0 is armed it takes
     // priority anyway (lowest-index-wins), but starting CH2 first

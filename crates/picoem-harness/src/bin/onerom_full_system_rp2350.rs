@@ -470,8 +470,7 @@ fn main() -> ExitCode {
             // driven during this rel_cycle and update the external-in
             // override. Re-asserting the same level is a cheap atomic
             // store, so we don't bother gating on "changed" here.
-            let sweep_idx =
-                ((rel_cycle / ADDR_DWELL_CYCLES) as usize).min(ADDR_SWEEP.len() - 1);
+            let sweep_idx = ((rel_cycle / ADDR_DWELL_CYCLES) as usize).min(ADDR_SWEEP.len() - 1);
             let active_addr_word = ADDR_SWEEP[sweep_idx];
             let cs_level = (1u32 << GPIO_CS2) | (1u32 << GPIO_CS3);
             let addr_level = addr_word_to_gpio_levels(active_addr_word);
@@ -694,8 +693,11 @@ fn main() -> ExitCode {
                      matched (addr & 0xFF) ^ 0x55 (ch1_pushes={}); \
                      {}/{} sweep addresses produced the correct data byte \
                      on D0..D7 with PIO2 driving",
-                    edges, distinct_src_addrs, ch1_pushes,
-                    pin_matches, ADDR_SWEEP.len()
+                    edges,
+                    distinct_src_addrs,
+                    ch1_pushes,
+                    pin_matches,
+                    ADDR_SWEEP.len()
                 );
                 smoke_passed = true;
             }
