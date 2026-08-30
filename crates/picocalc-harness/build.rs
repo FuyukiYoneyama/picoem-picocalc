@@ -49,6 +49,10 @@ fn main() {
             "cpu-application-profiler",
         ),
         (
+            "CARGO_FEATURE_DECODE_INVALIDATION_TAG_GUARD",
+            "decode-invalidation-tag-guard",
+        ),
+        (
             "CARGO_FEATURE_DECODED_OP_8BYTE_PROTOTYPE",
             "decoded-op-8byte-prototype",
         ),
