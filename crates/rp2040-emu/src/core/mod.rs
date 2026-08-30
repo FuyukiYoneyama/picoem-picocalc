@@ -525,12 +525,12 @@ impl CortexM0Plus {
                 if let Some(profiler) = self.cpu_application_profiler.as_mut() {
                     profiler.record_invalidation_slot(
                         !entry.is_empty(),
-                        entry.matches_pc(prev, slot),
-                        entry.matches_pc(prev, slot) && entry.is_wide(),
+                        entry.matches_invalidation_pc(prev, slot),
+                        entry.matches_invalidation_pc(prev, slot) && entry.is_wide(),
                     );
                 }
                 #[cfg(feature = "decode-invalidation-tag-guard")]
-                if entry.matches_pc(prev, slot) && entry.is_wide() {
+                if entry.matches_invalidation_pc(prev, slot) && entry.is_wide() {
                     self.decode_cache[slot] = empty;
                 }
                 #[cfg(not(feature = "decode-invalidation-tag-guard"))]
@@ -549,12 +549,12 @@ impl CortexM0Plus {
                 if let Some(profiler) = self.cpu_application_profiler.as_mut() {
                     profiler.record_invalidation_slot(
                         !entry.is_empty(),
-                        entry.matches_pc(aligned, slot),
+                        entry.matches_invalidation_pc(aligned, slot),
                         false,
                     );
                 }
                 #[cfg(feature = "decode-invalidation-tag-guard")]
-                if entry.matches_pc(aligned, slot) {
+                if entry.matches_invalidation_pc(aligned, slot) {
                     self.decode_cache[slot] = empty;
                 }
                 #[cfg(not(feature = "decode-invalidation-tag-guard"))]

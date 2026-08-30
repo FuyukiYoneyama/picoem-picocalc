@@ -430,6 +430,26 @@ impl DecodedOp {
         }
     }
 
+    /// Does this entry back the same physical executable bytes as `pc`?
+    ///
+    /// The RP2040 exposes four SRAM alias windows (`0x20`..`0x23`) that
+    /// share one backing store.  Decode lookup intentionally keeps the full
+    /// virtual PC as its tag, but a write through one alias must invalidate
+    /// an entry fetched through another alias.  P1-A uses this predicate for
+    /// invalidation only; normal decode lookup remains `matches_pc`.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn matches_invalidation_pc(&self, pc: u32, slot: usize) -> bool {
+        if self.matches_pc(pc, slot) {
+            return true;
+        }
+        if pc >> 28 != 0x2 {
+            return false;
+        }
+        let entry_pc = self.tag_for_slot(slot);
+        entry_pc >> 28 == 0x2 && (entry_pc & 0x00FF_FFFF) == (pc & 0x00FF_FFFF)
+    }
+
     #[inline(always)]
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {

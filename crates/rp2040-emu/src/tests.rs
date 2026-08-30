@@ -9216,6 +9216,25 @@ mod decode_cache {
 
     #[cfg(feature = "decode-invalidation-tag-guard")]
     #[test]
+    fn tag_guard_clears_sram_alias_entry_written_through_another_alias() {
+        // 0x20/0x21 SRAM aliases share backing bytes.  Full virtual-tag
+        // equality alone would leave the fetched alias stale after a write
+        // through the other window.
+        let fetched_pc = 0x2100_0010u32;
+        let write_pc = 0x2000_0010u32;
+        let slot = ((fetched_pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
+        assert_eq!(
+            slot,
+            ((write_pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize
+        );
+        let mut cpu = CortexM0Plus::new();
+        cpu.decode_cache[slot] = DecodedOp::from_parts(fetched_pc, 0x3001, 0, false);
+        cpu.invalidate_decode_cache_entries(&[write_pc]);
+        assert_eq!(cpu.decode_cache[slot].tag_for_slot(slot), u32::MAX);
+    }
+
+    #[cfg(feature = "decode-invalidation-tag-guard")]
+    #[test]
     fn tag_guard_clears_matching_narrow_entry() {
         let pc = 0x2000_0000u32;
         let slot = ((pc >> 1) & (DECODE_CACHE_SIZE as u32 - 1)) as usize;
