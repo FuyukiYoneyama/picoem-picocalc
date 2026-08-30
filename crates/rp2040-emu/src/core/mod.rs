@@ -83,6 +83,10 @@ pub struct CortexM0Plus {
     /// Decode-cache hit/miss profiler state (feature gated).
     #[cfg(feature = "event-horizon-profiler")]
     pub(crate) decode_profile: crate::running_profile::DecodeProfile,
+    /// P0-B application counter bank (diagnostic builds only).
+    #[cfg(feature = "cpu-application-profiler")]
+    pub(crate) cpu_application_profiler:
+        Option<crate::cpu_application_profile::CpuApplicationProfiler>,
 }
 
 impl CortexM0Plus {
@@ -110,6 +114,8 @@ impl CortexM0Plus {
             decode_cache,
             #[cfg(feature = "event-horizon-profiler")]
             decode_profile: crate::running_profile::DecodeProfile::default(),
+            #[cfg(feature = "cpu-application-profiler")]
+            cpu_application_profiler: None,
         }
     }
 
@@ -221,6 +227,22 @@ impl CortexM0Plus {
         self.decode_profile = crate::running_profile::DecodeProfile::default();
     }
 
+    /// Enable the P0-B per-core application profiler and clear prior data.
+    #[cfg(feature = "cpu-application-profiler")]
+    pub(crate) fn enable_cpu_application_profiler(&mut self) {
+        self.cpu_application_profiler = Some(Default::default());
+    }
+
+    /// Snapshot the P0-B per-core application counters, if enabled.
+    #[cfg(feature = "cpu-application-profiler")]
+    pub(crate) fn cpu_application_profile_snapshot(
+        &self,
+    ) -> Option<crate::cpu_application_profile::CpuApplicationProfileSnapshot> {
+        self.cpu_application_profiler
+            .as_ref()
+            .map(crate::cpu_application_profile::CpuApplicationProfiler::snapshot)
+    }
+
     /// True iff the CPU is currently executing the HardFault handler,
     /// i.e. IPSR == 3. Used by harness integration tests to distinguish
     /// a misdispatch (HardFault) from a regular FAIL (counter mismatch).
@@ -293,6 +315,10 @@ impl CortexM0Plus {
             #[cfg(feature = "event-horizon-profiler")]
             self.decode_profile
                 .record_immutable_xip_hit_run_prefetch_exception();
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_cycles(exc_cycles as u64);
+            }
             self.cycles = self.cycles.wrapping_add(exc_cycles as u64);
             return exc_cycles;
         }
@@ -326,6 +352,10 @@ impl CortexM0Plus {
         }
 
         self.cycles = self.cycles.wrapping_add(cycles as u64);
+        #[cfg(feature = "cpu-application-profiler")]
+        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+            profiler.record_cycles(cycles as u64);
+        }
         cycles
     }
 
@@ -352,7 +382,15 @@ impl CortexM0Plus {
     /// bit for external IRQs) and run `enter_exception`. Returns the
     /// cycle count of exception entry (non-zero on dispatch, 0 otherwise).
     fn try_take_any_pending_exception<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
+        #[cfg(feature = "cpu-application-profiler")]
+        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+            profiler.record_exception_poll();
+        }
         if self.regs.primask & 1 != 0 {
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_exception_reject_primask();
+            }
             return 0;
         }
 
@@ -385,8 +423,18 @@ impl CortexM0Plus {
             };
         }
 
-        let Some((_, candidate)) = best else { return 0 };
+        let Some((_, candidate)) = best else {
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_exception_reject_no_candidate();
+            }
+            return 0;
+        };
         if !self.can_dispatch_now(bus) {
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_exception_reject_active_handler();
+            }
             return 0;
         }
 
@@ -394,6 +442,10 @@ impl CortexM0Plus {
             14 => bus.ppb_mut(core).icsr &= !(1 << 28),
             15 => bus.ppb_mut(core).icsr &= !(1 << 26),
             e => bus.nvic_mut(core).clear_pending((e - 16) as u8),
+        }
+        #[cfg(feature = "cpu-application-profiler")]
+        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+            profiler.record_exception_entry(candidate);
         }
         self.enter_exception(candidate, bus)
     }
@@ -454,14 +506,38 @@ impl CortexM0Plus {
             #[cfg(feature = "event-horizon-profiler")]
             self.decode_profile
                 .record_decode_cache_entry_invalidation(addr);
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_invalidation_request();
+            }
             let aligned = addr & !1;
             let prev = aligned.wrapping_sub(2);
             if is_cacheable_pc(prev) {
                 let slot = ((prev >> 1) & MASK) as usize;
+                #[cfg(feature = "cpu-application-profiler")]
+                let entry = self.decode_cache[slot];
+                #[cfg(feature = "cpu-application-profiler")]
+                if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                    profiler.record_invalidation_slot(
+                        !entry.is_empty(),
+                        entry.matches_pc(prev, slot),
+                        entry.matches_pc(prev, slot) && entry.is_wide(),
+                    );
+                }
                 self.decode_cache[slot] = empty;
             }
             if is_cacheable_pc(aligned) {
                 let slot = ((aligned >> 1) & MASK) as usize;
+                #[cfg(feature = "cpu-application-profiler")]
+                let entry = self.decode_cache[slot];
+                #[cfg(feature = "cpu-application-profiler")]
+                if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                    profiler.record_invalidation_slot(
+                        !entry.is_empty(),
+                        entry.matches_pc(aligned, slot),
+                        false,
+                    );
+                }
                 self.decode_cache[slot] = empty;
             }
         }
@@ -486,10 +562,20 @@ impl CortexM0Plus {
         #[cfg(feature = "event-horizon-profiler")]
         self.decode_profile
             .record_decode_cache_region_invalidation(regions);
+        #[cfg(feature = "cpu-application-profiler")]
+        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+            profiler.record_invalidation_request();
+        }
         let empty = DecodedOp::empty();
         if regions & BULK != 0 {
-            for slot in self.decode_cache.iter_mut() {
-                *slot = empty;
+            for index in 0..self.decode_cache.len() {
+                #[cfg(feature = "cpu-application-profiler")]
+                let entry = self.decode_cache[index];
+                #[cfg(feature = "cpu-application-profiler")]
+                if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                    profiler.record_invalidation_slot(!entry.is_empty(), !entry.is_empty(), false);
+                }
+                self.decode_cache[index] = empty;
             }
             return;
         }
@@ -498,10 +584,31 @@ impl CortexM0Plus {
         // `regions` matches region `n`. The entry helper maps empty slots
         // to a non-cacheable nibble, so they are skipped without
         // special-casing in either cache representation.
-        for slot in self.decode_cache.iter_mut() {
-            let nibble = slot.region_nibble();
-            if nibble < 8 && regions & (1 << nibble) != 0 {
-                *slot = empty;
+        for index in 0..self.decode_cache.len() {
+            #[cfg(feature = "cpu-application-profiler")]
+            let entry = self.decode_cache[index];
+            #[cfg(feature = "cpu-application-profiler")]
+            let nibble = entry.region_nibble();
+            #[cfg(feature = "cpu-application-profiler")]
+            let selected = nibble < 8 && regions & (1 << nibble) != 0;
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_invalidation_slot(
+                    selected && !entry.is_empty(),
+                    selected && !entry.is_empty(),
+                    false,
+                );
+            }
+            #[cfg(feature = "cpu-application-profiler")]
+            if selected {
+                self.decode_cache[index] = empty;
+            }
+            #[cfg(not(feature = "cpu-application-profiler"))]
+            {
+                let nibble = self.decode_cache[index].region_nibble();
+                if nibble < 8 && regions & (1 << nibble) != 0 {
+                    self.decode_cache[index] = empty;
+                }
             }
         }
     }
@@ -512,9 +619,19 @@ impl CortexM0Plus {
         use crate::bus::DecodedOp;
         #[cfg(feature = "event-horizon-profiler")]
         self.decode_profile.record_decode_cache_all_invalidation();
+        #[cfg(feature = "cpu-application-profiler")]
+        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+            profiler.record_invalidation_request();
+        }
         let empty = DecodedOp::empty();
-        for slot in self.decode_cache.iter_mut() {
-            *slot = empty;
+        for index in 0..self.decode_cache.len() {
+            #[cfg(feature = "cpu-application-profiler")]
+            let entry = self.decode_cache[index];
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_invalidation_slot(!entry.is_empty(), !entry.is_empty(), false);
+            }
+            self.decode_cache[index] = empty;
         }
     }
 }

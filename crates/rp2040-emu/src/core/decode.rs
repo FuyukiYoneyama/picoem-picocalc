@@ -305,7 +305,10 @@ impl CortexM0Plus {
         } else {
             None
         };
-        #[cfg(feature = "event-horizon-profiler")]
+        #[cfg(any(
+            feature = "event-horizon-profiler",
+            feature = "cpu-application-profiler"
+        ))]
         let hit = entry.is_some();
 
         let entry = match entry {
@@ -318,6 +321,10 @@ impl CortexM0Plus {
             let entry_width_bytes = if entry.is_wide() { 4 } else { 2 };
             self.decode_profile
                 .record_decode_lookup(pc, entry_width_bytes, cacheable, hit);
+        }
+        #[cfg(feature = "cpu-application-profiler")]
+        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+            profiler.record_decode_lookup(pc, is_cacheable_pc(pc), hit);
         }
 
         let hw0 = entry.hw0;
@@ -387,6 +394,10 @@ impl CortexM0Plus {
                 .record_immutable_xip_hit_run_termination(
                     crate::running_profile::ImmutableXipHitRunTerminationReason::PostExecuteNextPcRedirect,
                 );
+        }
+        #[cfg(feature = "cpu-application-profiler")]
+        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+            profiler.record_retirement(pc, hw0, entry.is_wide());
         }
         cycles
     }

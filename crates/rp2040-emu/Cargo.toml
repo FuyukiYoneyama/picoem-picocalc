@@ -70,6 +70,9 @@ diagnostic-pc-compile-out-prototype = []
 # OPT4-E experimental compact dispatch key in the default decoded-op flags.
 # This cannot be combined with the OPT4-C packed 8-byte layout.
 compact-dispatch-key-prototype = []
+# P0-B application profiler. Diagnostic-only counters are compiled into the
+# CPU core only when explicitly requested; normal builds have no hooks.
+cpu-application-profiler = []
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }

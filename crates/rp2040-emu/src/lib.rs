@@ -61,6 +61,16 @@ pub use behavior_trace::{
     BehaviorTraceSnapshot,
 };
 
+#[cfg(feature = "cpu-application-profiler")]
+mod cpu_application_profile;
+
+#[cfg(feature = "cpu-application-profiler")]
+pub use cpu_application_profile::{
+    CPU_APPLICATION_PROFILE_SCHEMA_VERSION, CpuApplicationProfileSnapshot, CpuApplicationProfiler,
+    CpuDecodeCounters, CpuDecodeRegionCounters, CpuDecodeRegionCountersByRegion,
+    CpuExceptionCounters, CpuHandlerGroupCounters, CpuInvalidationCounters, CpuPcRegionCounters,
+};
+
 // Dual-execution HLD V1 (Stage 3b.2) — threaded runtime scaffolding.
 // The module file internally `#![cfg]`-gates to x86_64 Windows + the
 // `threading` cargo feature, so non-Windows and `--no-default-features`
@@ -2284,6 +2294,33 @@ impl Emulator {
         self.idle_profiler
             .as_ref()
             .map(idle_profile::IdleProfiler::snapshot)
+    }
+
+    /// Enable and reset the P0-B per-core CPU application profiler.
+    ///
+    /// This is a Serial-only diagnostic mode. It records emulated cycles,
+    /// instruction classes, decode-cache outcomes, invalidation collateral,
+    /// and exception-poll dispositions; it does not read a host clock and
+    /// must not be used as wall-time acceptance evidence.
+    #[cfg(feature = "cpu-application-profiler")]
+    pub fn enable_cpu_application_profiler(&mut self) -> Result<(), EmulatorError> {
+        if self.execution_model != ExecutionModel::Serial {
+            return Err(EmulatorError::NotSupportedInThreadedMode);
+        }
+        for core in &mut self.cores {
+            core.enable_cpu_application_profiler();
+        }
+        Ok(())
+    }
+
+    /// Snapshot the P0-B per-core CPU application counters without mutating
+    /// the open interval. Returns `None` until profiling is enabled.
+    #[cfg(feature = "cpu-application-profiler")]
+    pub fn cpu_application_profile_snapshot(&self) -> Option<[CpuApplicationProfileSnapshot; 2]> {
+        Some([
+            self.cores[0].cpu_application_profile_snapshot()?,
+            self.cores[1].cpu_application_profile_snapshot()?,
+        ])
     }
 
     /// Sample the current conservative idle gate for OPT0-A cost studies.

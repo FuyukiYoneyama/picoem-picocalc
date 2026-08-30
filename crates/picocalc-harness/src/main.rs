@@ -46,6 +46,12 @@ use picocalc_board::{
 use rp2040_emu::peripherals::i2c::I2cExternalDevice;
 #[cfg(feature = "behavior-trace")]
 use rp2040_emu::{BehaviorEventDomain, BehaviorTraceSnapshot};
+#[cfg(feature = "cpu-application-profiler")]
+use rp2040_emu::{
+    CPU_APPLICATION_PROFILE_SCHEMA_VERSION, CpuApplicationProfileSnapshot, CpuDecodeCounters,
+    CpuDecodeRegionCounters, CpuDecodeRegionCountersByRegion, CpuExceptionCounters,
+    CpuHandlerGroupCounters, CpuInvalidationCounters, CpuPcRegionCounters,
+};
 use rp2040_emu::{Config, Emulator, EmulatorBuilder, RP2040_SRAM_TOP, WatchdogResetEvent};
 #[cfg(feature = "idle-profiler")]
 use rp2040_emu::{
@@ -161,6 +167,8 @@ const UART_DRAIN_INTERVAL: u64 = 256;
 /// shelled out to at run time: the report must be a pure function of
 /// its inputs.
 const BUILT_BACKEND_COMMIT: &str = env!("PICOEM_BUILT_COMMIT");
+#[cfg(feature = "cpu-application-profiler")]
+const BUILT_FEATURE_SET: &str = env!("PICOEM_FEATURE_SET");
 
 fn built_backend_dirty() -> bool {
     env!("PICOEM_BUILT_DIRTY") == "true"
@@ -304,6 +312,8 @@ struct Args {
     event_horizon_profile: Option<PathBuf>,
     #[cfg(feature = "event-horizon-profiler")]
     event_horizon_profile_after_uart: Option<String>,
+    #[cfg(feature = "cpu-application-profiler")]
+    cpu_application_profile: Option<PathBuf>,
 }
 
 const PROGRESS_CLOCK_CHECK_DISPATCHES: u64 = 256;
@@ -608,6 +618,12 @@ fn print_usage() {
                                           Defer OPT2-D until this UART marker is observed.\n\
                                           Requires --event-horizon-profile."
     );
+    #[cfg(feature = "cpu-application-profiler")]
+    eprintln!(
+        "         --cpu-application-profile <path>\n\
+                                          P0-B emulated-cycle CPU application counters.\n\
+                                          Diagnostic only; not valid for wall-time measurement."
+    );
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -669,6 +685,8 @@ fn parse_args() -> Result<Args, String> {
     let mut event_horizon_profile: Option<PathBuf> = None;
     #[cfg(feature = "event-horizon-profiler")]
     let mut event_horizon_profile_after_uart: Option<String> = None;
+    #[cfg(feature = "cpu-application-profiler")]
+    let mut cpu_application_profile: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -853,6 +871,13 @@ fn parse_args() -> Result<Args, String> {
                     );
                 }
                 event_horizon_profile_after_uart = Some(marker);
+            }
+            #[cfg(feature = "cpu-application-profiler")]
+            "--cpu-application-profile" => {
+                if cpu_application_profile.is_some() {
+                    return Err("--cpu-application-profile may be specified only once".to_string());
+                }
+                cpu_application_profile = Some(PathBuf::from(value("--cpu-application-profile")?));
             }
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
@@ -1077,6 +1102,38 @@ fn parse_args() -> Result<Args, String> {
             "--event-horizon-profile-after-uart requires --event-horizon-profile".to_string(),
         );
     }
+    #[cfg(feature = "cpu-application-profiler")]
+    if machine_api && cpu_application_profile.is_some() {
+        return Err("--machine-api cannot be combined with --cpu-application-profile".to_string());
+    }
+    #[cfg(feature = "cpu-application-profiler")]
+    if preview_api && cpu_application_profile.is_some() {
+        return Err("--preview-api cannot be combined with --cpu-application-profile".to_string());
+    }
+    #[cfg(all(feature = "cpu-application-profiler", feature = "idle-profiler"))]
+    if cpu_application_profile.is_some() && idle_profile.is_some() {
+        return Err(
+            "--cpu-application-profile and --idle-profile are separate diagnostic modes"
+                .to_string(),
+        );
+    }
+    #[cfg(all(feature = "cpu-application-profiler", feature = "behavior-trace"))]
+    if cpu_application_profile.is_some() && behavior_trace.is_some() {
+        return Err(
+            "--cpu-application-profile and --behavior-trace are separate diagnostic modes"
+                .to_string(),
+        );
+    }
+    #[cfg(all(
+        feature = "cpu-application-profiler",
+        feature = "event-horizon-profiler"
+    ))]
+    if cpu_application_profile.is_some() && event_horizon_profile.is_some() {
+        return Err(
+            "--cpu-application-profile and --event-horizon-profile are separate diagnostic modes"
+                .to_string(),
+        );
+    }
 
     Ok(Args {
         bin: bin.ok_or_else(|| "missing required --bin <path>".to_string())?,
@@ -1125,6 +1182,8 @@ fn parse_args() -> Result<Args, String> {
         event_horizon_profile,
         #[cfg(feature = "event-horizon-profiler")]
         event_horizon_profile_after_uart,
+        #[cfg(feature = "cpu-application-profiler")]
+        cpu_application_profile,
     })
 }
 
@@ -4964,6 +5023,193 @@ fn build_framebuffer_report(
     }))
 }
 
+#[cfg(feature = "cpu-application-profiler")]
+fn cpu_profile_region_json(value: &CpuPcRegionCounters) -> serde_json::Value {
+    serde_json::json!({
+        "boot_rom": value.boot_rom,
+        "immutable_xip": value.immutable_xip,
+        "xip_sram": value.xip_sram,
+        "sram": value.sram,
+        "other": value.other,
+    })
+}
+
+#[cfg(feature = "cpu-application-profiler")]
+fn cpu_profile_decode_region_json(value: &CpuDecodeRegionCounters) -> serde_json::Value {
+    serde_json::json!({
+        "lookups": value.lookups,
+        "hits": value.hits,
+        "misses": value.misses,
+    })
+}
+
+#[cfg(feature = "cpu-application-profiler")]
+fn cpu_profile_decode_regions_json(value: &CpuDecodeRegionCountersByRegion) -> serde_json::Value {
+    serde_json::json!({
+        "boot_rom": cpu_profile_decode_region_json(&value.boot_rom),
+        "immutable_xip": cpu_profile_decode_region_json(&value.immutable_xip),
+        "xip_sram": cpu_profile_decode_region_json(&value.xip_sram),
+        "sram": cpu_profile_decode_region_json(&value.sram),
+        "other": cpu_profile_decode_region_json(&value.other),
+    })
+}
+
+#[cfg(feature = "cpu-application-profiler")]
+fn cpu_profile_decode_json(value: &CpuDecodeCounters) -> serde_json::Value {
+    serde_json::json!({
+        "lookups": value.lookups,
+        "hits": value.hits,
+        "misses": value.misses,
+        "noncacheable_fetches": value.noncacheable_fetches,
+        "by_region": cpu_profile_decode_regions_json(&value.by_region),
+    })
+}
+
+#[cfg(feature = "cpu-application-profiler")]
+fn cpu_profile_invalidation_json(value: &CpuInvalidationCounters) -> serde_json::Value {
+    serde_json::json!({
+        "requests": value.requests,
+        "examined_slots": value.examined_slots,
+        "matching_clears": value.matching_clears,
+        "unrelated_would_clear": value.unrelated_would_clear,
+        "wide_predecessor_clears": value.wide_predecessor_clears,
+    })
+}
+
+#[cfg(feature = "cpu-application-profiler")]
+fn cpu_profile_exception_json(value: &CpuExceptionCounters) -> serde_json::Value {
+    serde_json::json!({
+        "polls": value.polls,
+        "reject_primask": value.reject_primask,
+        "reject_no_candidate": value.reject_no_candidate,
+        "reject_active_handler": value.reject_active_handler,
+        "entries": value.entries,
+        "source": {
+            "pendsv": value.source.pendsv,
+            "systick": value.source.systick,
+            "nvic": value.source.nvic,
+        },
+    })
+}
+
+#[cfg(feature = "cpu-application-profiler")]
+fn cpu_profile_handler_json(value: &CpuHandlerGroupCounters) -> serde_json::Value {
+    serde_json::json!({
+        "thumb16_shift_add_sub": value.thumb16_shift_add_sub,
+        "data_processing": value.data_processing,
+        "load_store": value.load_store,
+        "branch_system": value.branch_system,
+        "thumb32": value.thumb32,
+        "other": value.other,
+    })
+}
+
+#[cfg(feature = "cpu-application-profiler")]
+fn cpu_profile_counters_json(value: &CpuApplicationProfileSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "active": value.active,
+        "retired_instructions": value.retired_instructions,
+        "emulated_cycles": value.emulated_cycles,
+        "pc_region": cpu_profile_region_json(&value.pc_region),
+        "decode": cpu_profile_decode_json(&value.decode),
+        "invalidation": cpu_profile_invalidation_json(&value.invalidation),
+        "exception": cpu_profile_exception_json(&value.exception),
+        "handler_group": cpu_profile_handler_json(&value.handler_group),
+    })
+}
+
+#[cfg(feature = "cpu-application-profiler")]
+fn build_cpu_application_profile_report(
+    backend_commit: &str,
+    backend_dirty: bool,
+    firmware_basename: &str,
+    firmware_sha: &str,
+    step_quantum: u32,
+    outcome: &RunOutcome,
+    cores: &[CpuApplicationProfileSnapshot; 2],
+) -> Result<String, String> {
+    let aggregate = CpuApplicationProfileSnapshot::aggregate(cores);
+    let core_invariants_valid = cores
+        .iter()
+        .all(CpuApplicationProfileSnapshot::invariants_valid);
+    let invariants_valid = core_invariants_valid && aggregate.invariants_valid();
+    let feature_set = BUILT_FEATURE_SET
+        .split(',')
+        .filter(|feature| !feature.is_empty())
+        .map(serde_json::Value::from)
+        .collect::<Vec<_>>();
+    let core_records = cores
+        .iter()
+        .enumerate()
+        .map(|(core_id, value)| {
+            serde_json::json!({
+                "core_id": core_id,
+                "active": value.active,
+                "retired_instructions": value.retired_instructions,
+                "emulated_cycles": value.emulated_cycles,
+                "pc_region": cpu_profile_region_json(&value.pc_region),
+                "decode": cpu_profile_decode_json(&value.decode),
+                "invalidation": cpu_profile_invalidation_json(&value.invalidation),
+                "exception": cpu_profile_exception_json(&value.exception),
+                "handler_group": cpu_profile_handler_json(&value.handler_group),
+                "overflowed": value.overflowed,
+                "invariants": {"valid": value.invariants_valid()},
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = serde_json::json!({
+        "schema_id": "picocalc.rp2040-cpu-profile",
+        "schema_version": CPU_APPLICATION_PROFILE_SCHEMA_VERSION,
+        "instrumented": true,
+        "valid_for_wall_time": false,
+        "backend_build": {"commit": backend_commit, "dirty": backend_dirty},
+        "firmware": {"basename": firmware_basename, "sha256": firmware_sha},
+        "execution_model": "serial",
+        "step_quantum": step_quantum,
+        "interval": {
+            "start_emulated_cycle": 0,
+            "end_emulated_cycle": outcome.cycles,
+        },
+        "stop_reason": outcome.stop_reason.as_str(),
+        "cores": core_records,
+        "overflowed": aggregate.overflowed,
+        "profile_valid": invariants_valid,
+        "counters": cpu_profile_counters_json(&aggregate),
+        "invariants": {
+            "valid": invariants_valid,
+            "core_records_valid": core_invariants_valid,
+            "pc_region_conservation": aggregate
+                .pc_region
+                .boot_rom
+                .saturating_add(aggregate.pc_region.immutable_xip)
+                .saturating_add(aggregate.pc_region.xip_sram)
+                .saturating_add(aggregate.pc_region.sram)
+                .saturating_add(aggregate.pc_region.other)
+                == aggregate.retired_instructions,
+            "decode_lookup_conservation": aggregate.decode.lookups
+                == aggregate.decode.hits.saturating_add(aggregate.decode.misses),
+            "decode_region_conservation": aggregate.decode_region_conservation_valid(),
+            "exception_poll_conservation": aggregate.exception.polls
+                == aggregate.exception.reject_primask
+                    .saturating_add(aggregate.exception.reject_no_candidate)
+                    .saturating_add(aggregate.exception.reject_active_handler)
+                    .saturating_add(aggregate.exception.entries),
+            "exception_source_conservation": aggregate.exception.entries
+                == aggregate.exception.source.pendsv
+                    .saturating_add(aggregate.exception.source.systick)
+                    .saturating_add(aggregate.exception.source.nvic),
+            "handler_group_conservation": aggregate.handler_group_conservation_valid(),
+        },
+        "feature_set": feature_set,
+    });
+    serde_json::to_string_pretty(&report)
+        .map(|mut value| {
+            value.push('\n');
+            value
+        })
+        .map_err(|error| format!("serialising CPU application profile: {error}"))
+}
+
 fn run() -> Result<Verdict, String> {
     let mut args = parse_args().inspect_err(|_| print_usage())?;
 
@@ -5117,6 +5363,11 @@ fn run() -> Result<Verdict, String> {
         emu.enable_running_event_profiler()
             .map_err(|e| format!("enabling running event-horizon profiler: {e}"))?;
     }
+    #[cfg(feature = "cpu-application-profiler")]
+    if args.cpu_application_profile.is_some() {
+        emu.enable_cpu_application_profiler()
+            .map_err(|e| format!("enabling CPU application profiler: {e}"))?;
+    }
     if args.audio_wav.is_some() {
         emu.bus.enable_audio_pcm_capture();
     }
@@ -5162,6 +5413,14 @@ fn run() -> Result<Verdict, String> {
     #[cfg(feature = "event-horizon-profiler")]
     let event_profile_start_cycle = machine.event_profile_start_cycle;
     let MachineSession { mut emu, .. } = machine;
+    #[cfg(feature = "cpu-application-profiler")]
+    let cpu_application_profile_snapshots = if args.cpu_application_profile.is_some() {
+        Some(emu.cpu_application_profile_snapshot().ok_or_else(|| {
+            "--cpu-application-profile enabled the profiler before the run".to_string()
+        })?)
+    } else {
+        None
+    };
 
     let flash_image = emu.bus.flash_image();
     if let Some(path) = args.flash_image_out.as_deref() {
@@ -5231,6 +5490,23 @@ fn run() -> Result<Verdict, String> {
         );
         std::fs::write(path, profile_report.as_bytes())
             .map_err(|e| format!("writing event-horizon profile {}: {e}", path.display()))?;
+    }
+    #[cfg(feature = "cpu-application-profiler")]
+    if let (Some(path), Some(cores)) = (
+        &args.cpu_application_profile,
+        cpu_application_profile_snapshots.as_ref(),
+    ) {
+        let profile_report = build_cpu_application_profile_report(
+            BUILT_BACKEND_COMMIT,
+            built_backend_dirty(),
+            &basename(&args.bin),
+            &firmware_sha,
+            step_quantum,
+            &outcome,
+            cores,
+        )?;
+        std::fs::write(path, profile_report.as_bytes())
+            .map_err(|e| format!("writing CPU application profile {}: {e}", path.display()))?;
     }
 
     // A run that ended for its own reasons — cycle limit, HardFault —
@@ -5539,6 +5815,8 @@ mod tests {
     use super::{VerdictReport, apply_sd_protocol_errors};
     use picocalc_board::{Keyboard, SdFormat, St7365p};
     use rp2040_emu::AudioSinkSnapshot;
+    #[cfg(feature = "cpu-application-profiler")]
+    use rp2040_emu::CpuApplicationProfiler;
     #[cfg(feature = "idle-profiler")]
     use rp2040_emu::IdleProfileSnapshot;
     use rp2040_emu::{Config, EmulatorBuilder};
@@ -5614,6 +5892,8 @@ mod tests {
 
     #[cfg(feature = "behavior-trace")]
     use super::behavior_projection;
+    #[cfg(feature = "cpu-application-profiler")]
+    use super::build_cpu_application_profile_report;
     #[cfg(feature = "idle-profiler")]
     use super::build_idle_profile_report;
     #[cfg(feature = "event-horizon-profiler")]
@@ -6375,6 +6655,54 @@ mod tests {
             validate_backend_identity(expected, expected, true)
                 .unwrap_err()
                 .contains("dirty")
+        );
+    }
+
+    #[cfg(feature = "cpu-application-profiler")]
+    #[test]
+    fn cpu_application_profile_report_is_deterministic_and_conservative() {
+        let mut profiler = CpuApplicationProfiler::default();
+        profiler.record_decode_lookup(0x1000_0000, true, true);
+        profiler.record_retirement(0x1000_0000, 0x0000, false);
+        profiler.record_cycles(2);
+        let cores = [profiler.snapshot(), Default::default()];
+        let run = outcome(StopReason::ScenarioDone, b"");
+        let report = build_cpu_application_profile_report(
+            "0123456789012345678901234567890123456789",
+            false,
+            "firmware.bin",
+            &"ab".repeat(32),
+            64,
+            &run,
+            &cores,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(parsed["schema_id"], "picocalc.rp2040-cpu-profile");
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["valid_for_wall_time"], false);
+        assert_eq!(parsed["profile_valid"], true);
+        assert_eq!(parsed["counters"]["retired_instructions"], 1);
+        assert_eq!(parsed["counters"]["pc_region"]["immutable_xip"], 1);
+        assert_eq!(parsed["counters"]["decode"]["hits"], 1);
+        assert_eq!(
+            parsed["counters"]["decode"]["by_region"]["immutable_xip"]["hits"],
+            1
+        );
+        assert_eq!(parsed["cores"][1]["active"], false);
+        assert_eq!(parsed["cores"][1]["retired_instructions"], 0);
+        assert_eq!(
+            report,
+            build_cpu_application_profile_report(
+                "0123456789012345678901234567890123456789",
+                false,
+                "firmware.bin",
+                &"ab".repeat(32),
+                64,
+                &run,
+                &cores,
+            )
+            .unwrap()
         );
     }
 

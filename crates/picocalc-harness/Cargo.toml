@@ -36,6 +36,8 @@ decoded-op-8byte-prototype = ["rp2040-emu/decoded-op-8byte-prototype"]
 diagnostic-pc-compile-out-prototype = ["rp2040-emu/diagnostic-pc-compile-out-prototype"]
 # OPT4-E experimental compact dispatch key in the default decoded-op flags.
 compact-dispatch-key-prototype = ["rp2040-emu/compact-dispatch-key-prototype"]
+# P0-B diagnostic CPU application profiler. Not part of wall-time runners.
+cpu-application-profiler = ["rp2040-emu/cpu-application-profiler"]
 # P3/P4 SD-GEN-1 multi-block model and protocol-error propagation. Existing
 # versioned target records remain immutable; a new runtime commit/record is
 # required when a target is revalidated.

@@ -35,6 +35,58 @@ fn main() {
     println!("cargo:rustc-env=PICOEM_BUILT_COMMIT={commit}");
     println!("cargo:rustc-env=PICOEM_BUILT_DIRTY={dirty}");
 
+    // Keep the diagnostic profile's feature_set tied to Cargo's actual
+    // feature environment rather than a self-attested CLI label. The
+    // benchmark runner compares this list with the build-provenance sidecar.
+    let feature_env = [
+        ("CARGO_FEATURE_BEHAVIOR_TRACE", "behavior-trace"),
+        (
+            "CARGO_FEATURE_COMPACT_DISPATCH_KEY_PROTOTYPE",
+            "compact-dispatch-key-prototype",
+        ),
+        (
+            "CARGO_FEATURE_CPU_APPLICATION_PROFILER",
+            "cpu-application-profiler",
+        ),
+        (
+            "CARGO_FEATURE_DECODED_OP_8BYTE_PROTOTYPE",
+            "decoded-op-8byte-prototype",
+        ),
+        (
+            "CARGO_FEATURE_DIAGNOSTIC_PC_COMPILE_OUT_PROTOTYPE",
+            "diagnostic-pc-compile-out-prototype",
+        ),
+        (
+            "CARGO_FEATURE_EVENT_HORIZON_PROFILER",
+            "event-horizon-profiler",
+        ),
+        ("CARGO_FEATURE_IDLE_PROFILER", "idle-profiler"),
+        (
+            "CARGO_FEATURE_NVIC_BITMAP_SCAN_PROTOTYPE",
+            "nvic-bitmap-scan-prototype",
+        ),
+        ("CARGO_FEATURE_SD_GEN1_MULTIBLOCK", "sd-gen1-multiblock"),
+        ("CARGO_FEATURE_THREADING", "threading"),
+        ("CARGO_FEATURE_TESTING", "testing"),
+        ("CARGO_FEATURE_TEST_HOOKS", "test-hooks"),
+        (
+            "CARGO_FEATURE_UNCONDITIONAL_CACHE_LOOKUP_PROTOTYPE",
+            "unconditional-cache-lookup-prototype",
+        ),
+    ];
+    let mut enabled_features: Vec<&str> = feature_env
+        .iter()
+        .filter_map(|(env_name, feature)| {
+            println!("cargo:rerun-if-env-changed={env_name}");
+            std::env::var_os(env_name).map(|_| *feature)
+        })
+        .collect();
+    enabled_features.sort_unstable();
+    println!(
+        "cargo:rustc-env=PICOEM_FEATURE_SET={}",
+        enabled_features.join(",")
+    );
+
     if let Some(git_dir) = git(&repo, &["rev-parse", "--git-dir"]) {
         let git_dir = PathBuf::from(git_dir);
         let git_dir = if git_dir.is_absolute() {
