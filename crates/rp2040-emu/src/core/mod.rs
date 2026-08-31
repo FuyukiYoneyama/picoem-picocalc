@@ -381,6 +381,7 @@ impl CortexM0Plus {
     /// (`ICSR.PENDSVSET`/`PENDSTSET` for system exceptions, NVIC pending
     /// bit for external IRQs) and run `enter_exception`. Returns the
     /// cycle count of exception entry (non-zero on dispatch, 0 otherwise).
+    #[cfg(not(feature = "pending-exception-fast-reject"))]
     fn try_take_any_pending_exception<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
         #[cfg(feature = "cpu-application-profiler")]
         if let Some(profiler) = self.cpu_application_profiler.as_mut() {
@@ -394,6 +395,101 @@ impl CortexM0Plus {
             return 0;
         }
 
+        let core = self.core_id as usize;
+        let icsr = bus.ppb(core).icsr;
+        let pendsv = icsr & (1 << 28) != 0;
+        let pendst = icsr & (1 << 26) != 0;
+
+        // (priority, exception_number); lower priority value wins,
+        // tie-break by lower exception number.
+        let mut best: Option<(u8, u16)> = None;
+
+        if pendsv {
+            best = Some((bus.ppb(core).exception_priority(14) as u8, 14));
+        }
+        if pendst {
+            let p = bus.ppb(core).exception_priority(15) as u8;
+            best = match best {
+                None => Some((p, 15)),
+                Some((bp, be)) if p < bp || (p == bp && 15 < be) => Some((p, 15)),
+                other => other,
+            };
+        }
+        if let Some((irq, p)) = bus.nvic(core).highest_priority_pending() {
+            let exc = 16u16 + irq as u16;
+            best = match best {
+                None => Some((p, exc)),
+                Some((bp, be)) if p < bp || (p == bp && exc < be) => Some((p, exc)),
+                other => other,
+            };
+        }
+
+        let Some((_, candidate)) = best else {
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_exception_reject_no_candidate();
+            }
+            return 0;
+        };
+        if !self.can_dispatch_now(bus) {
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_exception_reject_active_handler();
+            }
+            return 0;
+        }
+
+        match candidate {
+            14 => bus.ppb_mut(core).icsr &= !(1 << 28),
+            15 => bus.ppb_mut(core).icsr &= !(1 << 26),
+            e => bus.nvic_mut(core).clear_pending((e - 16) as u8),
+        }
+        #[cfg(feature = "cpu-application-profiler")]
+        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+            profiler.record_exception_entry(candidate);
+        }
+        self.enter_exception(candidate, bus)
+    }
+
+    /// P2-A common-case gate: keep the no-pending path to three state reads
+    /// and leave priority arbitration in a cold, out-of-line function.  No
+    /// cached summary is introduced; all mutation points remain in the
+    /// existing arbitration body below.
+    #[cfg(feature = "pending-exception-fast-reject")]
+    #[inline(always)]
+    fn try_take_any_pending_exception<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
+        #[cfg(feature = "cpu-application-profiler")]
+        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+            profiler.record_exception_poll();
+        }
+        if self.regs.primask & 1 != 0 {
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_exception_reject_primask();
+            }
+            return 0;
+        }
+
+        let core = self.core_id as usize;
+        let icsr = bus.ppb(core).icsr;
+        let system_pending = icsr & ((1 << 28) | (1 << 26)) != 0;
+        let external_pending = bus.nvic(core).pending_and_enabled() != 0;
+        if !system_pending && !external_pending {
+            #[cfg(feature = "cpu-application-profiler")]
+            if let Some(profiler) = self.cpu_application_profiler.as_mut() {
+                profiler.record_exception_reject_no_candidate();
+            }
+            return 0;
+        }
+        self.try_take_any_pending_exception_slow(bus)
+    }
+
+    /// P2-A cold path: preserve the existing priority/tie-break and dispatch
+    /// mutations for the uncommon case where a source is pending.
+    #[cfg(feature = "pending-exception-fast-reject")]
+    #[cold]
+    #[inline(never)]
+    fn try_take_any_pending_exception_slow<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
         let core = self.core_id as usize;
         let icsr = bus.ppb(core).icsr;
         let pendsv = icsr & (1 << 28) != 0;

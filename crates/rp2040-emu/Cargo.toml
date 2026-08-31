@@ -77,6 +77,10 @@ cpu-application-profiler = []
 # Default invalidation semantics remain unchanged until correctness and
 # application A/B evidence promote this candidate.
 decode-invalidation-tag-guard = []
+# P2-A experimental fast reject for the common no-pending-exception path.
+# The default arbitration path remains unchanged until exactness/performance
+# evidence promotes this candidate.
+pending-exception-fast-reject = []
 
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }

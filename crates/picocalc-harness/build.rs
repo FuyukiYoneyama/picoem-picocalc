@@ -53,6 +53,10 @@ fn main() {
             "decode-invalidation-tag-guard",
         ),
         (
+            "CARGO_FEATURE_PENDING_EXCEPTION_FAST_REJECT",
+            "pending-exception-fast-reject",
+        ),
+        (
             "CARGO_FEATURE_DECODED_OP_8BYTE_PROTOTYPE",
             "decoded-op-8byte-prototype",
         ),
