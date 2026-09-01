@@ -273,6 +273,7 @@ struct Args {
     stop_pc: Option<u32>,
     json: Option<PathBuf>,
     uart: Option<PathBuf>,
+    host_timing: Option<PathBuf>,
     flash_image_out: Option<PathBuf>,
     expected_backend_commit: Option<String>,
     board: Board,
@@ -525,6 +526,9 @@ fn print_usage() {
          --json <path>            Write the JSON report here. Default: stdout.\n\
          --uart <path>            Write raw UART0 TX bytes here. Default: discarded\n\
                                   (byte count + sha256 still reported).\n\
+         --host-timing <path>    Write an opt-in host-timing sidecar measured only around\n\
+                                  the in-process run_loop. Includes process CPU time and\n\
+                                  monotonic wall time; never changes the schema-8 report.\n\
          --backend-commit <str>   Require the runner's compile-time Git identity to match.\n\
          --board <none|picocalc>  Attach an off-chip board model. 'picocalc' hangs the\n\
                                   ST7365P display off SPI1 (CS=GP13, DC=GP14, RST=GP15)\n\
@@ -635,6 +639,7 @@ fn parse_args() -> Result<Args, String> {
     let mut stop_pc: Option<u32> = None;
     let mut json: Option<PathBuf> = None;
     let mut uart: Option<PathBuf> = None;
+    let mut host_timing: Option<PathBuf> = None;
     let mut flash_image_out: Option<PathBuf> = None;
     let mut expected_backend_commit: Option<String> = None;
     let mut board = Board::None;
@@ -720,6 +725,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--json" => json = Some(PathBuf::from(value("--json")?)),
             "--uart" => uart = Some(PathBuf::from(value("--uart")?)),
+            "--host-timing" => {
+                if host_timing.is_some() {
+                    return Err("--host-timing may be specified only once".to_string());
+                }
+                host_timing = Some(PathBuf::from(value("--host-timing")?));
+            }
             "--flash-image-out" => {
                 if flash_image_out.is_some() {
                     return Err("--flash-image-out may be specified only once".to_string());
@@ -989,6 +1000,7 @@ fn parse_args() -> Result<Args, String> {
             (stop_pc.is_some(), "--stop-pc"),
             (json.is_some(), "--json"),
             (uart.is_some(), "--uart"),
+            (host_timing.is_some(), "--host-timing"),
             (flash_image_out.is_some(), "--flash-image-out"),
             (fb_png.is_some(), "--fb-png"),
             (expected_stop.is_some(), "--expect-stop"),
@@ -1024,6 +1036,7 @@ fn parse_args() -> Result<Args, String> {
             (stop_pc.is_some(), "--stop-pc"),
             (json.is_some(), "--json"),
             (uart.is_some(), "--uart"),
+            (host_timing.is_some(), "--host-timing"),
             (flash_image_out.is_some(), "--flash-image-out"),
             (fb_png.is_some(), "--fb-png"),
             (expected_stop.is_some(), "--expect-stop"),
@@ -1143,6 +1156,7 @@ fn parse_args() -> Result<Args, String> {
         stop_pc,
         json,
         uart,
+        host_timing,
         flash_image_out,
         expected_backend_commit,
         board,
@@ -1236,6 +1250,105 @@ struct RunOutcome {
     error: Option<String>,
     uart_bytes: Vec<u8>,
     watchdog_resets: Vec<WatchdogResetEvent>,
+}
+
+/// Host timing captured only around the authoritative in-process emulation
+/// loop. The sidecar is deliberately separate from the deterministic report:
+/// CPU scheduling and wall time are host observations, not guest behavior.
+struct HostTimingStart {
+    wall: Instant,
+    cpu_ns: Option<u64>,
+}
+
+struct HostTiming {
+    wall_ns: u64,
+    cpu_ns: Option<u64>,
+}
+
+fn process_cpu_time_ns() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid writable timespec and the clock ID is a
+        // process-wide clock supplied by libc for this platform.
+        let status = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+        if status != 0 {
+            return None;
+        }
+        let seconds = u64::try_from(ts.tv_sec).ok()?;
+        let nanos = u64::try_from(ts.tv_nsec).ok()?;
+        seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+impl HostTimingStart {
+    fn start() -> Self {
+        Self {
+            wall: Instant::now(),
+            cpu_ns: process_cpu_time_ns(),
+        }
+    }
+
+    fn finish(self) -> HostTiming {
+        let wall_ns = self.wall.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let cpu_ns = process_cpu_time_ns().and_then(|end| end.checked_sub(self.cpu_ns?));
+        HostTiming { wall_ns, cpu_ns }
+    }
+}
+
+const HOST_TIMING_SCHEMA_VERSION: u32 = 1;
+
+fn host_timing_json(
+    timing: &HostTiming,
+    firmware_name: &str,
+    firmware_sha: &str,
+    backend_commit: &str,
+    backend_dirty: bool,
+    board: Board,
+    step_quantum: u32,
+    outcome: &RunOutcome,
+) -> String {
+    let cpu_ns = timing
+        .cpu_ns
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let cpu_seconds = timing
+        .cpu_ns
+        .map(|value| value as f64 / 1_000_000_000.0)
+        .unwrap_or(0.0);
+    let cpu_throughput = timing
+        .cpu_ns
+        .filter(|&value| value > 0)
+        .map(|value| outcome.cycles as f64 / (value as f64 / 1_000_000_000.0))
+        .map(|value| format!("{value:.9}"))
+        .unwrap_or_else(|| "null".to_string());
+    let wall_throughput = if timing.wall_ns > 0 {
+        format!(
+            "{:.9}",
+            outcome.cycles as f64 / (timing.wall_ns as f64 / 1_000_000_000.0)
+        )
+    } else {
+        "null".to_string()
+    };
+    format!(
+        "{{\n  \"schema_version\": {HOST_TIMING_SCHEMA_VERSION},\n  \"artifact_type\": \"in-process-host-timing\",\n  \"timing_scope\": \"picocalc-harness::run_loop\",\n  \"cpu_clock\": \"CLOCK_PROCESS_CPUTIME_ID\",\n  \"firmware\": {{\"basename\": {}, \"sha256\": {}}},\n  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n  \"board\": {},\n  \"step_quantum\": {step_quantum},\n  \"cycles\": {},\n  \"stop_reason\": {},\n  \"emulation_wall_ns\": {},\n  \"emulation_cpu_ns\": {},\n  \"emulation_cpu_seconds\": {cpu_seconds:.9},\n  \"cycles_per_emulation_cpu_second\": {cpu_throughput},\n  \"cycles_per_emulation_wall_second\": {wall_throughput}\n}}\n",
+        json_string(firmware_name),
+        json_string(firmware_sha),
+        json_string(backend_commit),
+        backend_dirty,
+        json_string(board.as_str()),
+        outcome.cycles,
+        json_string(outcome.stop_reason.as_str()),
+        timing.wall_ns,
+        cpu_ns,
+    )
 }
 
 /// Process result. `CannotJudge` is distinct from a negative firmware
@@ -5401,6 +5514,10 @@ fn run() -> Result<Verdict, String> {
     }
     let mut engine = scenario.map(|s| scenario::Engine::new(s, args.snapshot_dir.clone()));
 
+    // Start host timing immediately before the emulation loop. Report and
+    // artifact generation happen after this point and therefore cannot
+    // contaminate the CPU-time denominator.
+    let host_timing_start = args.host_timing.as_ref().map(|_| HostTimingStart::start());
     let outcome = run_loop(
         &mut machine,
         args.cycles,
@@ -5408,6 +5525,7 @@ fn run() -> Result<Verdict, String> {
         engine.as_mut(),
         progress.as_mut(),
     );
+    let host_timing = host_timing_start.map(HostTimingStart::finish);
     // Report generation still consumes the emulator after the shared
     // session ends. Moving it back out preserves the existing schema bytes.
     #[cfg(feature = "event-horizon-profiler")]
@@ -5421,6 +5539,21 @@ fn run() -> Result<Verdict, String> {
     } else {
         None
     };
+
+    if let (Some(path), Some(timing)) = (args.host_timing.as_deref(), host_timing.as_ref()) {
+        let sidecar = host_timing_json(
+            timing,
+            &basename(&args.bin),
+            &firmware_sha,
+            BUILT_BACKEND_COMMIT,
+            built_backend_dirty(),
+            args.board,
+            step_quantum,
+            &outcome,
+        );
+        std::fs::write(path, sidecar.as_bytes())
+            .map_err(|e| format!("writing host timing {}: {e}", path.display()))?;
+    }
 
     let flash_image = emu.bus.flash_image();
     if let Some(path) = args.flash_image_out.as_deref() {

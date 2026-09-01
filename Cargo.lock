@@ -1848,6 +1848,7 @@ dependencies = [
 name = "picocalc-harness"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "picocalc-board",
  "picoem-common",
  "rp2040-emu",

@@ -65,6 +65,10 @@ picocalc-board = { path = "../picocalc-board", default-features = false }
 # than by a serialiser's map ordering. Parsed through `Value` rather than
 # `derive`, so every error can name the JSON path that is wrong.
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# Linux/WSL diagnostic sidecar: process CPU time around the in-process
+# emulation loop. This is optional at the CLI boundary and never enters the
+# deterministic schema-8 report.
+libc = "0.2"
 
 [[bin]]
 name = "picocalc-run"
