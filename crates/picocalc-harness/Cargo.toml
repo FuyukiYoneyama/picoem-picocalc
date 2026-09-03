@@ -14,7 +14,9 @@ build = "build.rs"
 # The production runner includes the SD-GEN-1 multi-block model.  Use
 # `--no-default-features` only for the legacy single-block differential
 # boundary; normal builds must exercise the promoted runtime.
-default = ["sd-gen1-multiblock"]
+# P1-A is promoted in the normal runner; keep the feature explicit so
+# provenance reports the adopted CPU path and reference builds can disable it.
+default = ["sd-gen1-multiblock", "decode-invalidation-tag-guard"]
 # Diagnostic-only OPT0-A build. The normal conformance runner remains
 # byte-for-byte schema compatible and carries no profiler hot-path branch.
 idle-profiler = ["rp2040-emu/idle-profiler"]
@@ -38,7 +40,8 @@ diagnostic-pc-compile-out-prototype = ["rp2040-emu/diagnostic-pc-compile-out-pro
 compact-dispatch-key-prototype = ["rp2040-emu/compact-dispatch-key-prototype"]
 # P0-B diagnostic CPU application profiler. Not part of wall-time runners.
 cpu-application-profiler = ["rp2040-emu/cpu-application-profiler"]
-# P1-A experimental full-tag guard for decode-cache invalidation.
+# P1-A promoted full-tag guard for decode-cache invalidation. It is enabled
+# by the normal runner default and remains opt-in when defaults are disabled.
 decode-invalidation-tag-guard = ["rp2040-emu/decode-invalidation-tag-guard"]
 # P2-A experimental fast reject for the common no-pending-exception path.
 pending-exception-fast-reject = ["rp2040-emu/pending-exception-fast-reject"]

@@ -593,9 +593,10 @@ impl CortexM0Plus {
     /// `((addr >> 1) & (DECODE_CACHE_SIZE - 1))` for each cacheable
     /// address, plus the preceding slot (so a wide instruction's `hw0`
     /// at `addr - 2` whose `hw1` is rewritten gets evicted too).
-    /// Non-cacheable addresses are skipped.  The P1-A feature adds a full
-    /// tag check before clearing either slot; the default path intentionally
-    /// keeps the historical index-only invalidation semantics.
+    /// Non-cacheable addresses are skipped.  The normal build enables the
+    /// P1-A full-tag check before clearing either slot.  `--no-default-features`
+    /// retains the historical index-only invalidation semantics as a reference
+    /// path for comparison.
     pub fn invalidate_decode_cache_entries(&mut self, addrs: &[u32]) {
         use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
         const MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;

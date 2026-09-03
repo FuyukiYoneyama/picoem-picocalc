@@ -24,7 +24,7 @@ workspace = true
 # working cross-platform out of the box. Windows / Linux users who
 # want the threaded runtime should opt in: `cargo add rp2040-emu
 # --features threading`.
-default = []
+default = ["decode-invalidation-tag-guard"]
 # Forward the PIO `test-hooks` feature to `picoem-common`. Enables
 # cross-crate unit tests to pop TX FIFO words via `PioBlock::pop_tx`
 # and push RX FIFO words via `PioBlock::push_rx`.
@@ -73,9 +73,11 @@ compact-dispatch-key-prototype = []
 # P0-B application profiler. Diagnostic-only counters are compiled into the
 # CPU core only when explicitly requested; normal builds have no hooks.
 cpu-application-profiler = []
-# P1-A experimental full-tag guard for per-address decode-cache invalidation.
-# Default invalidation semantics remain unchanged until correctness and
-# application A/B evidence promote this candidate.
+# P1-A full-tag guard for per-address decode-cache invalidation. It is part
+# of the normal build after the positive application-level A/B result. Use
+# `--no-default-features` when the historical index-only reference path is
+# needed for comparison; the feature remains explicit for feature-matrix
+# builds.
 decode-invalidation-tag-guard = []
 # P2-A experimental fast reject for the common no-pending-exception path.
 # The default arbitration path remains unchanged until exactness/performance
