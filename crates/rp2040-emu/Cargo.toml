@@ -79,11 +79,6 @@ cpu-application-profiler = []
 # needed for comparison; the feature remains explicit for feature-matrix
 # builds.
 decode-invalidation-tag-guard = []
-# P2-A experimental fast reject for the common no-pending-exception path.
-# The default arbitration path remains unchanged until exactness/performance
-# evidence promotes this candidate.
-pending-exception-fast-reject = []
-
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }
 picoem-devices = { version = "0.1", path = "../picoem-devices" }

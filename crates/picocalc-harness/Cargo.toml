@@ -43,8 +43,6 @@ cpu-application-profiler = ["rp2040-emu/cpu-application-profiler"]
 # P1-A promoted full-tag guard for decode-cache invalidation. It is enabled
 # by the normal runner default and remains opt-in when defaults are disabled.
 decode-invalidation-tag-guard = ["rp2040-emu/decode-invalidation-tag-guard"]
-# P2-A experimental fast reject for the common no-pending-exception path.
-pending-exception-fast-reject = ["rp2040-emu/pending-exception-fast-reject"]
 # P3/P4 SD-GEN-1 multi-block model and protocol-error propagation. Existing
 # versioned target records remain immutable; a new runtime commit/record is
 # required when a target is revalidated.
