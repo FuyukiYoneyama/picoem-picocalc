@@ -16,7 +16,6 @@
 
 use tracing::info;
 
-mod audio_sink;
 pub mod bus;
 pub mod core;
 pub mod dma;
@@ -25,31 +24,13 @@ pub mod irq;
 pub mod memory;
 pub mod peripherals;
 
-pub use audio_sink::{
-    AudioPreviewBlock, AudioPreviewSnapshot, AudioSinkSnapshot, PREVIEW_AUDIO_BLOCK_FRAMES,
-};
-pub use dma::DmaSchedulerSnapshot;
-
 mod idle_profile;
-mod virtual_time;
-
-pub use virtual_time::VirtualClock;
-
-#[cfg(feature = "event-horizon-profiler")]
-mod running_profile;
 
 #[cfg(feature = "idle-profiler")]
 pub use idle_profile::{
     CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_HORIZON_SCHEMA_VERSION,
     IDLE_PROFILE_SCHEMA_VERSION, IdleBlockerCycles, IdleBlockerEpisodes, IdleCurrentProbe,
     IdleEventHorizonProbe, IdleEventSourceMask, IdleHorizonEvents, IdleProfileSnapshot,
-};
-
-#[cfg(feature = "event-horizon-profiler")]
-pub use running_profile::{
-    DecodeProfileSnapshot, ONE_CYCLE_FALLBACK_SIGNATURE_BUCKETS,
-    RUNNING_EVENT_PROFILE_SCHEMA_VERSION, RunningBoundaryEvents, RunningBoundaryMask,
-    RunningBoundarySnapshot, RunningEventProfileSnapshot,
 };
 
 #[cfg(feature = "behavior-trace")]
@@ -59,16 +40,6 @@ mod behavior_trace;
 pub use behavior_trace::{
     BEHAVIOR_TRACE_SCHEMA_VERSION, BehaviorEventDomain, BehaviorTraceDomainSnapshot,
     BehaviorTraceSnapshot,
-};
-
-#[cfg(feature = "cpu-application-profiler")]
-mod cpu_application_profile;
-
-#[cfg(feature = "cpu-application-profiler")]
-pub use cpu_application_profile::{
-    CPU_APPLICATION_PROFILE_SCHEMA_VERSION, CpuApplicationProfileSnapshot, CpuApplicationProfiler,
-    CpuDecodeCounters, CpuDecodeRegionCounters, CpuDecodeRegionCountersByRegion,
-    CpuExceptionCounters, CpuHandlerGroupCounters, CpuInvalidationCounters, CpuPcRegionCounters,
 };
 
 // Dual-execution HLD V1 (Stage 3b.2) — threaded runtime scaffolding.
@@ -222,41 +193,6 @@ pub use self::bus::Bus;
 pub use self::core::CortexM0Plus;
 pub use self::memory::{Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 
-/// RP2040 SRAM address at which the boot2 stack is seeded by the runner.
-pub const RP2040_SRAM_TOP: u32 = 0x2004_2000;
-
-/// Deterministic provenance for a watchdog warm reset.  The event is
-/// produced at the scheduler boundary immediately after the triggering
-/// instruction retires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WatchdogResetEvent {
-    pub epoch: u64,
-    pub cycle: u64,
-    pub core: u8,
-    pub pc: u32,
-    pub reason: u32,
-}
-
-/// Failure returned when a boot2 entry contract cannot be seeded safely.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Boot2EntryError {
-    /// The supplied stack pointer is not aligned or is outside RP2040 SRAM.
-    InvalidStackPointer(u32),
-}
-
-impl std::fmt::Display for Boot2EntryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidStackPointer(value) => write!(
-                f,
-                "boot2 stack pointer {value:#010x} is not a 4-byte-aligned RP2040 SRAM address"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Boot2EntryError {}
-
 pub use picoem_common::Pacer;
 pub use picoem_common::{Clock, PacerSnapshot, PacerStats};
 
@@ -325,19 +261,10 @@ pub struct Emulator {
     /// PC moved this tick. Initialised to a sentinel `0xFF` so the
     /// very first observation always counts as an advance.
     pub(crate) pio0_sm0_last_pc: u8,
-    /// Number of watchdog warm resets since the last cold reset.
-    pub watchdog_reset_count: u64,
-    /// Last watchdog reset event, consumed by the harness after a step.
-    watchdog_reset_event: Option<WatchdogResetEvent>,
     /// OPT0-A Serial idle profiler. Entirely absent from normal builds;
     /// diagnostic harnesses opt in through the `idle-profiler` feature.
     #[cfg(feature = "idle-profiler")]
     idle_profiler: Option<idle_profile::IdleProfiler>,
-    /// OPT2-B running event-horizon opportunity profiler. Diagnostic only;
-    /// normal and performance builds contain neither this state nor its bus
-    /// access latches.
-    #[cfg(feature = "event-horizon-profiler")]
-    running_profiler: Option<running_profile::RunningProfile>,
     /// OPT0-B streaming correctness trace. Entirely absent from normal
     /// builds so performance mode has no disabled hot-path branch.
     #[cfg(feature = "behavior-trace")]
@@ -486,7 +413,6 @@ impl Emulator {
         self.bus.xosc_regs.reset();
         self.bus.rosc_regs.reset();
         self.bus.watchdog_tick.reset();
-        self.bus.watchdog_reset_requested = false;
         self.bus.timer.reset();
         self.bus.uart0.reset();
         self.bus.uart1.reset();
@@ -507,7 +433,6 @@ impl Emulator {
         self.bus.pll_usb_lock_at_cycle = None;
         self.bus.master_cycle = 0;
         self.bus.clock_tree = Default::default();
-        self.bus.reset_virtual_time();
         self.bus.io_bank0.reset();
         self.bus.pads_bank0.reset();
         for pio in &mut self.bus.pio {
@@ -524,10 +449,6 @@ impl Emulator {
         if let Some(profiler) = self.idle_profiler.as_mut() {
             *profiler = idle_profile::IdleProfiler::default();
         }
-        #[cfg(feature = "event-horizon-profiler")]
-        if let Some(profiler) = self.running_profiler.as_mut() {
-            *profiler = running_profile::RunningProfile::default();
-        }
         if let Some(ref mut psram) = self.bus.psram {
             psram.reset_state();
         }
@@ -541,69 +462,12 @@ impl Emulator {
         self.bus.end_core1_step();
 
         self.clock = Clock { cycles: 0 };
-        self.watchdog_reset_count = 0;
-        self.watchdog_reset_event = None;
 
         // Core 1 stays halted — bootrom on real silicon parks core 1 in
         // a wait-for-event loop until core 0 sends the wake sequence.
         // Routed through the wrapper so the SIO handshake FSM `armed`
         // flag stays in sync with core 1's halt state (HLD §2.1).
         self.halt_core1();
-    }
-
-    /// Consume the most recent watchdog warm-reset event, if one occurred.
-    pub fn take_watchdog_reset_event(&mut self) -> Option<WatchdogResetEvent> {
-        self.watchdog_reset_event.take()
-    }
-
-    /// Apply an RP2040-style MCU warm reset while retaining XIP flash,
-    /// attached SD backing/devices, watchdog scratch and the monotonic
-    /// master-cycle counter.  The caller selects the post-reset boot handoff
-    /// after observing the event.
-    fn apply_watchdog_warm_reset(&mut self, cycle: u64, core: usize, pc: u32, reason: u32) {
-        let virtual_time_ns = self.bus.virtual_time_ns();
-        let scratch = self.bus.watchdog_tick.scratch;
-        let reset_reason = self.bus.watchdog_tick.reason | reason;
-        // Board-level inputs are external to the MCU reset domain.  In the
-        // harness the SD card-detect line (and any test GPIO override) is
-        // represented by this pair; dropping it would make a warm reset
-        // appear to physically remove the card and the loader would fail to
-        // remount it after watchdog_reboot().
-        let external_gpio_in_mask = self.bus.external_gpio_in_mask;
-        let external_gpio_in_override = self.bus.external_gpio_in_override;
-        let next_epoch = self.watchdog_reset_count.saturating_add(1);
-        self.reset();
-        self.clock.cycles = cycle;
-        self.bus.master_cycle = cycle;
-        self.bus.restore_virtual_time_after_reset(virtual_time_ns);
-        self.bus.external_gpio_in_mask = external_gpio_in_mask;
-        self.bus.external_gpio_in_override = external_gpio_in_override;
-        self.bus.watchdog_tick.scratch = scratch;
-        self.bus.watchdog_tick.reason = reset_reason;
-        self.watchdog_reset_count = next_epoch;
-        self.watchdog_reset_event = Some(WatchdogResetEvent {
-            epoch: next_epoch,
-            cycle,
-            core: core as u8,
-            pc,
-            reason: reset_reason,
-        });
-    }
-
-    /// If the current instruction requested a watchdog reset, perform it at
-    /// the exact instruction boundary. Returns true when the scheduler must
-    /// abandon the rest of the current quantum.
-    #[inline]
-    fn finish_watchdog_trigger(&mut self, instruction_cycles: u64) -> bool {
-        if !self.bus.take_watchdog_reset_request() {
-            return false;
-        }
-        let cycle = self.clock.cycles.wrapping_add(instruction_cycles);
-        let core = self.bus.active_core();
-        let pc = self.bus.active_pc_for_event();
-        let reason = self.bus.watchdog_tick.reason;
-        self.apply_watchdog_warm_reset(cycle, core, pc, reason);
-        true
     }
 
     /// Load a raw binary at the given address. ROM writes are honoured
@@ -723,42 +587,6 @@ impl Emulator {
         // through the wrapper so the handshake FSM re-arms if the caller
         // used `direct_boot_from_flash` as a mode-switch (§2.1).
         self.halt_core1();
-    }
-
-    /// Enter a flash-resident RP2040 boot2 image without executing the
-    /// ROM's QSPI-detection/USB-MSC path.
-    ///
-    /// This is deliberately a lower-level entry than
-    /// [`Self::direct_boot_from_flash`].  The RP2040 bootrom normally
-    /// supplies the initial register state before branching to boot2, but
-    /// the full ROM path is outside this emulator's scope.  The caller
-    /// therefore supplies the stack pointer and link-register values that
-    /// its boot2 contract requires.  The PC is always the XIP flash base
-    /// (`0x1000_0000`), Thumb state is restored, core 1 remains parked, and
-    /// VTOR is left at the reset value because boot2 owns the handoff to the
-    /// next image.
-    ///
-    /// Call after [`Self::reset`] and [`Self::load_flash`].  This helper does
-    /// not validate the contents or provenance of the boot2 bytes; the
-    /// harness performs artifact-level validation before accepting a run.
-    pub fn boot2_from_flash(
-        &mut self,
-        stack_pointer: u32,
-        link_register: u32,
-    ) -> Result<(), Boot2EntryError> {
-        self.assert_not_placeholder();
-        if stack_pointer & 3 != 0 || !(0x2000_0000..=RP2040_SRAM_TOP).contains(&stack_pointer) {
-            return Err(Boot2EntryError::InvalidStackPointer(stack_pointer));
-        }
-
-        let core = &mut self.cores[0];
-        core.regs.msp = stack_pointer;
-        core.regs.set_sp(stack_pointer);
-        core.regs.set_lr(link_register);
-        core.regs.set_pc(bus::XIP_FLASH_BASE);
-        core.regs.xpsr = 1 << 24;
-        self.halt_core1();
-        Ok(())
     }
 
     /// Advance the system by up to `step_quantum` master-clock cycles,
@@ -949,12 +777,6 @@ impl Emulator {
         self.bus.master_cycle = self.clock.cycles;
         let start = self.clock.cycles;
         let target = start.wrapping_add(self.step_quantum as u64);
-        #[cfg(feature = "event-horizon-profiler")]
-        self.bus.reset_running_cpu_boundaries();
-        #[cfg(feature = "event-horizon-profiler")]
-        let running_before = self.behavior_observation();
-        #[cfg(feature = "event-horizon-profiler")]
-        let running_horizon = self.idle_event_horizon_internal(external_event_cycle);
 
         // Per HLD 2026.04.26 V5 §5.2.3: accumulate per-core cycle counts
         // across the inner loop so the slow-branch SysTick advance
@@ -977,9 +799,6 @@ impl Emulator {
                 // sees the eviction next quantum. Mirrors rp2350_emu
                 // (commit 0c31479, lib.rs §lookup-and-drain).
                 Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
-                if self.finish_watchdog_trigger(c) {
-                    return c;
-                }
                 self.maybe_wake_core1(0);
                 c
             } else {
@@ -992,9 +811,6 @@ impl Emulator {
                 let c = self.cores[1].step(&mut self.bus) as u64;
                 Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
                 self.bus.end_core1_step();
-                if self.finish_watchdog_trigger(c0.max(c)) {
-                    return c0.max(c);
-                }
                 self.maybe_wake_core1(1);
                 c
             } else {
@@ -1011,12 +827,6 @@ impl Emulator {
             c1_total = c1_total.wrapping_add(c1);
             self.clock.cycles = self.clock.cycles.wrapping_add(c0.max(c1));
         }
-
-        // SIO FIFO IRQs are core-local level signals, unlike the shared
-        // peripheral bits drained through `bus.irq_pending`. Refresh after
-        // both core steps so FIFO push/pop and WOF/ROE changes from this
-        // quantum are visible before blocked-core and wake decisions.
-        self.bus.refresh_sio_fifo_irqs();
 
         let consumed = self.clock.cycles.wrapping_sub(start);
         let both_cores_blocked = (self.cores[0].is_halted() || self.bus.wfe_waiting[0])
@@ -1127,10 +937,6 @@ impl Emulator {
                     c1_wfe,
                 );
             }
-            #[cfg(feature = "event-horizon-profiler")]
-            if let Some(profiler) = self.running_profiler.as_mut() {
-                profiler.record_non_running();
-            }
             return advance;
         }
         // See the fn docstring for the rationale on the fast-path and
@@ -1140,10 +946,11 @@ impl Emulator {
         //
         // HLD V7 §5.5 broadens the gate from "PIO idle" to "PIO idle
         // AND peripherals (including DMA) idle AND no IRQ pending".
-        // TIMER/WATCHDOG_TICK are lazy. DMA and the other stateful
-        // peripherals remain part of `all_peripherals_idle()`; the
-        // short-circuit below only avoids evaluating them after active
-        // PIO has already made the slow path mandatory.
+        // Phase 1 peripherals are all lazy (TIMER/WATCHDOG_TICK), and
+        // DMA is a Phase 1 always-idle stub, so in practice the gate
+        // still reduces to the PIO check — but the extra conditions
+        // are in place so later phases don't need to reopen this
+        // site.
         let pio_idle = self.bus.pio_all_idle();
         // SysTick fires by ORing into `bus.ppb[active].icsr` — NOT by
         // setting `bus.irq_pending` — so the IRQ check below does
@@ -1216,25 +1023,6 @@ impl Emulator {
             self.drain_pending_irqs_to_cores();
         }
         self.wake_checks();
-        #[cfg(feature = "event-horizon-profiler")]
-        {
-            let mut boundaries = self.bus.take_running_cpu_boundaries();
-            let running_after = self.behavior_observation();
-            boundaries.insert(Self::running_device_boundaries(
-                &running_before,
-                &running_after,
-            ));
-            if external_event_cycle.is_some_and(|cycle| self.clock.cycles >= cycle) {
-                boundaries.insert(running_profile::RunningBoundaryMask::EXTERNAL);
-            }
-            if let Some(profiler) = self.running_profiler.as_mut() {
-                if consumed == 0 {
-                    profiler.record_non_running();
-                } else {
-                    profiler.record_running(consumed, boundaries, running_horizon);
-                }
-            }
-        }
         #[cfg(feature = "idle-profiler")]
         if let Some(profiler) = self.idle_profiler.as_mut() {
             let both_blocked = (self.cores[0].is_halted() || self.bus.wfe_waiting[0])
@@ -1373,17 +1161,8 @@ impl Emulator {
             let raised = std::mem::replace(&mut self.bus.irq_pending, 0);
             for irq in 0..crate::irq::IRQ_COUNT {
                 if raised & (1u32 << irq) != 0 {
-                    let exception = 16 + irq as u16;
-                    for core in 0..2 {
-                        // A still-asserted level belonging to the handler
-                        // that is already active is not a second event. If
-                        // the source remains asserted after exception
-                        // return, the next peripheral tick routes it again.
-                        // The other core still receives the shared wire.
-                        if !self.bus.ppb[core].is_active(exception) {
-                            self.bus.nvics[core].set_pending(irq as u8);
-                        }
-                    }
+                    self.bus.nvics[0].set_pending(irq as u8);
+                    self.bus.nvics[1].set_pending(irq as u8);
                 }
             }
         }
@@ -1642,14 +1421,8 @@ impl Emulator {
             pio0_sm0_max_pc: self.pio0_sm0_max_pc,
             pio0_sm0_pc_advances: self.pio0_sm0_pc_advances,
             pio0_sm0_last_pc: self.pio0_sm0_last_pc,
-            watchdog_reset_count: self.watchdog_reset_count,
-            watchdog_reset_event: self.watchdog_reset_event,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
-            #[cfg(feature = "event-horizon-profiler")]
-            running_profiler: None,
-            #[cfg(feature = "behavior-trace")]
-            behavior_tracer: None,
             execution_model: ExecutionModel::Serial,
             threaded: None,
             panic_info: None,
@@ -1728,26 +1501,6 @@ impl Emulator {
         let ext_mask = self.bus.external_gpio_in_mask;
         if ext_mask != 0 {
             out = (out & !ext_mask) | (self.bus.external_gpio_in_override & ext_mask);
-        }
-
-        // IO_BANK0 GPIO_CTRL.INOVER is applied to the resolved pad level,
-        // after external devices have contributed their input.  This is
-        // observable on PicoCalc GP22: the uf2loader sets INOVER=INVERT and
-        // then treats the physically-active-low card-detect switch as a
-        // logical high (card present).  Ignoring INOVER makes the loader
-        // report "SD card not found" even though SPI reads succeed.
-        for pin in 0..bus::io_bank0::NUM_GPIOS {
-            let mode = (self.bus.io_bank0.ctrl[pin] >> 16) & 0x3;
-            if mode == 0 {
-                continue;
-            }
-            let mask = 1u32 << pin;
-            match mode {
-                1 => out ^= mask,  // GPIO_OVERRIDE_INVERT
-                2 => out &= !mask, // GPIO_OVERRIDE_LOW
-                3 => out |= mask,  // GPIO_OVERRIDE_HIGH
-                _ => unreachable!(),
-            }
         }
         self.bus.gpio_in = out;
 
@@ -2019,41 +1772,6 @@ impl Emulator {
         self.bus.drain_uart0_tx_log()
     }
 
-    /// Drain UART0 TX writes together with the exact virtual bus cycle at
-    /// which the guest wrote each byte. This is used by the preview adapter;
-    /// the byte-only accessor remains the stable report path.
-    pub fn drain_uart0_tx_log_with_cycles(&mut self) -> Vec<(u64, u8)> {
-        self.assert_not_placeholder();
-        self.bus.drain_uart0_tx_log_with_cycles()
-    }
-
-    /// Enable exact virtual-cycle metadata on the UART0 TX preview tap.
-    /// Ordinary batch/report runs keep this tap disabled.
-    pub fn enable_uart0_tx_cycle_tap(&mut self) {
-        self.assert_not_placeholder();
-        self.bus.enable_uart0_tx_cycle_tap();
-    }
-
-    /// Inject one byte on the external UART0 RX wire for the interactive
-    /// preview.  The result reports whether the guest RX FIFO accepted it,
-    /// ignored it while disabled, or dropped it on FIFO overrun.
-    pub fn inject_uart0_rx(&mut self, byte: u8) -> peripherals::uart::UartRxResult {
-        self.assert_not_placeholder();
-        self.bus.inject_uart0_rx(byte)
-    }
-
-    /// Number of bytes currently waiting in UART0's guest RX FIFO.
-    pub fn uart0_rx_fifo_len(&self) -> usize {
-        self.assert_not_placeholder();
-        self.bus.uart0_rx_fifo_len()
-    }
-
-    /// UART0 raw interrupt status, exposed for preview status diagnostics.
-    pub fn uart0_raw_interrupt_status(&self) -> u32 {
-        self.assert_not_placeholder();
-        self.bus.uart0_raw_interrupt_status()
-    }
-
     /// Enable and reset the OPT0-B streaming event trace.
     ///
     /// Only Serial mode is accepted. The initial observable state is
@@ -2207,72 +1925,6 @@ impl Emulator {
         }
     }
 
-    /// Compare the same observable projection used by OPT0-B and classify
-    /// which device-side boundary ended an OPT2-B running interval.  The
-    /// profiler records these post-hoc gaps as an opportunity upper bound;
-    /// it does not promote them to a predictive/safe horizon.
-    #[cfg(feature = "event-horizon-profiler")]
-    fn running_device_boundaries(
-        before: &behavior_trace::BehaviorObservation,
-        after: &behavior_trace::BehaviorObservation,
-    ) -> u16 {
-        use running_profile::RunningBoundaryMask as M;
-
-        let mut bits = 0u16;
-        if before.clock_hz != after.clock_hz {
-            bits |= M::CLOCK;
-        }
-        if before.irq != after.irq {
-            bits |= M::IRQ_EXCEPTION;
-        }
-        if before.gpio_in != after.gpio_in
-            || before.pio_state != after.pio_state
-            || before.psram != after.psram
-        {
-            bits |= M::PIO_DEVICE;
-        }
-        if before.dma_transfers != after.dma_transfers {
-            bits |= M::DMA_DREQ;
-        }
-        if before.timer != after.timer || behavior_trace::pwm_boundary(&before.pwm, &after.pwm) {
-            bits |= M::TIMER_SYSTICK_PWM;
-        }
-        if before.serial != after.serial {
-            bits |= M::SERIAL;
-        }
-        bits
-    }
-
-    /// Enable and reset the running event-horizon/decode opportunity
-    /// profiler, including OPT3-A immutable-XIP cursor metrics. This
-    /// diagnostic is Serial-only and is intentionally
-    /// separate from the wall-time measurement binary.
-    #[cfg(feature = "event-horizon-profiler")]
-    pub fn enable_running_event_profiler(&mut self) -> Result<(), EmulatorError> {
-        if self.execution_model != ExecutionModel::Serial {
-            return Err(EmulatorError::NotSupportedInThreadedMode);
-        }
-        self.running_profiler = Some(running_profile::RunningProfile::default());
-        for core in &mut self.cores {
-            core.reset_decode_profile();
-        }
-        Ok(())
-    }
-
-    /// Snapshot aggregate counters without mutating open intervals.
-    #[cfg(feature = "event-horizon-profiler")]
-    pub fn running_event_profile_snapshot(&self) -> Option<RunningEventProfileSnapshot> {
-        self.running_profiler
-            .as_ref()
-            .map(|profile| RunningEventProfileSnapshot {
-                boundary: profile.snapshot(),
-                decode_by_core: [
-                    self.cores[0].decode_profile_snapshot(),
-                    self.cores[1].decode_profile_snapshot(),
-                ],
-            })
-    }
-
     /// Enable and reset the diagnostic Serial idle profiler.
     ///
     /// Available only in builds with the `idle-profiler` feature. The
@@ -2294,33 +1946,6 @@ impl Emulator {
         self.idle_profiler
             .as_ref()
             .map(idle_profile::IdleProfiler::snapshot)
-    }
-
-    /// Enable and reset the P0-B per-core CPU application profiler.
-    ///
-    /// This is a Serial-only diagnostic mode. It records emulated cycles,
-    /// instruction classes, decode-cache outcomes, invalidation collateral,
-    /// and exception-poll dispositions; it does not read a host clock and
-    /// must not be used as wall-time acceptance evidence.
-    #[cfg(feature = "cpu-application-profiler")]
-    pub fn enable_cpu_application_profiler(&mut self) -> Result<(), EmulatorError> {
-        if self.execution_model != ExecutionModel::Serial {
-            return Err(EmulatorError::NotSupportedInThreadedMode);
-        }
-        for core in &mut self.cores {
-            core.enable_cpu_application_profiler();
-        }
-        Ok(())
-    }
-
-    /// Snapshot the P0-B per-core CPU application counters without mutating
-    /// the open interval. Returns `None` until profiling is enabled.
-    #[cfg(feature = "cpu-application-profiler")]
-    pub fn cpu_application_profile_snapshot(&self) -> Option<[CpuApplicationProfileSnapshot; 2]> {
-        Some([
-            self.cores[0].cpu_application_profile_snapshot()?,
-            self.cores[1].cpu_application_profile_snapshot()?,
-        ])
     }
 
     /// Sample the current conservative idle gate for OPT0-A cost studies.
@@ -2537,12 +2162,8 @@ impl EmulatorBuilder {
             pio0_sm0_max_pc: 0,
             pio0_sm0_pc_advances: 0,
             pio0_sm0_last_pc: 0xFF,
-            watchdog_reset_count: 0,
-            watchdog_reset_event: None,
             #[cfg(feature = "idle-profiler")]
             idle_profiler: None,
-            #[cfg(feature = "event-horizon-profiler")]
-            running_profiler: None,
             #[cfg(feature = "behavior-trace")]
             behavior_tracer: None,
             execution_model: self.execution,
@@ -3492,28 +3113,6 @@ mod stage5_lib_residue {
         assert!(emu.bus.nvics[0].is_pending(0) || emu.bus.nvics[1].is_pending(0));
     }
 
-    #[test]
-    fn active_level_irq_does_not_repend_same_core_but_remains_shared() {
-        let mut emu = Emulator::new(Config::default());
-        const IRQ: u8 = 11;
-        const EXCEPTION: u16 = 16 + IRQ as u16;
-
-        emu.bus.ppb[0].mark_active(EXCEPTION);
-        emu.bus.irq_pending = 1u32 << IRQ;
-        emu.drain_pending_irqs_to_cores();
-
-        assert!(!emu.bus.nvics[0].is_pending(IRQ));
-        assert!(emu.bus.nvics[1].is_pending(IRQ));
-
-        emu.bus.nvics[1].clear_pending(IRQ);
-        emu.bus.ppb[0].clear_active(EXCEPTION);
-        emu.bus.irq_pending = 1u32 << IRQ;
-        emu.drain_pending_irqs_to_cores();
-
-        assert!(emu.bus.nvics[0].is_pending(IRQ));
-        assert!(emu.bus.nvics[1].is_pending(IRQ));
-    }
-
     // ------------------- tick_systick (lines 812, 817) -------------------
 
     /// Drives the true branches of `if systicks[0].tick()` (line 812) and
@@ -3618,28 +3217,6 @@ mod stage5_lib_residue {
         // Trigger update_gpio via gpio_write.
         emu.gpio_write(0, false);
         assert!(emu.gpio_read(5));
-    }
-
-    /// The PicoCalc SD slot's card-detect switch is physically active-low.
-    /// uf2loader configures IO_BANK0 GPIO_CTRL.INOVER=INVERT on GP22, so a
-    /// low external pad level must be observed by firmware as logical high.
-    /// Keep this at the emulator boundary: a loader run must not rely on a
-    /// harness-only logical-level shortcut.
-    #[test]
-    fn update_gpio_applies_io_bank0_input_override() {
-        let mut emu = Emulator::new(Config::default());
-        let pin = 22u8;
-        let mask = 1u32 << pin;
-        emu.bus.external_gpio_in_mask = mask;
-        emu.bus.external_gpio_in_override = 0;
-        emu.bus.io_bank0.ctrl[pin as usize] = 1u32 << 16; // INOVER=INVERT
-
-        emu.gpio_write(0, false);
-
-        assert!(
-            emu.gpio_read(pin),
-            "active-low card detect must invert to high"
-        );
     }
 
     // ------------------- wake_checks (lines 1148, 1155) -------------------

@@ -33,22 +33,13 @@ use std::io::Write;
 use tracing::debug;
 
 use picoem_common::PioBlock;
-
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    feature = "decoded-op-8byte-prototype"
-))]
-compile_error!(
-    "compact-dispatch-key-prototype is incompatible with decoded-op-8byte-prototype; enable one cache representation at a time"
-);
-
 use picoem_common::clocks::{pll_cs_read_with_lock, pll_should_arm_lock};
 
 use crate::core::Nvic;
 use crate::dma::Dma;
 use crate::irq::{
-    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP, IRQ_SIO_IRQ_PROC0,
-    IRQ_SIO_IRQ_PROC1, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_UART0_IRQ, IRQ_UART1_IRQ,
+    IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ,
+    IRQ_UART0_IRQ, IRQ_UART1_IRQ,
 };
 use crate::memory::{FLASH_SIZE, Memory, ROM_SIZE, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::AdcRegs;
@@ -56,9 +47,8 @@ use crate::peripherals::i2c::I2cRegs;
 use crate::peripherals::pwm::PwmRegs;
 use crate::peripherals::spi::SpiRegs;
 use crate::peripherals::timer::TimerRegs;
-use crate::peripherals::uart::{UartRegs, UartRxResult};
+use crate::peripherals::uart::UartRegs;
 use crate::peripherals::watchdog_tick::WatchdogTickRegs;
-use crate::virtual_time::VirtualClock;
 use clocks::{ClockTree, ClocksRegs, PLL_RESET, PllRegs, ROSC_FREQ_HZ, RoscRegs, XoscRegs};
 use io_bank0::IoBank0;
 use pads_bank0::PadsBank0;
@@ -114,14 +104,6 @@ pub const TIMER_BASE: u32 = 0x4005_4000;
 pub const WATCHDOG_BASE: u32 = 0x4005_8000;
 pub const XIP_CTRL_BASE: u32 = 0x1400_0000;
 pub const SSI_BASE: u32 = 0x1800_0000;
-/// IO_QSPI GPIO1 (QSPI_SS_N) control register. The RP2040 ROM flash
-/// helpers force this output low/high around command transfers instead of
-/// toggling SSIENR, so it is also the flash transaction boundary.
-const IO_QSPI_SS_CTRL: u32 = 0x0C;
-const IO_QSPI_OUTOVER_SHIFT: u32 = 8;
-const IO_QSPI_OUTOVER_MASK: u32 = 0x3 << IO_QSPI_OUTOVER_SHIFT;
-const IO_QSPI_OUTOVER_LOW: u32 = 0x2 << IO_QSPI_OUTOVER_SHIFT;
-const IO_QSPI_OUTOVER_HIGH: u32 = 0x3 << IO_QSPI_OUTOVER_SHIFT;
 /// XIP_SSI register offsets touched by the boot-time flash helpers.
 const SSI_SSIENR: u32 = 0x08;
 const SSI_TXFLR: u32 = 0x20;
@@ -231,32 +213,26 @@ pub const XIP_SRAM_SIZE: usize = 16 * 1024;
 
 /// Number of entries in the per-core PC-keyed decoded-op cache.
 /// Direct-mapped, indexed by `(pc >> 1) & (DECODE_CACHE_SIZE - 1)`.
-/// 8192 entries × 12 B = 96 KB per core (8 B in the
-/// `decoded-op-8byte-prototype` experiment). Modelled on the RP2350 cache
+/// 8192 entries × 12 B = 96 KB per core. Modelled on the RP2350 cache
 /// (rp2350_emu commit 0c31479) but sized down: RP2040 hot loops are well
 /// under 1 KB and total executable space (16 KB ROM + 16 KB XIP-SRAM +
 /// 264 KB SRAM + 2 MB XIP flash) hashes to 8K slots without meaningful
 /// conflict pressure for the workloads we measure.
 pub(crate) const DECODE_CACHE_SIZE: usize = 8192;
 
-/// One decoded ARMv6-M instruction, `Copy`.
+/// One decoded ARMv6-M instruction. 12 bytes (4 + 2 + 2 + 1 + 3 pad),
+/// `Copy`.
 ///
 /// Populated lazily on a cache miss by
-/// [`crate::core::CortexM0Plus::populate_decode_cache`]. In the default
-/// representation an entry with `tag == u32::MAX` is empty; the packed
-/// representation uses its valid bit instead.
-///
-/// The `decoded-op-8byte-prototype` representation stores the upper 18 PC
-/// bits and the wide flag in one `u32`; the direct-mapped slot supplies the
-/// lower PC bits. This preserves the full tag while reducing the entry from
-/// 12 to 8 bytes. The default representation remains unchanged.
+/// [`crate::core::CortexM0Plus::populate_decode_cache`]. An entry with
+/// `tag == u32::MAX` is empty (that value is odd and cannot match a
+/// halfword-aligned PC).
 ///
 /// Differs from the rp2350_emu [`crate::bus::DecodedOp`] equivalent by
 /// dropping `fetch_wait` (RP2040 has no `extra_wait_states` accumulator
 /// — `Bus::read16` writes `last_access_cycles` but the core path does
 /// not consume it) and `is_thumb16_flag_only` (ARMv6-M has no IT
 /// blocks).
-#[cfg(not(feature = "decoded-op-8byte-prototype"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DecodedOp {
     /// PC this entry is valid for. Full tag (no shift). `u32::MAX` =
@@ -272,53 +248,11 @@ pub(crate) struct DecodedOp {
     pub flags: u8,
 }
 
-#[cfg(feature = "decoded-op-8byte-prototype")]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct DecodedOp {
-    /// Bits [17:0] contain `pc >> 14`; bit 18 is `is_wide`; bit 19 is the
-    /// valid bit. A zero valid bit is the empty/fault sentinel, allowing a
-    /// fault result to retain its wide classification without becoming a
-    /// cache hit.
-    tag_flags: u32,
-    /// First halfword (the one at PC).
-    pub hw0: u16,
-    /// Second halfword (at PC+2). Zero for narrow instructions.
-    pub hw1: u16,
-}
-
 impl DecodedOp {
-    #[cfg(not(feature = "decoded-op-8byte-prototype"))]
     pub(crate) const FLAG_WIDE: u8 = 0b0000_0001;
-
-    #[cfg(all(
-        feature = "compact-dispatch-key-prototype",
-        not(feature = "decoded-op-8byte-prototype")
-    ))]
-    pub(crate) const FLAG_DISPATCH_KEY_MASK: u8 = 0b0111_1110;
-    #[cfg(all(
-        feature = "compact-dispatch-key-prototype",
-        not(feature = "decoded-op-8byte-prototype")
-    ))]
-    pub(crate) const FLAG_DISPATCH_KEY_SHIFT: u8 = 1;
-
-    #[cfg(feature = "decoded-op-8byte-prototype")]
-    const TAG_MASK: u32 = (1 << 18) - 1;
-    #[cfg(feature = "decoded-op-8byte-prototype")]
-    const WIDE_MASK: u32 = 1 << 18;
-    #[cfg(feature = "decoded-op-8byte-prototype")]
-    const VALID_MASK: u32 = 1 << 19;
 
     #[inline(always)]
     pub(crate) fn empty() -> Self {
-        #[cfg(feature = "decoded-op-8byte-prototype")]
-        {
-            return Self {
-                tag_flags: 0,
-                hw0: 0,
-                hw1: 0,
-            };
-        }
-        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
         Self {
             tag: u32::MAX,
             hw0: 0,
@@ -329,201 +263,9 @@ impl DecodedOp {
 
     #[inline(always)]
     pub(crate) fn is_wide(&self) -> bool {
-        #[cfg(feature = "decoded-op-8byte-prototype")]
-        {
-            return self.tag_flags & Self::WIDE_MASK != 0;
-        }
-        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
-        {
-            self.flags & Self::FLAG_WIDE != 0
-        }
-    }
-
-    /// Compact handler class stored in the otherwise-unused default flags.
-    /// The OPT4-C packed entry is explicitly incompatible with this feature.
-    #[cfg(all(
-        feature = "compact-dispatch-key-prototype",
-        not(feature = "decoded-op-8byte-prototype")
-    ))]
-    #[inline(always)]
-    pub(crate) fn dispatch_key(&self) -> u8 {
-        (self.flags & Self::FLAG_DISPATCH_KEY_MASK) >> Self::FLAG_DISPATCH_KEY_SHIFT
-    }
-
-    #[cfg(all(
-        feature = "compact-dispatch-key-prototype",
-        not(feature = "decoded-op-8byte-prototype")
-    ))]
-    #[inline(always)]
-    pub(crate) fn with_dispatch_key(mut self, wide: bool, key: u8) -> Self {
-        debug_assert!(key <= (Self::FLAG_DISPATCH_KEY_MASK >> Self::FLAG_DISPATCH_KEY_SHIFT));
-        self.flags = (self.flags & !(Self::FLAG_WIDE | Self::FLAG_DISPATCH_KEY_MASK))
-            | (if wide { Self::FLAG_WIDE } else { 0 })
-            | ((key << Self::FLAG_DISPATCH_KEY_SHIFT) & Self::FLAG_DISPATCH_KEY_MASK);
-        self
-    }
-
-    /// Build a valid decoded entry for a halfword-aligned PC.
-    #[inline(always)]
-    pub(crate) fn from_parts(pc: u32, hw0: u16, hw1: u16, wide: bool) -> Self {
-        #[cfg(feature = "decoded-op-8byte-prototype")]
-        {
-            let mut tag_flags = Self::VALID_MASK | ((pc >> 14) & Self::TAG_MASK);
-            if wide {
-                tag_flags |= Self::WIDE_MASK;
-            }
-            Self {
-                tag_flags,
-                hw0,
-                hw1,
-            }
-        }
-        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
-        {
-            Self {
-                tag: pc,
-                hw0,
-                hw1,
-                flags: if wide { Self::FLAG_WIDE } else { 0 },
-            }
-        }
-    }
-
-    /// Build an uncached fetch result while retaining its decoded halfwords.
-    #[inline(always)]
-    pub(crate) fn fault_result(hw0: u16, hw1: u16, wide: bool) -> Self {
-        #[cfg(feature = "decoded-op-8byte-prototype")]
-        {
-            let mut result = Self::empty();
-            result.hw0 = hw0;
-            result.hw1 = hw1;
-            if wide {
-                result.tag_flags = Self::WIDE_MASK;
-            }
-            result
-        }
-        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
-        {
-            Self {
-                tag: u32::MAX,
-                hw0,
-                hw1,
-                flags: if wide { Self::FLAG_WIDE } else { 0 },
-            }
-        }
-    }
-
-    /// Does this entry represent `pc` in the supplied direct-mapped slot?
-    #[inline(always)]
-    pub(crate) fn matches_pc(&self, pc: u32, _slot: usize) -> bool {
-        #[cfg(feature = "decoded-op-8byte-prototype")]
-        {
-            !self.is_empty()
-                && (self.tag_flags & Self::TAG_MASK) == ((pc >> 14) & Self::TAG_MASK)
-                && (_slot as u32 & ((DECODE_CACHE_SIZE as u32) - 1))
-                    == ((pc >> 1) & ((DECODE_CACHE_SIZE as u32) - 1))
-                && pc & 1 == 0
-        }
-        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
-        {
-            !self.is_empty() && self.tag == pc
-        }
-    }
-
-    /// Does this entry back the same physical executable bytes as `pc`?
-    ///
-    /// The RP2040 exposes four SRAM alias windows (`0x20`..`0x23`) that
-    /// share one backing store.  Decode lookup intentionally keeps the full
-    /// virtual PC as its tag, but a write through one alias must invalidate
-    /// an entry fetched through another alias.  P1-A uses this predicate for
-    /// invalidation only; normal decode lookup remains `matches_pc`.
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub(crate) fn matches_invalidation_pc(&self, pc: u32, slot: usize) -> bool {
-        if self.matches_pc(pc, slot) {
-            return true;
-        }
-        if pc >> 28 != 0x2 {
-            return false;
-        }
-        let entry_pc = self.tag_for_slot(slot);
-        entry_pc >> 28 == 0x2 && (entry_pc & 0x00FF_FFFF) == (pc & 0x00FF_FFFF)
-    }
-
-    #[inline(always)]
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        #[cfg(feature = "decoded-op-8byte-prototype")]
-        {
-            self.tag_flags & Self::VALID_MASK == 0
-        }
-        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
-        {
-            self.tag == u32::MAX
-        }
-    }
-
-    /// Reconstruct the full PC for diagnostics/tests from this entry and its
-    /// direct-mapped slot. Returns `u32::MAX` for an empty entry.
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub(crate) fn tag_for_slot(&self, slot: usize) -> u32 {
-        #[cfg(feature = "decoded-op-8byte-prototype")]
-        {
-            if self.is_empty() {
-                u32::MAX
-            } else {
-                ((self.tag_flags & Self::TAG_MASK) << 14)
-                    | (((slot as u32) & ((DECODE_CACHE_SIZE as u32) - 1)) << 1)
-            }
-        }
-        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
-        {
-            let _ = slot;
-            self.tag
-        }
-    }
-
-    /// Set the full tag for a test/diagnostic cache fixture, retaining the
-    /// current wide bit in the experimental packed representation.
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub(crate) fn set_tag_for_slot(&mut self, slot: usize, pc: u32) {
-        #[cfg(feature = "decoded-op-8byte-prototype")]
-        {
-            let _ = slot;
-            let wide = self.tag_flags & Self::WIDE_MASK;
-            self.tag_flags = Self::VALID_MASK | ((pc >> 14) & Self::TAG_MASK) | wide;
-        }
-        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
-        {
-            let _ = slot;
-            self.tag = pc;
-        }
-    }
-
-    /// Original address-region nibble used by region-scoped invalidation.
-    #[inline(always)]
-    pub(crate) fn region_nibble(&self) -> u8 {
-        #[cfg(feature = "decoded-op-8byte-prototype")]
-        {
-            if self.is_empty() {
-                0xF
-            } else {
-                ((self.tag_flags >> 14) & 0xF) as u8
-            }
-        }
-        #[cfg(not(feature = "decoded-op-8byte-prototype"))]
-        {
-            (self.tag >> 28) as u8
-        }
+        self.flags & Self::FLAG_WIDE != 0
     }
 }
-
-#[cfg(feature = "decoded-op-8byte-prototype")]
-const _: () = assert!(core::mem::size_of::<DecodedOp>() == 8);
-#[cfg(not(feature = "decoded-op-8byte-prototype"))]
-const _: () = assert!(core::mem::size_of::<DecodedOp>() == 12);
 
 /// True if `pc` lies in an executable region the cache may index.
 /// Only ROM (`0x0`), XIP / XIP-SRAM (`0x1`), and SRAM (`0x2`) qualify.
@@ -607,9 +349,6 @@ pub struct Bus {
     pub(crate) pll_usb_lock_at_cycle: Option<u64>,
     /// Derived clock tree frequencies (recomputed on any CLOCKS/PLL write).
     pub clock_tree: ClockTree,
-    /// Single deterministic cycle-to-nanosecond snapshot shared by all
-    /// optional external I2C devices and the harness observation API.
-    virtual_time: VirtualClock,
     /// IO_BANK0 per-pin function select.
     pub io_bank0: IoBank0,
     /// PADS_BANK0 per-pin pad control.
@@ -638,10 +377,6 @@ pub struct Bus {
     /// the `TICK` register at offset `0x2C` is modelled today; the rest
     /// of the WATCHDOG block reads as 0.
     pub watchdog_tick: WatchdogTickRegs,
-    /// Sticky request raised by WATCHDOG CTRL.TRIGGER.  The CPU scheduler
-    /// consumes it only after the current instruction retires, so the core
-    /// executing the trigger never executes a following instruction.
-    pub(crate) watchdog_reset_requested: bool,
     /// TIMER register model (Phase 1 Wave 2 — HLD V7 §5.3). Lazy
     /// microsecond counter + four alarms; `advance_lazy_scheduled`
     /// polls `poll_alarms` on every step tail to surface alarm-match
@@ -727,12 +462,6 @@ pub struct Bus {
     active_core: usize,
     /// Cycle cost of the most recent bus access.
     last_access_cycles: u32,
-    /// OPT2-B diagnostic latch for CPU-visible synchronization accesses
-    /// performed during the current Serial dispatch.  It is compiled out of
-    /// production builds and drained before peripheral/DMA advancement, so
-    /// bus traffic generated by a DMA tick cannot be mistaken for CPU MMIO.
-    #[cfg(feature = "event-horizon-profiler")]
-    running_cpu_boundary_mask: crate::running_profile::RunningBoundaryMask,
     /// Bus fault sticky flags.
     bus_fault: bool,
     bus_fault_addr: u32,
@@ -815,7 +544,6 @@ impl Bus {
             pll_sys_lock_at_cycle: None,
             pll_usb_lock_at_cycle: None,
             clock_tree: ClockTree::default(),
-            virtual_time: VirtualClock::new(ClockTree::default().sys_clk_hz),
             io_bank0: IoBank0::new(),
             pads_bank0: PadsBank0::new(),
             xip_sram: Box::new([0u8; XIP_SRAM_SIZE]),
@@ -826,7 +554,6 @@ impl Bus {
             pio: [PioBlock::new(), PioBlock::new()],
             pin_devices: Vec::new(),
             watchdog_tick: WatchdogTickRegs::new(),
-            watchdog_reset_requested: false,
             timer: TimerRegs::new(),
             uart0: UartRegs::new(IRQ_UART0_IRQ),
             uart1: UartRegs::new(IRQ_UART1_IRQ),
@@ -847,8 +574,6 @@ impl Bus {
             wfe_waiting: [false; 2],
             active_core: 0,
             last_access_cycles: 0,
-            #[cfg(feature = "event-horizon-profiler")]
-            running_cpu_boundary_mask: Default::default(),
             bus_fault: false,
             bus_fault_addr: 0,
             core0_bank_touched: 0,
@@ -876,70 +601,6 @@ impl Bus {
     pub fn set_active_core(&mut self, core: usize) {
         debug_assert!(core < 2);
         self.active_core = core;
-    }
-
-    /// PC attributed to the instruction currently executing on the active
-    /// core.  Used only for deterministic watchdog reset provenance.
-    #[inline]
-    pub(crate) fn active_pc_for_event(&self) -> u32 {
-        self.active_pc[self.active_core]
-    }
-
-    #[inline]
-    pub(crate) fn take_watchdog_reset_request(&mut self) -> bool {
-        std::mem::take(&mut self.watchdog_reset_requested)
-    }
-
-    #[cfg(feature = "event-horizon-profiler")]
-    pub(crate) fn reset_running_cpu_boundaries(&mut self) {
-        self.running_cpu_boundary_mask = Default::default();
-    }
-
-    #[cfg(feature = "event-horizon-profiler")]
-    pub(crate) fn take_running_cpu_boundaries(
-        &mut self,
-    ) -> crate::running_profile::RunningBoundaryMask {
-        std::mem::take(&mut self.running_cpu_boundary_mask)
-    }
-
-    /// Classify CPU-visible synchronization accesses for the OPT2-B
-    /// opportunity profile. Categories deliberately overlap: GPIO_IN and
-    /// FIFO/DREQ reads are also ordinary MMIO boundaries.
-    #[cfg(feature = "event-horizon-profiler")]
-    #[inline]
-    fn note_running_cpu_access(&mut self, addr: u32, read: bool) {
-        use crate::running_profile::RunningBoundaryMask as M;
-
-        let region = addr >> 28;
-        if !matches!(region, 0x4 | 0x5 | 0xD | 0xE) {
-            return;
-        }
-        self.running_cpu_boundary_mask.insert(M::CPU_MMIO);
-
-        let canonical = addr & !0x3000;
-        let base = canonical & 0xFFFF_F000;
-        let offset = canonical & 0x0000_0FFF;
-        if read && base == SIO_BASE && (offset & !3) == 0x004 {
-            self.running_cpu_boundary_mask.insert(M::GPIO_IN);
-        }
-
-        let fifo_or_dreq = (base == SIO_BASE && (0x050..=0x058).contains(&(offset & !3)))
-            || ((base == PIO0_BASE || base == PIO1_BASE)
-                && (0x010..=0x02c).contains(&(offset & !3)))
-            || matches!(
-                base,
-                DMA_BASE
-                    | UART0_BASE
-                    | UART1_BASE
-                    | SPI0_BASE
-                    | SPI1_BASE
-                    | I2C0_BASE
-                    | I2C1_BASE
-                    | ADC_BASE
-            );
-        if fifo_or_dreq {
-            self.running_cpu_boundary_mask.insert(M::FIFO_DREQ);
-        }
     }
 
     /// Stash the instruction PC of the currently-executing instruction
@@ -1032,47 +693,6 @@ impl Bus {
     pub fn seed_sys_clk_hz(&mut self, hz: u32) {
         self.clock_tree.sys_clk_hz = hz;
         self.clock_tree.ref_clk_hz = hz;
-        self.virtual_time.rebase(self.master_cycle, hz);
-    }
-
-    /// Current deterministic virtual time in nanoseconds.
-    #[inline]
-    pub fn virtual_time_ns(&self) -> u64 {
-        self.virtual_time.ns_at(self.master_cycle)
-    }
-
-    /// Convert a virtual nanosecond deadline to the corresponding absolute
-    /// master cycle using the shared snapshot.
-    #[inline]
-    pub fn virtual_time_cycles_at(&self, ns: u64) -> u64 {
-        self.virtual_time.cycles_at(ns)
-    }
-
-    /// Reset the shared virtual-time epoch for a cold emulator reset.
-    pub(crate) fn reset_virtual_time(&mut self) {
-        self.virtual_time.reset(self.clock_tree.sys_clk_hz);
-    }
-
-    /// Restore virtual time after a watchdog warm reset. The external
-    /// module state remains attached, so elapsed time must not jump back to
-    /// zero merely because the MCU reset domain did.
-    pub(crate) fn restore_virtual_time_after_reset(&mut self, ns: u64) {
-        self.virtual_time
-            .restore_after_reset(self.master_cycle, ns, self.clock_tree.sys_clk_hz);
-    }
-
-    /// Advance the shared snapshot once and deliver the resulting delta to
-    /// both I2C controllers. This is called exactly once for each peripheral
-    /// window, regardless of whether the scheduler used normal ticking or
-    /// lazy fast-forward.
-    #[inline]
-    fn advance_external_virtual_time(&mut self) {
-        let nanoseconds = self
-            .virtual_time
-            .advance_to(self.master_cycle, self.clock_tree.sys_clk_hz);
-        let delta = crate::peripherals::i2c::I2cVirtualTimeDelta { nanoseconds };
-        self.i2c0.advance_virtual_time(delta);
-        self.i2c1.advance_virtual_time(delta);
     }
 
     fn recompute_clock_tree(&mut self) {
@@ -1101,40 +721,6 @@ impl Bus {
         // mask, so a flash reload invalidates any cached entry that
         // tagged into either window.
         self.pending_invalidation_regions |= invalidation_regions::XIP;
-    }
-
-    /// Snapshot the current XIP flash image, including SSI erase/program
-    /// mutations performed by firmware during the run.
-    pub fn flash_image(&self) -> Vec<u8> {
-        self.memory.xip_image()
-    }
-
-    /// SSI flash protocol/range errors accumulated during the run.
-    pub fn flash_mutation_errors(&self) -> &[String] {
-        &self.ssi_flash.errors
-    }
-
-    /// Unknown SSI opcodes observed during the run.
-    pub fn flash_unknown_commands(&self) -> &[(u8, u32)] {
-        &self.ssi_flash.unknown_commands
-    }
-
-    /// Every SSI flash opcode observed, including commands the model does
-    /// not yet implement. Counts are bounded by opcode, not transaction.
-    pub fn flash_command_counts(&self) -> &[(u8, u32)] {
-        &self.ssi_flash.command_counts
-    }
-
-    pub fn flash_erase_count(&self) -> u64 {
-        self.ssi_flash.erase_count
-    }
-
-    pub fn flash_program_count(&self) -> u64 {
-        self.ssi_flash.program_count
-    }
-
-    pub fn flash_program_bytes(&self) -> u64 {
-        self.ssi_flash.program_bytes
     }
 
     // --- Bus-fault plumbing -----------------------------------------------
@@ -1277,38 +863,6 @@ impl Bus {
         self.uart0.drain_tx_log()
     }
 
-    /// Drain UART0 TX writes with their exact virtual bus cycles. The
-    /// byte-only accessor remains the compatibility path for reports; this
-    /// richer tap is used by the realtime preview transport.
-    pub fn drain_uart0_tx_log_with_cycles(&mut self) -> Vec<(u64, u8)> {
-        self.uart0.drain_tx_log_with_cycles()
-    }
-
-    /// Enable virtual-cycle metadata on the UART0 TX diagnostic tap. This is
-    /// preview-only and leaves the authoritative byte-only runner path
-    /// unchanged.
-    pub fn enable_uart0_tx_cycle_tap(&mut self) {
-        self.uart0.enable_wire_cycle_tap();
-    }
-
-    /// Inject one byte on the external UART0 RX wire.  This is a harness /
-    /// preview operation; ordinary guest MMIO and authoritative batch runs
-    /// remain unchanged.  The UART model applies its enable, FIFO-capacity,
-    /// IRQ and overrun semantics before returning the result.
-    pub fn inject_uart0_rx(&mut self, byte: u8) -> UartRxResult {
-        self.uart0.inject_rx(byte, &mut self.irq_pending)
-    }
-
-    /// Return the number of bytes waiting in the UART0 guest RX FIFO.
-    pub fn uart0_rx_fifo_len(&self) -> usize {
-        self.uart0.rx_fifo_len()
-    }
-
-    /// Return UART0's raw interrupt status for preview diagnostics.
-    pub fn uart0_raw_interrupt_status(&self) -> u32 {
-        self.uart0.raw_interrupt_status()
-    }
-
     #[cfg(feature = "behavior-trace")]
     pub(crate) fn drain_uart0_behavior_tx_log(&mut self) -> Vec<u8> {
         self.uart0.drain_behavior_tx_log()
@@ -1339,51 +893,6 @@ impl Bus {
     #[inline]
     pub fn dma_channel(&self, i: usize) -> &crate::dma::DmaChannel {
         self.dma.channel(i)
-    }
-
-    /// Snapshot DMA-origin writes to the PicoCalc PWM audio sink.
-    pub fn audio_sink_snapshot(&self) -> crate::AudioSinkSnapshot {
-        self.dma
-            .audio_sink_snapshot_at_clock(self.clock_tree.sys_clk_hz)
-    }
-
-    /// Snapshot DMA timer pacing and digital audio observation state.
-    pub fn dma_scheduler_snapshot(&self) -> crate::DmaSchedulerSnapshot {
-        self.dma
-            .scheduler_snapshot_at_clock(self.clock_tree.sys_clk_hz)
-    }
-
-    /// Enable optional PCM retention for a later diagnostic WAV export.
-    pub fn enable_audio_pcm_capture(&mut self) {
-        self.dma.enable_audio_pcm_capture();
-    }
-
-    /// Take the optional interleaved stereo PCM retained by the audio sink.
-    pub fn take_audio_pcm_capture(&mut self) -> Option<Vec<i16>> {
-        self.dma.take_audio_pcm_capture()
-    }
-
-    /// Enable the bounded PCM tap used by the realtime preview frontend.
-    /// This is independent of the optional whole-run diagnostic capture.
-    pub fn enable_audio_preview_tap(&mut self) {
-        self.dma.enable_audio_preview_tap();
-    }
-
-    /// Drain complete bounded preview PCM blocks without waiting for a host
-    /// audio device.  Dropped blocks are accounted for by the sink snapshot.
-    pub fn drain_audio_preview_blocks(&mut self) -> Vec<crate::AudioPreviewBlock> {
-        self.dma.drain_audio_preview_blocks()
-    }
-
-    /// Flush and drain the final partial preview block at session shutdown.
-    pub fn finish_audio_preview_blocks(&mut self) -> Vec<crate::AudioPreviewBlock> {
-        self.dma.finish_audio_preview_blocks()
-    }
-
-    /// Read bounded preview transport counters.  These values are diagnostic
-    /// status only and are intentionally excluded from exactness digests.
-    pub fn audio_preview_snapshot(&self) -> crate::AudioPreviewSnapshot {
-        self.dma.audio_preview_snapshot()
     }
 
     /// Base read latency for an address region (cycles).
@@ -1556,41 +1065,7 @@ impl Bus {
             }
             ROSC_BASE => self.rosc_regs.write32(offset, val, alias),
             IO_BANK0_BASE => self.io_bank0.write32(offset, val, alias),
-            IO_QSPI_BASE => {
-                let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
-                let new = match alias {
-                    0 => val,
-                    1 => old ^ val,
-                    2 => old | val,
-                    3 => old & !val,
-                    _ => val,
-                };
-                if offset == IO_QSPI_SS_CTRL {
-                    let old_out = old & IO_QSPI_OUTOVER_MASK;
-                    let new_out = new & IO_QSPI_OUTOVER_MASK;
-                    // ROM flash_cs_force() drives active-low CS low to
-                    // begin a command and high to commit it. End the
-                    // parser transaction on the rising edge; relying only
-                    // on SSIENR misses the SDK/bootrom path entirely.
-                    if old_out == IO_QSPI_OUTOVER_LOW && new_out == IO_QSPI_OUTOVER_HIGH {
-                        self.ssi_flash.end_transaction();
-                        self.apply_ssi_flash_mutations();
-                    }
-                }
-                self.peripheral_regs.insert(canonical, new);
-            }
             PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
-            PADS_QSPI_BASE => {
-                let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
-                let new = match alias {
-                    0 => val,
-                    1 => old ^ val,
-                    2 => old | val,
-                    3 => old & !val,
-                    _ => val,
-                };
-                self.peripheral_regs.insert(canonical, new);
-            }
             PIO0_BASE => self.pio[0].write32(pio_rp2040_to_internal(offset), val, alias),
             PIO1_BASE => self.pio[1].write32(pio_rp2040_to_internal(offset), val, alias),
             DMA_BASE => self.dma.write32(offset, val, alias),
@@ -1599,21 +1074,13 @@ impl Bus {
                 let mc = self.master_cycle;
                 self.timer.write32(offset, val, alias, mc, sys_hz);
             }
-            WATCHDOG_BASE => {
-                if self.watchdog_tick.write32(offset, val, alias) {
-                    self.watchdog_reset_requested = true;
-                }
-            }
-            UART0_BASE => {
-                self.uart0.set_wire_cycle(self.master_cycle);
-                self.uart0
-                    .write32(offset, val, alias, &mut self.irq_pending);
-            }
-            UART1_BASE => {
-                self.uart1.set_wire_cycle(self.master_cycle);
-                self.uart1
-                    .write32(offset, val, alias, &mut self.irq_pending);
-            }
+            WATCHDOG_BASE => self.watchdog_tick.write32(offset, val, alias),
+            UART0_BASE => self
+                .uart0
+                .write32(offset, val, alias, &mut self.irq_pending),
+            UART1_BASE => self
+                .uart1
+                .write32(offset, val, alias, &mut self.irq_pending),
             SPI0_BASE => self.spi0.write32(offset, val, alias, &mut self.irq_pending),
             SPI1_BASE => self.spi1.write32(offset, val, alias, &mut self.irq_pending),
             I2C0_BASE => self.i2c0.write32(offset, val, alias, &mut self.irq_pending),
@@ -1692,76 +1159,12 @@ impl Bus {
             SSI_SSIENR => {
                 if val & 1 == 0 {
                     self.ssi_flash.end_transaction();
-                    self.apply_ssi_flash_mutations();
                 }
                 self.ssi_regs.insert(offset, val);
             }
-            SSI_DR0 => {
-                self.ssi_flash.push_tx(val as u8);
-                // A transaction normally commits at SSIENR=0.  Applying
-                // here as well keeps the model correct for firmware that
-                // leaves the controller enabled between commands.
-                self.apply_ssi_flash_mutations();
-            }
+            SSI_DR0 => self.ssi_flash.push_tx(val as u8),
             _ => {
                 self.ssi_regs.insert(offset, val);
-            }
-        }
-    }
-
-    /// Apply completed SSI NOR operations to the executable XIP image.
-    /// The SSI parser deliberately emits operations instead of borrowing
-    /// `Memory`, so the bus can update XIP and invalidate decode caches at
-    /// one well-defined boundary.
-    fn apply_ssi_flash_mutations(&mut self) {
-        use ssi_flash::FlashMutation;
-
-        let mutations = self.ssi_flash.take_mutations();
-        for mutation in mutations {
-            match mutation {
-                FlashMutation::Erase { offset, len } => {
-                    let start = offset as usize;
-                    let erase_len = if len == 0 {
-                        self.memory.flash_size().saturating_sub(start)
-                    } else {
-                        len as usize
-                    };
-                    if !self.memory.xip_erase(start, erase_len) {
-                        self.ssi_flash.errors.push(format!(
-                            "erase_out_of_range:offset=0x{offset:08x}:len=0x{len:08x}"
-                        ));
-                    } else {
-                        self.pending_invalidation_regions |= invalidation_regions::XIP;
-                    }
-                }
-                FlashMutation::Program { offset, data } => {
-                    let start = offset as usize;
-                    let Some(end) = start.checked_add(data.len()) else {
-                        self.ssi_flash.errors.push("program_range_overflow".into());
-                        continue;
-                    };
-                    if end > self.memory.flash_size() {
-                        self.ssi_flash.errors.push(format!(
-                            "program_out_of_range:offset=0x{offset:08x}:len=0x{:x}",
-                            data.len()
-                        ));
-                        continue;
-                    }
-                    for (index, requested) in data.into_iter().enumerate() {
-                        let address = start + index;
-                        let current = self.memory.xip_byte(address).unwrap_or(0);
-                        // NOR programming cannot change a zero back to one.
-                        // Do not silently accept a firmware bug: retain the
-                        // physical AND result but record a fail-closed error.
-                        if (requested & !current) != 0 {
-                            self.ssi_flash.errors.push(format!(
-                                "program_attempted_0_to_1:offset=0x{address:08x}:old=0x{current:02x}:requested=0x{requested:02x}"
-                            ));
-                        }
-                        let _ = self.memory.xip_program_byte(address, requested);
-                    }
-                    self.pending_invalidation_regions |= invalidation_regions::XIP;
-                }
             }
         }
     }
@@ -1845,14 +1248,8 @@ impl Bus {
             return;
         }
         match base {
-            UART0_BASE => {
-                self.uart0.set_wire_cycle(self.master_cycle);
-                self.uart0.write8(offset, val, &mut self.irq_pending);
-            }
-            UART1_BASE => {
-                self.uart1.set_wire_cycle(self.master_cycle);
-                self.uart1.write8(offset, val, &mut self.irq_pending);
-            }
+            UART0_BASE => self.uart0.write8(offset, val, &mut self.irq_pending),
+            UART1_BASE => self.uart1.write8(offset, val, &mut self.irq_pending),
             SPI0_BASE => self.spi0.write8(offset, val, &mut self.irq_pending),
             SPI1_BASE => self.spi1.write8(offset, val, &mut self.irq_pending),
             I2C0_BASE => self.i2c0.write8(offset, val, &mut self.irq_pending),
@@ -1871,14 +1268,8 @@ impl Bus {
         match base {
             SPI0_BASE => self.spi0.write16(offset, val, &mut self.irq_pending),
             SPI1_BASE => self.spi1.write16(offset, val, &mut self.irq_pending),
-            UART0_BASE => {
-                self.uart0.set_wire_cycle(self.master_cycle);
-                self.uart0.write8(offset, val as u8, &mut self.irq_pending);
-            }
-            UART1_BASE => {
-                self.uart1.set_wire_cycle(self.master_cycle);
-                self.uart1.write8(offset, val as u8, &mut self.irq_pending);
-            }
+            UART0_BASE => self.uart0.write8(offset, val as u8, &mut self.irq_pending),
+            UART1_BASE => self.uart1.write8(offset, val as u8, &mut self.irq_pending),
             I2C0_BASE => self
                 .i2c0
                 .write32(offset, val as u32, 0, &mut self.irq_pending),
@@ -1896,8 +1287,6 @@ impl Bus {
     // ======================================================================
 
     pub fn read8(&mut self, addr: u32) -> u8 {
-        #[cfg(feature = "event-horizon-profiler")]
-        self.note_running_cpu_access(addr, true);
         let region = addr >> 28;
         self.last_access_cycles = Self::read_latency(region);
         let val = match region {
@@ -1953,8 +1342,6 @@ impl Bus {
     }
 
     pub fn read16(&mut self, addr: u32) -> u16 {
-        #[cfg(feature = "event-horizon-profiler")]
-        self.note_running_cpu_access(addr, true);
         let region = addr >> 28;
         self.last_access_cycles = Self::read_latency(region);
         let val = match region {
@@ -2013,8 +1400,6 @@ impl Bus {
     }
 
     pub fn read32(&mut self, addr: u32) -> u32 {
-        #[cfg(feature = "event-horizon-profiler")]
-        self.note_running_cpu_access(addr, true);
         let region = addr >> 28;
         self.last_access_cycles = Self::read_latency(region);
         let val = match region {
@@ -2055,8 +1440,6 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, val: u8) {
-        #[cfg(feature = "event-horizon-profiler")]
-        self.note_running_cpu_access(addr, false);
         if self.mmio_trace_enabled {
             self.emit_mmio_trace('W', 1, addr, val as u32);
         }
@@ -2160,8 +1543,6 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, val: u16) {
-        #[cfg(feature = "event-horizon-profiler")]
-        self.note_running_cpu_access(addr, false);
         if self.mmio_trace_enabled {
             self.emit_mmio_trace('W', 2, addr, val as u32);
         }
@@ -2257,8 +1638,6 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, val: u32) {
-        #[cfg(feature = "event-horizon-profiler")]
-        self.note_running_cpu_access(addr, false);
         if self.mmio_trace_enabled {
             self.emit_mmio_trace('W', 4, addr, val);
         }
@@ -2457,15 +1836,13 @@ impl Bus {
 
     fn sio_read32(&mut self, addr: u32) -> u32 {
         let offset = addr & 0xFFF;
-        let value = match offset {
+        match offset {
             0x004 => self.gpio_in,
             _ => {
                 let core = self.active_core;
                 self.sio.read32(offset, core)
             }
-        };
-        self.refresh_sio_fifo_irqs();
-        value
+        }
     }
 
     fn sio_write32(&mut self, addr: u32, val: u32) {
@@ -2474,21 +1851,6 @@ impl Bus {
         self.sio.write32(offset, val, core);
         if let Some(receiver) = self.sio.pending_fifo_event.take() {
             self.event_flag[receiver] = true;
-        }
-        self.refresh_sio_fifo_irqs();
-    }
-
-    /// Project the two core-local, level-sensitive SIO FIFO interrupt lines
-    /// into their matching NVICs. These lines must not use `irq_pending`,
-    /// because that shared-peripheral path broadcasts every bit to both
-    /// cores; `SIO_IRQ_PROC0` belongs only to core 0 and `SIO_IRQ_PROC1`
-    /// only to core 1.
-    pub(crate) fn refresh_sio_fifo_irqs(&mut self) {
-        if self.sio.fifo_irq_asserted(0) {
-            self.nvics[0].set_pending(IRQ_SIO_IRQ_PROC0 as u8);
-        }
-        if self.sio.fifo_irq_asserted(1) {
-            self.nvics[1].set_pending(IRQ_SIO_IRQ_PROC1 as u8);
         }
     }
 
@@ -2561,21 +1923,6 @@ impl Bus {
         match instance {
             0 => Ok(self.i2c0.attach_device(device)),
             1 => Ok(self.i2c1.attach_device(device)),
-            other => Err(other),
-        }
-    }
-
-    /// Attach an explicitly configured I2C profile and disable the legacy
-    /// synthetic ACK fallback for that controller. Profile builders use
-    /// this entry point so unclaimed addresses remain NACKed.
-    pub fn attach_i2c_device_exclusive(
-        &mut self,
-        instance: usize,
-        device: Box<dyn crate::peripherals::i2c::I2cExternalDevice>,
-    ) -> Result<Option<Box<dyn crate::peripherals::i2c::I2cExternalDevice>>, usize> {
-        match instance {
-            0 => Ok(self.i2c0.attach_device_exclusive(device)),
-            1 => Ok(self.i2c1.attach_device_exclusive(device)),
             other => Err(other),
         }
     }
@@ -2800,15 +2147,7 @@ impl Bus {
     /// tail of [`Self::tick_peripherals`].
     pub fn tick_dma(&mut self) {
         let mut dma = std::mem::take(&mut self.dma);
-        dma.tick(self, 1);
-        dma.route_irqs(&mut self.irq_pending);
-        self.dma = dma;
-    }
-
-    /// Drive DMA for an arbitrary number of sysclks.
-    pub fn tick_dma_with_cycles(&mut self, cycles: u32) {
-        let mut dma = std::mem::take(&mut self.dma);
-        dma.tick(self, cycles);
+        dma.tick(self);
         dma.route_irqs(&mut self.irq_pending);
         self.dma = dma;
     }
@@ -2864,11 +2203,6 @@ impl Bus {
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
         self.i2c1
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
-        // External I2C devices consume the same shared virtual-time
-        // snapshot as the harness. This is deliberately one call per
-        // peripheral window; lazy scheduled advance below is the other,
-        // mutually exclusive path.
-        self.advance_external_virtual_time();
         // ADC: fixed-point clk_adc accumulator advances via tick.
         self.adc
             .tick(cycles, &self.clock_tree, &mut self.irq_pending);
@@ -2878,7 +2212,7 @@ impl Bus {
         // DMA ticks LAST per HLD V7 §5.6 ordering contract — peripherals
         // produce DREQ on this cycle, DMA snapshots + consumes. Stays
         // once per quantum; mirrors RP2350.
-        self.tick_dma_with_cycles(cycles);
+        self.tick_dma();
     }
 
     /// Fast-path lazy-schedule advance (HLD V7 §5.5).
@@ -2897,7 +2231,6 @@ impl Bus {
             .timer
             .poll_alarms(self.master_cycle, self.clock_tree.sys_clk_hz);
         self.irq_pending |= nvic_bits & 0xF;
-        self.advance_external_virtual_time();
     }
 
     /// Soonest scheduled lazy IRQ deadline (master-cycle space) across
@@ -2973,18 +2306,6 @@ impl CoreBus for Bus {
     }
 
     #[inline(always)]
-    fn set_active_pc_for_instruction(&mut self, pc: u32) {
-        #[cfg(feature = "diagnostic-pc-compile-out-prototype")]
-        {
-            let _ = pc;
-        }
-        #[cfg(not(feature = "diagnostic-pc-compile-out-prototype"))]
-        {
-            Bus::set_active_pc(self, pc);
-        }
-    }
-
-    #[inline(always)]
     fn bus_fault(&self) -> bool {
         Bus::bus_fault(self)
     }
@@ -3048,89 +2369,11 @@ impl CoreBus for Bus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    struct TimeProbe {
-        deltas: Arc<Mutex<Vec<u64>>>,
-    }
-
-    impl crate::peripherals::i2c::I2cExternalDevice for TimeProbe {
-        fn responds_to(&self, addr: u16) -> bool {
-            addr == 0x68
-        }
-
-        fn write_byte(&mut self, _byte: u8) -> bool {
-            true
-        }
-
-        fn read_byte(&mut self) -> u8 {
-            0
-        }
-
-        fn transaction_end(&mut self) {}
-
-        fn advance_virtual_time(&mut self, delta: crate::peripherals::i2c::I2cVirtualTimeDelta) {
-            self.deltas
-                .lock()
-                .expect("time probe lock")
-                .push(delta.nanoseconds);
-        }
-    }
-
-    #[cfg(feature = "event-horizon-profiler")]
-    #[test]
-    fn running_profiler_classifies_cpu_visible_accesses_without_memory_noise() {
-        use crate::running_profile::RunningBoundaryMask as M;
-
-        let mut bus = Bus::new();
-        bus.reset_running_cpu_boundaries();
-        let _ = bus.read32(0x2000_0000);
-        assert_eq!(bus.take_running_cpu_boundaries().bits(), 0);
-
-        bus.reset_running_cpu_boundaries();
-        let _ = bus.read32(SIO_BASE + 0x004);
-        let gpio = bus.take_running_cpu_boundaries();
-        assert!(gpio.contains(M::CPU_MMIO));
-        assert!(gpio.contains(M::GPIO_IN));
-
-        bus.reset_running_cpu_boundaries();
-        bus.write32(DMA_BASE, 0);
-        let dma = bus.take_running_cpu_boundaries();
-        assert!(dma.contains(M::CPU_MMIO));
-        assert!(dma.contains(M::FIFO_DREQ));
-    }
 
     #[test]
     fn new_bus_all_peripherals_in_reset() {
         let bus = Bus::new();
         assert_eq!(bus.resets.state, resets::RESET_MASK);
-    }
-
-    #[test]
-    fn external_i2c_devices_receive_one_shared_delta_per_window() {
-        let mut bus = Bus::new();
-        bus.seed_sys_clk_hz(100_000_000);
-        let deltas = Arc::new(Mutex::new(Vec::new()));
-        bus.attach_i2c_device_exclusive(
-            1,
-            Box::new(TimeProbe {
-                deltas: Arc::clone(&deltas),
-            }),
-        )
-        .expect("I2C1 exists");
-
-        bus.master_cycle = 100;
-        bus.tick_peripherals(100);
-        // Calling the private helper a second time for the same absolute
-        // cycle must not double-advance the child.
-        bus.advance_external_virtual_time();
-        bus.advance_lazy_scheduled(100);
-
-        assert_eq!(
-            *deltas.lock().expect("time probe lock"),
-            vec![1_000, 1_000],
-            "100 cycles at 100 MHz must be delivered once per window"
-        );
     }
 
     #[test]
@@ -3220,31 +2463,6 @@ mod tests {
     }
 
     #[test]
-    fn sio_fifo_irq_routes_only_to_receiving_core_and_reasserts() {
-        let mut bus = Bus::new();
-        bus.sio.set_handshake_armed(false);
-
-        bus.set_active_core(0);
-        bus.write32(SIO_BASE + 0x054, 0xCAFE_BABE);
-        assert!(!bus.nvics[0].is_pending(IRQ_SIO_IRQ_PROC0 as u8));
-        assert!(!bus.nvics[0].is_pending(IRQ_SIO_IRQ_PROC1 as u8));
-        assert!(bus.nvics[1].is_pending(IRQ_SIO_IRQ_PROC1 as u8));
-
-        bus.nvics[1].clear_pending(IRQ_SIO_IRQ_PROC1 as u8);
-        bus.refresh_sio_fifo_irqs();
-        assert!(
-            bus.nvics[1].is_pending(IRQ_SIO_IRQ_PROC1 as u8),
-            "a still-readable FIFO must reassert its level IRQ"
-        );
-
-        bus.set_active_core(1);
-        assert_eq!(bus.read32(SIO_BASE + 0x058), 0xCAFE_BABE);
-        bus.nvics[1].clear_pending(IRQ_SIO_IRQ_PROC1 as u8);
-        bus.refresh_sio_fifo_irqs();
-        assert!(!bus.nvics[1].is_pending(IRQ_SIO_IRQ_PROC1 as u8));
-    }
-
-    #[test]
     fn gpio_in_is_owned_by_bus() {
         let mut bus = Bus::new();
         bus.gpio_in = 0x42;
@@ -3272,47 +2490,6 @@ mod tests {
         assert_eq!(bus.read8(0x1000_0000), 0xAA);
         assert_eq!(bus.read8(0x1000_0003), 0xDD);
         assert_eq!(bus.read16(0x1000_0002), 0xDDCC);
-    }
-
-    #[test]
-    fn ssi_erase_program_mutates_xip_and_records_zero_to_one() {
-        let mut bus = Bus::new();
-        bus.load_flash(&[0x00; 0x2000]);
-        let tx = |bus: &mut Bus, bytes: &[u8]| {
-            bus.write32(SSI_BASE + SSI_SSIENR, 1);
-            for &byte in bytes {
-                bus.write32(SSI_BASE + SSI_DR0, u32::from(byte));
-                let _ = bus.read32(SSI_BASE + SSI_DR0);
-            }
-            bus.write32(SSI_BASE + SSI_SSIENR, 0);
-        };
-
-        tx(&mut bus, &[0x06]); // WREN
-        tx(&mut bus, &[0x20, 0x00, 0x00, 0x00]); // sector erase
-        assert_eq!(bus.read8(0x1000_0000), 0xFF);
-        assert!(
-            bus.flash_mutation_errors().is_empty(),
-            "errors: {:?}",
-            bus.flash_mutation_errors()
-        );
-
-        tx(&mut bus, &[0x06]);
-        tx(&mut bus, &[0x02, 0x00, 0x00, 0x00, 0xA5]);
-        assert_eq!(bus.read8(0x1000_0000), 0xA5);
-        assert!(
-            bus.flash_mutation_errors().is_empty(),
-            "errors: {:?}",
-            bus.flash_mutation_errors()
-        );
-
-        tx(&mut bus, &[0x06]);
-        tx(&mut bus, &[0x02, 0x00, 0x00, 0x00, 0xFF]);
-        assert_eq!(bus.read8(0x1000_0000), 0xA5);
-        assert!(
-            bus.flash_mutation_errors()
-                .iter()
-                .any(|error| error.starts_with("program_attempted_0_to_1"))
-        );
     }
 
     #[test]
@@ -3514,21 +2691,6 @@ mod tests {
         bus.write32(0x2000_0200, 0xCAFE_F00D);
         let _ = bus.read32(0x2000_0200);
         assert!(capture.0.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn instruction_pc_publication_respects_opt4d_boundary() {
-        use crate::core::CoreBus;
-
-        let mut bus = Bus::new();
-        bus.set_active_core(0);
-        bus.set_active_pc(0x1111_0000);
-        CoreBus::set_active_pc_for_instruction(&mut bus, 0x2222_0000);
-
-        #[cfg(not(feature = "diagnostic-pc-compile-out-prototype"))]
-        assert_eq!(bus.active_pc[0], 0x2222_0000);
-        #[cfg(feature = "diagnostic-pc-compile-out-prototype")]
-        assert_eq!(bus.active_pc[0], 0x1111_0000);
     }
 
     #[test]

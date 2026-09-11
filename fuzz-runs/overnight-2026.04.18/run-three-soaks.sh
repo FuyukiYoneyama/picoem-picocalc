@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 BIN="./silicon-soak.220248.exe"
-PROBE="${RP2354_PROBE:?set RP2354_PROBE to your RP2354 probe VID:PID:SERIAL}"
+PROBE="2e8a:000c:E46410955F614129"
 SEED=5831149830256
 DUR=10m
 

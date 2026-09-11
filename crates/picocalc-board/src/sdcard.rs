@@ -20,28 +20,18 @@
 //! Command framing follows the driver's own shape: six bytes (`0x40 |
 //! index`, four argument bytes, CRC), then the card holds MISO high for
 //! a few bytes before answering. R1 is one byte; R3 and R7 add four
-//! trailing bytes. CMD0 and CMD8 command CRCs are checked even while
-//! general SPI-mode CRC is disabled, as required by the SD protocol.
-//! Data blocks arrive after a `0xFE` token and end with two CRC bytes the
-//! model accepts and ignores, because the driver never enables general
-//! CRC checking.
+//! trailing bytes. Data blocks arrive after a `0xFE` token and end with
+//! two CRC bytes the model accepts and ignores, because SPI mode leaves
+//! CRC off by default and the driver never turns it on.
 //!
 //! # What is not modelled
 //!
 //! No card-removal or write-protect behaviour, no CSD/CID registers
-//! beyond what bring-up reads. The production build includes the SD-GEN-1
-//! multi-block transfer states (CMD18/CMD12/CMD23/CMD25); the pre-P4
-//! single-block boundary remains available only with
-//! `--no-default-features` for differential tests. Busy timing is still
-//! deterministic rather than wall-clock based: writes expose the explicit
-//! modelled busy state and complete without an analogue programming delay.
-
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-
-use crate::sha256::StreamingSha256;
+//! beyond what bring-up reads, no multi-block transfer (CMD18/CMD25),
+//! and no busy timing: writes complete immediately rather than holding
+//! MISO low for a programming delay. Nothing in the conformance track
+//! exercises those, and a half-modelled busy state would be harder to
+//! reason about than its absence.
 
 /// Bytes per block. SDHC addresses in blocks, not bytes.
 pub const BLOCK_SIZE: usize = 512;
@@ -87,23 +77,10 @@ impl std::str::FromStr for SdFormat {
     }
 }
 
-/// Stable, path-free metadata for a RAW-backed card. The source path is
-/// intentionally omitted so callers can report provenance without leaking
-/// host-specific absolute paths.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RawMetadata {
-    pub bytes: u64,
-    pub blocks: usize,
-    pub dirty_blocks: usize,
-    pub source_sha256: String,
-}
-
 /// Idle byte. The card leaves MISO high when it has nothing to say.
 const IDLE: u8 = 0xFF;
 /// R1 bit 0: the card is in idle state (still initialising).
 const R1_IDLE: u8 = 0x01;
-/// R1 bit 3: the received command frame failed its mandatory CRC check.
-const R1_COM_CRC_ERROR: u8 = 0x08;
 /// R1 with no bits set: ready.
 const R1_READY: u8 = 0x00;
 /// Start token for a single block, both directions.
@@ -126,384 +103,11 @@ enum Phase {
     WriteData { taken: usize },
     /// Data taken; the acceptance token goes out on the next transfer.
     DataResponse,
-    /// A multi-block read has finished its current block. The host may
-    /// clock the next block or start CMD12 without raising CS.
-    #[cfg(feature = "sd-gen1-multiblock")]
-    MultiReadAwait { next_block: u32 },
-    /// A multi-block write is waiting for either another block token or the
-    /// stop token.
-    #[cfg(feature = "sd-gen1-multiblock")]
-    MultiWriteAwaitToken { block: u32 },
-    /// Taking the 512-byte payload and two CRC bytes of a multi-block write.
-    #[cfg(feature = "sd-gen1-multiblock")]
-    MultiWriteData { block: u32, taken: usize },
-    /// The data-response token is returned one transfer after the CRC.
-    #[cfg(feature = "sd-gen1-multiblock")]
-    MultiWriteDataResponse { next_block: u32 },
-    /// A bounded busy interval follows each accepted multi-block write.
-    #[cfg(feature = "sd-gen1-multiblock")]
-    MultiWriteBusy { next_block: u32 },
-}
-
-/// Schema version for the diagnostic SD protocol trace.  This is separate
-/// from the runner report schema because a trace is an optional observation
-/// artifact, not an acceptance input.
-pub const SD_TRACE_SCHEMA_VERSION: u32 = 1;
-const SD_TRACE_PREVIEW_LIMIT: usize = 4096;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SdTraceDirection {
-    Read,
-    Write,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SdTraceData {
-    pub direction: SdTraceDirection,
-    pub block: u32,
-    pub token: u8,
-    pub length: usize,
-    pub crc: [u8; 2],
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SdTraceEvent {
-    Command {
-        sequence: u64,
-        cs_epoch: u64,
-        transfers: u64,
-        index: u8,
-        argument: u32,
-        crc: u8,
-        crc_valid: bool,
-        response: Vec<u8>,
-        data: Option<SdTraceData>,
-    },
-    BlockData {
-        sequence: u64,
-        cs_epoch: u64,
-        transfers: u64,
-        data: SdTraceData,
-    },
-    Deselect {
-        sequence: u64,
-        cs_epoch: u64,
-        transfers: u64,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SdTraceSnapshot {
-    pub schema_version: u32,
-    pub event_count: u64,
-    pub digest_sha256: String,
-    pub preview_truncated: bool,
-    pub preview: Vec<SdTraceEvent>,
-}
-
-#[derive(Clone)]
-struct SdTraceState {
-    digest: StreamingSha256,
-    event_count: u64,
-    preview: Vec<SdTraceEvent>,
-    preview_truncated: bool,
-    cs_epoch: u64,
-    cs_active: bool,
-    transfers: u64,
-}
-
-impl SdTraceState {
-    fn new() -> Self {
-        Self {
-            digest: StreamingSha256::new(),
-            event_count: 0,
-            preview: Vec::new(),
-            preview_truncated: false,
-            cs_epoch: 0,
-            cs_active: false,
-            transfers: 0,
-        }
-    }
-
-    fn select(&mut self) {
-        if !self.cs_active {
-            self.cs_epoch = self.cs_epoch.saturating_add(1);
-            self.cs_active = true;
-            self.transfers = 0;
-        }
-    }
-
-    fn transfer(&mut self) {
-        // Unit tests can exercise the card without the wire's pin callbacks.
-        // Treat their first byte as an implicit CS-low edge so the trace is
-        // still self-contained and deterministic.
-        self.select();
-        self.transfers = self.transfers.saturating_add(1);
-    }
-
-    fn record(&mut self, event: SdTraceEvent) {
-        let mut canonical = Vec::with_capacity(96);
-        match &event {
-            SdTraceEvent::Command {
-                sequence,
-                cs_epoch,
-                transfers,
-                index,
-                argument,
-                crc,
-                crc_valid,
-                response,
-                data,
-            } => {
-                canonical.push(1);
-                canonical.extend_from_slice(&sequence.to_be_bytes());
-                canonical.extend_from_slice(&cs_epoch.to_be_bytes());
-                canonical.extend_from_slice(&transfers.to_be_bytes());
-                canonical.push(*index);
-                canonical.extend_from_slice(&argument.to_be_bytes());
-                canonical.push(*crc);
-                canonical.push(u8::from(*crc_valid));
-                canonical.extend_from_slice(&(response.len() as u32).to_be_bytes());
-                canonical.extend_from_slice(response);
-                match data {
-                    Some(data) => {
-                        canonical.push(1);
-                        canonical.push(match data.direction {
-                            SdTraceDirection::Read => 0,
-                            SdTraceDirection::Write => 1,
-                        });
-                        canonical.extend_from_slice(&data.block.to_be_bytes());
-                        canonical.push(data.token);
-                        canonical.extend_from_slice(&(data.length as u64).to_be_bytes());
-                        canonical.extend_from_slice(&data.crc);
-                    }
-                    None => canonical.push(0),
-                }
-            }
-            SdTraceEvent::Deselect {
-                sequence,
-                cs_epoch,
-                transfers,
-            } => {
-                canonical.push(2);
-                canonical.extend_from_slice(&sequence.to_be_bytes());
-                canonical.extend_from_slice(&cs_epoch.to_be_bytes());
-                canonical.extend_from_slice(&transfers.to_be_bytes());
-            }
-            SdTraceEvent::BlockData {
-                sequence,
-                cs_epoch,
-                transfers,
-                data,
-            } => {
-                canonical.push(3);
-                canonical.extend_from_slice(&sequence.to_be_bytes());
-                canonical.extend_from_slice(&cs_epoch.to_be_bytes());
-                canonical.extend_from_slice(&transfers.to_be_bytes());
-                canonical.push(match data.direction {
-                    SdTraceDirection::Read => 0,
-                    SdTraceDirection::Write => 1,
-                });
-                canonical.extend_from_slice(&data.block.to_be_bytes());
-                canonical.push(data.token);
-                canonical.extend_from_slice(&(data.length as u64).to_be_bytes());
-                canonical.extend_from_slice(&data.crc);
-            }
-        }
-        self.digest.update(&canonical);
-        self.event_count = self.event_count.saturating_add(1);
-        if self.preview.len() < SD_TRACE_PREVIEW_LIMIT {
-            self.preview.push(event);
-        } else {
-            self.preview_truncated = true;
-        }
-    }
-
-    fn command(
-        &mut self,
-        index: u8,
-        argument: u32,
-        crc: u8,
-        crc_valid: bool,
-        response: Vec<u8>,
-        data: Option<SdTraceData>,
-    ) {
-        self.select();
-        let sequence = self.event_count;
-        self.record(SdTraceEvent::Command {
-            sequence,
-            cs_epoch: self.cs_epoch,
-            transfers: self.transfers,
-            index,
-            argument,
-            crc,
-            crc_valid,
-            response,
-            data,
-        });
-    }
-
-    fn deselect(&mut self) {
-        if !self.cs_active {
-            return;
-        }
-        let sequence = self.event_count;
-        self.record(SdTraceEvent::Deselect {
-            sequence,
-            cs_epoch: self.cs_epoch,
-            transfers: self.transfers,
-        });
-        self.cs_active = false;
-        self.transfers = 0;
-    }
-
-    fn snapshot(&self) -> SdTraceSnapshot {
-        SdTraceSnapshot {
-            schema_version: SD_TRACE_SCHEMA_VERSION,
-            event_count: self.event_count,
-            digest_sha256: self.digest.finalize_hex(),
-            preview_truncated: self.preview_truncated,
-            preview: self.preview.clone(),
-        }
-    }
-}
-
-struct RawBacking {
-    file: File,
-    source_path: PathBuf,
-    source_sha256: String,
-    block_count: usize,
-    /// Only sectors written by the emulated card are kept here. The input
-    /// file remains read-only and is never changed by a run.
-    overlay: HashMap<usize, Box<[u8; BLOCK_SIZE]>>,
-}
-
-impl RawBacking {
-    fn open(path: &Path) -> io::Result<Self> {
-        let mut file = File::open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SD RAW backing must be a regular file",
-            ));
-        }
-        let length = metadata.len();
-        if length == 0 || length % BLOCK_SIZE as u64 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SD RAW image must be non-empty and a multiple of 512 bytes",
-            ));
-        }
-        let block_count = usize::try_from(length / BLOCK_SIZE as u64).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SD RAW image is too large for this host",
-            )
-        })?;
-        let source_sha256 = crate::sha256::sha256_reader_hex(&mut file)?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(Self {
-            file,
-            source_path: std::fs::canonicalize(path)?,
-            block_count,
-            source_sha256,
-            overlay: HashMap::new(),
-        })
-    }
-
-    fn read_sector(&mut self, block: usize) -> io::Result<[u8; BLOCK_SIZE]> {
-        if let Some(sector) = self.overlay.get(&block) {
-            return Ok(**sector);
-        }
-        let offset = (block as u64)
-            .checked_mul(BLOCK_SIZE as u64)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "SD block offset overflow")
-            })?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut sector = [0u8; BLOCK_SIZE];
-        self.file.read_exact(&mut sector)?;
-        Ok(sector)
-    }
-
-    fn write_sector(&mut self, block: usize, data: &[u8]) -> io::Result<()> {
-        if block >= self.block_count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SD block is outside the RAW image",
-            ));
-        }
-        if data.len() != BLOCK_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SD sector writes must be exactly 512 bytes",
-            ));
-        }
-        let mut sector = [0u8; BLOCK_SIZE];
-        sector.copy_from_slice(data);
-        self.overlay.insert(block, Box::new(sector));
-        Ok(())
-    }
-
-    fn export_raw(&mut self, output: &Path) -> io::Result<()> {
-        // `output` is normally a new path, so canonicalize its existing
-        // parent as well as an already-existing file.  Comparing only
-        // `canonicalize(output)` misses alternate spellings when the final
-        // component does not exist yet, and could let a same-file export
-        // bypass the policy check.  Reject symlink output paths explicitly;
-        // the export is an atomic rename, never a write through a link.
-        if let Ok(metadata) = std::fs::symlink_metadata(output)
-            && metadata.file_type().is_symlink()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SD RAW output must not be a symlink",
-            ));
-        }
-        let output_canonical = if output.exists() {
-            std::fs::canonicalize(output)
-        } else {
-            let parent = output.parent().unwrap_or_else(|| Path::new("."));
-            let name = output.file_name().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "SD RAW output must name a file",
-                )
-            })?;
-            std::fs::canonicalize(parent).map(|parent| parent.join(name))
-        };
-        if matches!(
-            output_canonical.as_deref(),
-            Ok(path) if path == self.source_path.as_path()
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SD RAW input and output must be different files",
-            ));
-        }
-        let temporary =
-            output.with_extension(format!("tmp-{}-{}", std::process::id(), self.overlay.len()));
-        let mut sink = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temporary)?;
-        for block in 0..self.block_count {
-            let sector = self.read_sector(block)?;
-            sink.write_all(&sector)?;
-        }
-        sink.flush()?;
-        sink.sync_all()?;
-        std::fs::rename(&temporary, output)?;
-        Ok(())
-    }
 }
 
 /// SD card in SPI mode.
 pub struct SdCard {
     blocks: Vec<u8>,
-    raw: Option<RawBacking>,
     format: SdFormat,
     phase: Phase,
     /// Argument bytes of the command being assembled.
@@ -524,9 +128,6 @@ pub struct SdCard {
     write_pending: bool,
     /// Buffer for the block being written.
     write_buf: Vec<u8>,
-    /// CRC bytes supplied after a block-write payload.  General CRC is not
-    /// validated by this model, but the trace records the wire values.
-    write_crc: [u8; 2],
 
     // --- observation counters ---
     pub commands_seen: u64,
@@ -534,21 +135,6 @@ pub struct SdCard {
     pub blocks_written: u64,
     /// Commands this model does not implement, with their counts.
     pub unknown_commands: Vec<(u8, u32)>,
-    /// Protocol violations observed by the experimental multi-block model.
-    /// This is the protocol diagnostic state exposed by the production
-    /// multi-block feature. The legacy single-block build returns an empty
-    /// slice and remains available with `--no-default-features`.
-    #[cfg(feature = "sd-gen1-multiblock")]
-    pub protocol_errors: Vec<String>,
-    #[cfg(feature = "sd-gen1-multiblock")]
-    multi_write_expected: Option<u32>,
-    #[cfg(feature = "sd-gen1-multiblock")]
-    multi_write_start_pending: Option<u32>,
-    #[cfg(feature = "sd-gen1-multiblock")]
-    multi_write_blocks_done: u32,
-    #[cfg(feature = "sd-gen1-multiblock")]
-    multi_read_next_block: Option<u32>,
-    trace: Option<SdTraceState>,
 }
 
 impl Default for SdCard {
@@ -567,7 +153,6 @@ impl SdCard {
     pub fn new_with_format(block_count: usize, format: SdFormat) -> Self {
         let mut card = Self {
             blocks: vec![0u8; block_count * BLOCK_SIZE],
-            raw: None,
             format,
             phase: Phase::Idle,
             arg: [0; 4],
@@ -580,22 +165,10 @@ impl SdCard {
             write_block: 0,
             write_pending: false,
             write_buf: Vec::with_capacity(BLOCK_SIZE),
-            write_crc: [0; 2],
             commands_seen: 0,
             blocks_read: 0,
             blocks_written: 0,
             unknown_commands: Vec::new(),
-            #[cfg(feature = "sd-gen1-multiblock")]
-            protocol_errors: Vec::new(),
-            #[cfg(feature = "sd-gen1-multiblock")]
-            multi_write_expected: None,
-            #[cfg(feature = "sd-gen1-multiblock")]
-            multi_write_start_pending: None,
-            #[cfg(feature = "sd-gen1-multiblock")]
-            multi_write_blocks_done: 0,
-            #[cfg(feature = "sd-gen1-multiblock")]
-            multi_read_next_block: None,
-            trace: None,
         };
         match format {
             SdFormat::Fat16 => card.format_fat16(),
@@ -604,109 +177,9 @@ impl SdCard {
         card
     }
 
-    /// Open a non-empty, 512-byte-aligned RAW image as a read-only card
-    /// backing. Writes are kept in a sector-sized copy-on-write overlay.
-    /// The default format label is FAT32 for compatibility with the normal
-    /// in-memory card; the RAW bytes themselves are not reformatted.
-    pub fn from_raw_file(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::from_raw_file_with_format(path, SdFormat::default())
-    }
-
-    /// Open a RAW image and retain an explicit format label for reports.
-    /// The selected format does not modify or validate the image contents.
-    pub fn from_raw_file_with_format(path: impl AsRef<Path>, format: SdFormat) -> io::Result<Self> {
-        let raw = RawBacking::open(path.as_ref())?;
-        Ok(Self {
-            blocks: Vec::new(),
-            raw: Some(raw),
-            format,
-            phase: Phase::Idle,
-            arg: [0; 4],
-            reply: std::collections::VecDeque::new(),
-            app_cmd_pending: false,
-            initialised: false,
-            acmd41_busy_left: 2,
-            write_block: 0,
-            write_pending: false,
-            write_buf: Vec::with_capacity(BLOCK_SIZE),
-            write_crc: [0; 2],
-            commands_seen: 0,
-            blocks_read: 0,
-            blocks_written: 0,
-            unknown_commands: Vec::new(),
-            #[cfg(feature = "sd-gen1-multiblock")]
-            protocol_errors: Vec::new(),
-            #[cfg(feature = "sd-gen1-multiblock")]
-            multi_write_expected: None,
-            #[cfg(feature = "sd-gen1-multiblock")]
-            multi_write_start_pending: None,
-            #[cfg(feature = "sd-gen1-multiblock")]
-            multi_write_blocks_done: 0,
-            #[cfg(feature = "sd-gen1-multiblock")]
-            multi_read_next_block: None,
-            trace: None,
-        })
-    }
-
-    /// Export the complete RAW image, applying any dirty overlay sectors.
-    /// Memory-backed cards do not have an input image to export.
-    pub fn export_raw(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.raw
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "card has no RAW backing"))?
-            .export_raw(path.as_ref())
-    }
-
-    /// Return path-free RAW metadata, or `None` for the legacy in-memory
-    /// backing. Dirty blocks are the sectors currently held by the COW
-    /// overlay and have not been written to the input file.
-    pub fn raw_metadata(&self) -> Option<RawMetadata> {
-        self.raw.as_ref().map(|raw| RawMetadata {
-            bytes: (raw.block_count as u64) * BLOCK_SIZE as u64,
-            blocks: raw.block_count,
-            dirty_blocks: raw.overlay.len(),
-            source_sha256: raw.source_sha256.clone(),
-        })
-    }
-
     /// Initial filesystem profile selected for this card.
     pub const fn format(&self) -> SdFormat {
         self.format
-    }
-
-    /// Enable the bounded, structured SPI protocol trace used by the U4
-    /// loader investigation.  It is deliberately opt-in and does not alter
-    /// card replies, counters, or backing-store behaviour.
-    pub fn enable_trace(&mut self) {
-        self.trace = Some(SdTraceState::new());
-    }
-
-    /// Return the trace snapshot, if diagnostic tracing was enabled.
-    pub fn trace_snapshot(&self) -> Option<SdTraceSnapshot> {
-        self.trace.as_ref().map(SdTraceState::snapshot)
-    }
-
-    /// Protocol errors raised by the optional SD-GEN-1 multi-block model.
-    /// The default model returns an empty slice so callers can expose the
-    /// field without changing the normal report schema.
-    pub fn protocol_errors(&self) -> &[String] {
-        #[cfg(feature = "sd-gen1-multiblock")]
-        {
-            &self.protocol_errors
-        }
-        #[cfg(not(feature = "sd-gen1-multiblock"))]
-        {
-            &[]
-        }
-    }
-
-    /// Notify the card that SPI chip-select went low.  The wire calls this
-    /// on the falling edge; direct card tests may omit it because the trace
-    /// state also infers a first selection from the first transfer.
-    pub fn trace_select(&mut self) {
-        if let Some(trace) = self.trace.as_mut() {
-            trace.select();
-        }
     }
 
     /// Lay down an empty FAT16 volume.
@@ -894,61 +367,18 @@ impl SdCard {
 
     /// Capacity in blocks.
     pub fn block_count(&self) -> usize {
-        self.raw
-            .as_ref()
-            .map_or(self.blocks.len() / BLOCK_SIZE, |raw| raw.block_count)
-    }
-
-    fn read_sector(&mut self, block: usize) -> io::Result<[u8; BLOCK_SIZE]> {
-        if let Some(raw) = self.raw.as_mut() {
-            if block >= raw.block_count {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "SD block is outside the RAW image",
-                ));
-            }
-            return raw.read_sector(block);
-        }
-        let offset = block.checked_mul(BLOCK_SIZE).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "SD block offset overflow")
-        })?;
-        let end = offset.checked_add(BLOCK_SIZE).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "SD block offset overflow")
-        })?;
-        if end > self.blocks.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "SD block is outside the card",
-            ));
-        }
-        let mut sector = [0u8; BLOCK_SIZE];
-        sector.copy_from_slice(&self.blocks[offset..end]);
-        Ok(sector)
+        self.blocks.len() / BLOCK_SIZE
     }
 
     /// Chip select released: abandon whatever was in flight.
     pub fn deselect(&mut self) {
-        if let Some(trace) = self.trace.as_mut() {
-            trace.deselect();
-        }
         self.phase = Phase::Idle;
         self.reply.clear();
         self.write_buf.clear();
-        self.write_crc = [0; 2];
-        #[cfg(feature = "sd-gen1-multiblock")]
-        {
-            self.multi_read_next_block = None;
-            self.multi_write_expected = None;
-            self.multi_write_start_pending = None;
-            self.multi_write_blocks_done = 0;
-        }
     }
 
     /// One byte exchanged. Returns what the card puts on MISO.
     pub fn transfer(&mut self, byte: u8) -> u8 {
-        if let Some(trace) = self.trace.as_mut() {
-            trace.transfer();
-        }
         match self.phase {
             Phase::Idle => {
                 // A command frame starts with 0b01xxxxxx.
@@ -968,9 +398,10 @@ impl SdCard {
                         taken: taken + 1,
                     };
                 } else {
-                    // CMD0 and CMD8 retain mandatory command-CRC checking
-                    // even while general SPI-mode CRC is disabled.
-                    self.begin_reply(index, byte);
+                    // Fifth byte is the CRC; SPI mode ignores it unless
+                    // CRC checking was turned on, which this driver
+                    // never does.
+                    self.begin_reply(index);
                 }
                 IDLE
             }
@@ -980,26 +411,8 @@ impl SdCard {
                         // A write command hands over to the data phase
                         // rather than going idle.
                         self.phase = match self.pending_write() {
-                            true => {
-                                #[cfg(feature = "sd-gen1-multiblock")]
-                                if let Some(block) = self.multi_write_start_pending.take() {
-                                    Phase::MultiWriteAwaitToken { block }
-                                } else {
-                                    Phase::AwaitWriteToken
-                                }
-                                #[cfg(not(feature = "sd-gen1-multiblock"))]
-                                Phase::AwaitWriteToken
-                            }
-                            false => {
-                                #[cfg(feature = "sd-gen1-multiblock")]
-                                if let Some(next_block) = self.multi_read_next_block {
-                                    Phase::MultiReadAwait { next_block }
-                                } else {
-                                    Phase::Idle
-                                }
-                                #[cfg(not(feature = "sd-gen1-multiblock"))]
-                                Phase::Idle
-                            }
+                            true => Phase::AwaitWriteToken,
+                            false => Phase::Idle,
                         };
                     }
                     b
@@ -1017,7 +430,6 @@ impl SdCard {
                 if byte == TOKEN_START {
                     self.phase = Phase::WriteData { taken: 0 };
                     self.write_buf.clear();
-                    self.write_crc = [0; 2];
                 }
                 IDLE
             }
@@ -1028,7 +440,6 @@ impl SdCard {
                     IDLE
                 } else if taken < BLOCK_SIZE + 1 {
                     // First CRC byte.
-                    self.write_crc[0] = byte;
                     self.phase = Phase::WriteData { taken: taken + 1 };
                     IDLE
                 } else {
@@ -1036,94 +447,10 @@ impl SdCard {
                     // discarding what comes back, then reads the
                     // response on the *next* transfer -- so commit here
                     // and answer one byte later.
-                    self.write_crc[1] = byte;
                     self.commit_write();
                     self.phase = Phase::DataResponse;
                     IDLE
                 }
-            }
-            #[cfg(feature = "sd-gen1-multiblock")]
-            Phase::MultiReadAwait { next_block } => {
-                if byte & 0xC0 == 0x40 {
-                    // CMD12 is sent while CS remains low after a block.
-                    self.phase = Phase::Command {
-                        index: byte & 0x3F,
-                        taken: 0,
-                    };
-                } else if byte == IDLE {
-                    if let Some(data) = self.queue_multi_read_block(next_block) {
-                        self.trace_block_data(data);
-                        self.multi_read_next_block = next_block.checked_add(1);
-                        self.phase = Phase::Reply;
-                    } else {
-                        self.multi_read_next_block = None;
-                        self.phase = Phase::Idle;
-                    }
-                } else {
-                    self.note_protocol_error(format!(
-                        "multi_read_expected_clock_or_cmd12_got_{byte:02x}"
-                    ));
-                }
-                IDLE
-            }
-            #[cfg(feature = "sd-gen1-multiblock")]
-            Phase::MultiWriteAwaitToken { block } => {
-                match byte {
-                    0xFC => {
-                        self.write_block = block;
-                        self.write_buf.clear();
-                        self.write_crc = [0; 2];
-                        self.phase = Phase::MultiWriteData { block, taken: 0 };
-                    }
-                    0xFD => {
-                        self.finish_multi_write(block);
-                        self.phase = Phase::Idle;
-                    }
-                    other => self.note_protocol_error(format!(
-                        "multi_write_expected_fc_or_fd_got_{other:02x}"
-                    )),
-                }
-                IDLE
-            }
-            #[cfg(feature = "sd-gen1-multiblock")]
-            Phase::MultiWriteData { block, taken } => {
-                if taken < BLOCK_SIZE {
-                    self.write_buf.push(byte);
-                    self.phase = Phase::MultiWriteData {
-                        block,
-                        taken: taken + 1,
-                    };
-                    IDLE
-                } else if taken < BLOCK_SIZE + 1 {
-                    self.write_crc[0] = byte;
-                    self.phase = Phase::MultiWriteData {
-                        block,
-                        taken: taken + 1,
-                    };
-                    IDLE
-                } else {
-                    self.write_crc[1] = byte;
-                    self.write_block = block;
-                    if self.commit_write() {
-                        self.phase = Phase::MultiWriteDataResponse {
-                            next_block: block.saturating_add(1),
-                        };
-                    } else {
-                        self.note_protocol_error(format!("multi_write_block_out_of_range_{block}"));
-                        self.phase = Phase::Idle;
-                    }
-                    IDLE
-                }
-            }
-            #[cfg(feature = "sd-gen1-multiblock")]
-            Phase::MultiWriteDataResponse { next_block } => {
-                self.phase = Phase::MultiWriteBusy { next_block };
-                DATA_ACCEPTED
-            }
-            #[cfg(feature = "sd-gen1-multiblock")]
-            Phase::MultiWriteBusy { next_block } => {
-                self.phase = Phase::MultiWriteAwaitToken { block: next_block };
-                0x00
             }
         }
     }
@@ -1133,79 +460,28 @@ impl SdCard {
         self.write_pending
     }
 
-    fn commit_write(&mut self) -> bool {
-        let block = self.write_block as usize;
-        let committed = if let Some(raw) = self.raw.as_mut() {
-            block < raw.block_count && raw.write_sector(block, &self.write_buf).is_ok()
-        } else {
-            let offset = block * BLOCK_SIZE;
-            if offset + BLOCK_SIZE <= self.blocks.len() {
-                self.blocks[offset..offset + BLOCK_SIZE].copy_from_slice(&self.write_buf);
-                true
-            } else {
-                false
-            }
-        };
-        if committed {
+    fn commit_write(&mut self) {
+        let offset = self.write_block as usize * BLOCK_SIZE;
+        if offset + BLOCK_SIZE <= self.blocks.len() {
+            self.blocks[offset..offset + BLOCK_SIZE].copy_from_slice(&self.write_buf);
             self.blocks_written += 1;
-            #[cfg(feature = "sd-gen1-multiblock")]
-            if matches!(self.phase, Phase::MultiWriteData { .. }) {
-                self.multi_write_blocks_done = self.multi_write_blocks_done.saturating_add(1);
-            }
-            if let Some(trace) = self.trace.as_mut() {
-                trace.record(SdTraceEvent::BlockData {
-                    sequence: trace.event_count,
-                    cs_epoch: trace.cs_epoch,
-                    transfers: trace.transfers,
-                    data: SdTraceData {
-                        direction: SdTraceDirection::Write,
-                        block: block as u32,
-                        token: TOKEN_START,
-                        length: self.write_buf.len(),
-                        crc: self.write_crc,
-                    },
-                });
-            }
         }
         self.write_buf.clear();
         self.write_pending = false;
-        committed
     }
 
     fn arg_value(&self) -> u32 {
         u32::from_be_bytes(self.arg)
     }
 
-    fn begin_reply(&mut self, index: u8, received_crc: u8) {
+    fn begin_reply(&mut self, index: u8) {
         self.commands_seen += 1;
+        let is_app = std::mem::take(&mut self.app_cmd_pending);
         self.reply.clear();
-        let argument = self.arg_value();
-        let crc_valid = !matches!(index, 0 | 8) || received_crc == self.command_crc(index);
         // The card takes a byte or two to answer; the driver polls for
         // the first byte with bit 7 clear, so one idle byte in front is
         // both realistic and harmless.
         self.reply.push_back(IDLE);
-
-        if matches!(index, 0 | 8) && !crc_valid {
-            // A rejected command has no R3/R7 extension and must not
-            // otherwise change card state. In particular, do not consume
-            // a pending APP_CMD prefix for a frame that was never accepted.
-            let state = if self.initialised { R1_READY } else { R1_IDLE };
-            let response = state | R1_COM_CRC_ERROR;
-            self.reply.push_back(response);
-            self.trace_command(
-                index,
-                argument,
-                received_crc,
-                crc_valid,
-                vec![response],
-                None,
-            );
-            self.phase = Phase::Reply;
-            return;
-        }
-
-        let is_app = std::mem::take(&mut self.app_cmd_pending);
 
         if is_app {
             match index {
@@ -1224,230 +500,72 @@ impl SdCard {
                     self.reply.push_back(R1_READY);
                 }
             }
-            let response = self.reply.back().copied().unwrap_or(R1_READY);
-            self.trace_command(
-                index,
-                argument,
-                received_crc,
-                crc_valid,
-                vec![response],
-                None,
-            );
             self.phase = Phase::Reply;
             return;
         }
 
-        let mut response = Vec::new();
-        let mut data = None;
         match index {
             // GO_IDLE_STATE: enter SPI mode, report idle.
-            0 => response.push(R1_IDLE),
+            0 => self.reply.push_back(R1_IDLE),
             // SEND_IF_COND: R7 echoes the voltage nibble and check byte.
             8 => {
-                response.extend_from_slice(&[R1_IDLE, 0x00, 0x00, 0x01, (argument & 0xFF) as u8]);
+                self.reply.push_back(R1_IDLE);
+                self.reply.push_back(0x00);
+                self.reply.push_back(0x00);
+                self.reply.push_back(0x01);
+                self.reply.push_back((self.arg_value() & 0xFF) as u8);
             }
             // SET_BLOCKLEN: SDHC is fixed at 512, so just accept it.
-            16 => response.push(R1_READY),
-            #[cfg(feature = "sd-gen1-multiblock")]
-            // STOP_TRANSMISSION. This is only meaningful while a
-            // multi-block read is awaiting the next host clock.
-            12 => {
-                if self.multi_read_next_block.is_some() {
-                    self.multi_read_next_block = None;
-                    response.push(R1_READY);
-                } else {
-                    self.note_protocol_error("cmd12_without_active_multi_read".to_string());
-                    response.push(R1_READY);
-                }
-            }
+            16 => self.reply.push_back(R1_READY),
             // READ_SINGLE_BLOCK.
             17 => {
-                response.push(R1_READY);
-                data = self.queue_block_read(argument);
-            }
-            #[cfg(feature = "sd-gen1-multiblock")]
-            // READ_MULTIPLE_BLOCK. The host ends the stream with CMD12.
-            18 => {
-                if self.multi_read_next_block.is_some() {
-                    self.note_protocol_error("nested_cmd18".to_string());
-                    response.push(R1_READY);
-                } else {
-                    response.push(R1_READY);
-                    data = self.queue_multi_read_block(argument);
-                    if data.is_some() {
-                        self.multi_read_next_block = argument.checked_add(1);
-                    }
-                }
-            }
-            #[cfg(feature = "sd-gen1-multiblock")]
-            // SET_BLOCK_COUNT for the following multi-block write.
-            23 => {
-                self.multi_write_expected = Some(argument);
-                response.push(R1_READY);
+                self.reply.push_back(R1_READY);
+                self.queue_block_read(self.arg_value());
             }
             // WRITE_BLOCK: acknowledge, then take the data phase.
             24 => {
-                response.push(R1_READY);
-                self.write_block = argument;
-                self.write_pending = true;
-            }
-            #[cfg(feature = "sd-gen1-multiblock")]
-            // WRITE_MULTIPLE_BLOCK. The data phase starts with 0xFC.
-            25 => {
-                response.push(R1_READY);
-                self.multi_write_start_pending = Some(argument);
-                self.multi_write_blocks_done = 0;
+                self.reply.push_back(R1_READY);
+                self.write_block = self.arg_value();
                 self.write_pending = true;
             }
             // APP_CMD: the next command is an ACMD.
             55 => {
                 self.app_cmd_pending = true;
-                response.push(if self.initialised { R1_READY } else { R1_IDLE });
+                self.reply
+                    .push_back(if self.initialised { R1_READY } else { R1_IDLE });
             }
             // READ_OCR: R3. Bit 30 of the first byte marks high capacity,
             // which is what makes the driver address in blocks.
             58 => {
-                response.extend_from_slice(&[R1_READY, 0xC0, 0xFF, 0x80, 0x00]);
+                self.reply.push_back(R1_READY);
+                self.reply.push_back(0xC0);
+                self.reply.push_back(0xFF);
+                self.reply.push_back(0x80);
+                self.reply.push_back(0x00);
             }
             other => {
                 self.note_unknown(other);
-                response.push(R1_READY);
+                self.reply.push_back(R1_READY);
             }
         }
-        // A block read queues its token and payload while the command is
-        // decoded.  The SPI protocol still returns the command response
-        // first (R1, then the data token/payload); keep the queued data
-        // behind that response.  Without this ordering, a real Petit
-        // FatFs host can mistake the first payload byte for R1 and retry
-        // the mount forever.
-        if data.is_some() {
-            let queued_data = self.reply.split_off(1);
-            self.reply.extend(response.iter().copied());
-            self.reply.extend(queued_data);
-        } else {
-            self.reply.extend(response.iter().copied());
-        }
-        self.trace_command(index, argument, received_crc, crc_valid, response, data);
         self.phase = Phase::Reply;
     }
 
-    fn trace_command(
-        &mut self,
-        index: u8,
-        argument: u32,
-        crc: u8,
-        crc_valid: bool,
-        response: Vec<u8>,
-        data: Option<SdTraceData>,
-    ) {
-        if let Some(trace) = self.trace.as_mut() {
-            trace.command(index, argument, crc, crc_valid, response, data);
+    fn queue_block_read(&mut self, block: u32) {
+        let offset = block as usize * BLOCK_SIZE;
+        if offset + BLOCK_SIZE > self.blocks.len() {
+            // Out of range: leave the host polling for a token that
+            // never comes rather than inventing data.
+            return;
         }
-    }
-
-    #[cfg(feature = "sd-gen1-multiblock")]
-    fn trace_block_data(&mut self, data: SdTraceData) {
-        if let Some(trace) = self.trace.as_mut() {
-            trace.record(SdTraceEvent::BlockData {
-                sequence: trace.event_count,
-                cs_epoch: trace.cs_epoch,
-                transfers: trace.transfers,
-                data,
-            });
-        }
-    }
-
-    /// CRC byte for a command frame: CRC7 over command+argument, shifted
-    /// left with the required end bit set.
-    fn command_crc(&self, index: u8) -> u8 {
-        let mut crc = 0u8;
-        for mut byte in [
-            0x40 | index,
-            self.arg[0],
-            self.arg[1],
-            self.arg[2],
-            self.arg[3],
-        ] {
-            for _ in 0..8 {
-                crc <<= 1;
-                if (byte ^ crc) & 0x80 != 0 {
-                    crc ^= 0x09;
-                }
-                byte <<= 1;
-            }
-        }
-        (crc << 1) | 1
-    }
-
-    fn queue_block_read(&mut self, block: u32) -> Option<SdTraceData> {
-        let block = block as usize;
-        let sector = match self.read_sector(block) {
-            Ok(sector) => sector,
-            Err(_) => {
-                // Out of range or unreadable: leave the host polling for a
-                // token that never comes rather than inventing data.
-                return None;
-            }
-        };
         self.reply.push_back(TOKEN_START);
-        self.reply.extend(sector);
+        for i in 0..BLOCK_SIZE {
+            self.reply.push_back(self.blocks[offset + i]);
+        }
         // Two CRC bytes the driver reads and discards.
         self.reply.push_back(0xFF);
         self.reply.push_back(0xFF);
         self.blocks_read += 1;
-        Some(SdTraceData {
-            direction: SdTraceDirection::Read,
-            block: block as u32,
-            token: TOKEN_START,
-            length: BLOCK_SIZE,
-            crc: [0xFF, 0xFF],
-        })
-    }
-
-    #[cfg(feature = "sd-gen1-multiblock")]
-    fn queue_multi_read_block(&mut self, block: u32) -> Option<SdTraceData> {
-        let sector = match self.read_sector(block as usize) {
-            Ok(sector) => sector,
-            Err(_) => {
-                self.note_protocol_error(format!("multi_read_block_out_of_range_{block}"));
-                return None;
-            }
-        };
-        self.reply.push_back(TOKEN_START);
-        self.reply.extend(sector);
-        self.reply.extend([0xFF, 0xFF]);
-        self.blocks_read += 1;
-        Some(SdTraceData {
-            direction: SdTraceDirection::Read,
-            block,
-            token: TOKEN_START,
-            length: BLOCK_SIZE,
-            crc: [0xFF, 0xFF],
-        })
-    }
-
-    #[cfg(feature = "sd-gen1-multiblock")]
-    fn finish_multi_write(&mut self, next_block: u32) {
-        if let Some(expected) = self.multi_write_expected
-            && expected != self.multi_write_blocks_done
-        {
-            self.note_protocol_error(format!(
-                "multi_write_count_mismatch_expected_{expected}_actual_{}",
-                self.multi_write_blocks_done
-            ));
-        }
-        if next_block == u32::MAX {
-            self.note_protocol_error("multi_write_block_address_overflow".to_string());
-        }
-        self.multi_write_expected = None;
-        self.multi_write_start_pending = None;
-        self.multi_write_blocks_done = 0;
-        self.write_pending = false;
-    }
-
-    #[cfg(feature = "sd-gen1-multiblock")]
-    fn note_protocol_error(&mut self, error: String) {
-        self.protocol_errors.push(error);
     }
 
     fn note_unknown(&mut self, code: u8) {
@@ -1466,23 +584,9 @@ impl SdCard {
 #[cfg(test)]
 mod format_tests {
     use super::{BLOCK_SIZE, DEFAULT_BLOCKS, SdCard, SdFormat};
-    use std::path::PathBuf;
-
-    fn temp_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("picocalc-sdcard-{label}-{}", std::process::id()))
-    }
 
     fn u16_at(bytes: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
-    }
-
-    #[test]
-    fn mandatory_command_crc_known_vectors_match_sd_protocol() {
-        let mut card = SdCard::new_with_format(64, SdFormat::Fat16);
-        card.arg = [0x00, 0x00, 0x00, 0x00];
-        assert_eq!(card.command_crc(0), 0x95);
-        card.arg = [0x00, 0x00, 0x01, 0xAA];
-        assert_eq!(card.command_crc(8), 0x87);
     }
 
     fn u32_at(bytes: &[u8], offset: usize) -> u32 {
@@ -1553,81 +657,5 @@ mod format_tests {
         assert_eq!("fat16".parse(), Ok(SdFormat::Fat16));
         assert_eq!("FAT32".parse(), Ok(SdFormat::Fat32));
         assert!("exfat".parse::<SdFormat>().is_err());
-    }
-
-    #[test]
-    fn raw_backing_reads_through_and_exports_cow_sectors() {
-        let input = temp_path("raw-input");
-        let output = temp_path("raw-output");
-        let original: Vec<u8> = (0..(2 * BLOCK_SIZE)).map(|value| value as u8).collect();
-        std::fs::write(&input, &original).unwrap();
-
-        let mut card = SdCard::from_raw_file(&input).unwrap();
-        assert_eq!(card.block_count(), 2);
-        assert_eq!(
-            card.read_sector(0).unwrap().as_slice(),
-            &original[..BLOCK_SIZE]
-        );
-
-        let replacement = [0xA5u8; BLOCK_SIZE];
-        card.raw
-            .as_mut()
-            .unwrap()
-            .write_sector(1, &replacement)
-            .unwrap();
-        assert_eq!(card.read_sector(1).unwrap(), replacement);
-        card.export_raw(&output).unwrap();
-
-        assert_eq!(std::fs::read(&input).unwrap(), original);
-        let mut expected = original;
-        expected[BLOCK_SIZE..].copy_from_slice(&replacement);
-        assert_eq!(std::fs::read(&output).unwrap(), expected);
-
-        let _ = std::fs::remove_file(input);
-        let _ = std::fs::remove_file(output);
-    }
-
-    #[test]
-    fn raw_backing_rejects_empty_and_unaligned_inputs() {
-        let empty = temp_path("raw-empty");
-        let unaligned = temp_path("raw-unaligned");
-        std::fs::write(&empty, []).unwrap();
-        std::fs::write(&unaligned, [0u8; BLOCK_SIZE - 1]).unwrap();
-
-        assert!(SdCard::from_raw_file(&empty).is_err());
-        assert!(SdCard::from_raw_file(&unaligned).is_err());
-
-        let _ = std::fs::remove_file(empty);
-        let _ = std::fs::remove_file(unaligned);
-    }
-
-    #[test]
-    fn raw_export_rejects_the_input_path_and_memory_cards() {
-        let input = temp_path("raw-same-path");
-        std::fs::write(&input, [0u8; BLOCK_SIZE]).unwrap();
-        let mut raw = SdCard::from_raw_file(&input).unwrap();
-        assert!(raw.export_raw(&input).is_err());
-        let dotted = input
-            .parent()
-            .unwrap()
-            .join(".")
-            .join(input.file_name().unwrap());
-        assert!(raw.export_raw(&dotted).is_err());
-        #[cfg(unix)]
-        {
-            let alias_dir = temp_path("raw-same-path-alias-dir");
-            std::fs::create_dir(&alias_dir).unwrap();
-            let alias = alias_dir.join(input.file_name().unwrap());
-            std::fs::remove_dir(&alias_dir).unwrap();
-            std::os::unix::fs::symlink(input.parent().unwrap(), &alias_dir).unwrap();
-            assert!(raw.export_raw(&alias).is_err());
-            std::fs::remove_file(&alias_dir).unwrap();
-        }
-        assert!(
-            SdCard::new_with_format(1024, SdFormat::Fat16)
-                .export_raw(temp_path("memory-output"))
-                .is_err()
-        );
-        let _ = std::fs::remove_file(input);
     }
 }

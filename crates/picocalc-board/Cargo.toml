@@ -9,14 +9,6 @@ rust-version.workspace = true
 # framebuffer extraction. `rp2040-emu` stays board-agnostic.
 publish = false
 
-[features]
-# SD-GEN-1 multi-block wire model. It is part of the production PicoCalc
-# runtime after the P4 representative-runtime regression gate.  The legacy
-# single-block boundary remains available with `--no-default-features` for
-# differential tests.
-default = ["sd-gen1-multiblock"]
-sd-gen1-multiblock = []
-
 [lints]
 workspace = true
 

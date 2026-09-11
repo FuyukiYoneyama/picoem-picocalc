@@ -2,24 +2,6 @@
 
 An independent PicoCalc-oriented derivative of [`0x4D44/picoem`](https://github.com/0x4D44/picoem), retaining the upstream Git history and dual MIT OR Apache-2.0 licensing.
 
-The maintained public distribution is
-[`FuyukiYoneyama/picoem-picocalc`](https://github.com/FuyukiYoneyama/picoem-picocalc).
-Links to `0x4D44/picoem` identify the upstream origin, not this derivative's
-distribution location.
-
-Public-project guidance is in [`CONTRIBUTING.md`](CONTRIBUTING.md),
-[`SECURITY.md`](SECURITY.md), and [`NOTICE`](NOTICE). The repository does not
-promise a response SLA, and development-probe identifiers remain per-machine
-operator configuration rather than checked-in project data.
-Users should select a GitHub Release and immutable SemVer tag rather than the
-moving `main` branch. The backend/emulator pairing and exact commit policy is
-documented in [`docs/VERSIONING.md`](docs/VERSIONING.md) and the canonical
-[`picocalc_emu` versioning policy](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/VERSIONING.md).
-
-The upstream Git history is intentionally retained. The current tree removes
-operator-specific probe identifiers and paths from public instructions, but
-historical commits are not rewritten by this release-preparation work.
-
 ## Derivative origin and direction
 
 - **Upstream:** `0x4D44/picoem`
@@ -90,28 +72,10 @@ used by the canonical BSP are modelled: SPI1/RGB666 for compatibility and PIO0/R
 the recommended configuration. The scenario runner can inject timed keys and assert UART,
 pixel, and framebuffer-region conditions while firmware is executing.
 
-The VRP-2 preview backend is available as an opt-in headless process. It
-speaks the frozen `PCRP` framed protocol on stdin/stdout and keeps diagnostics
-on stderr; it does not add a GUI or claim realtime-1x support. See
-[`docs/VALIDATED_REALTIME_PREVIEW_BACKEND.md`](docs/VALIDATED_REALTIME_PREVIEW_BACKEND.md)
-for the wire boundary, commands, fail-closed rules, and local verification
-commands. Use `--preview-api` only from a validated preview supervisor; the
-normal report-producing runner and machine API remain separate contracts. The
-preview status and machine API `observe` operation expose the same versioned
-UART/framebuffer/unsupported-MMIO/audio observation projection and canonical
-digest. A local process E2E now runs a board-backed synthetic UART fixture and
-compares the report-compatible observation projection from the batch runner
-with both APIs at one exact virtual cycle, including the initial RGB565 LCD
-frame. This is a VRP-2 smoke gate, not target admission or a qualified
-realtime/GUI/audio acceptance result. The local compatibility suite also fixes
-the machine API schema-1 golden transcript and exercises directional UART RX
-acceptance plus bounded FIFO overrun; these remain local evidence until the
-registered-target digest admission gate is closed.
-
 The primary reference for keyboard-controller behavior is ClockworkPi's official
 [`PicoCalc/Code/picocalc_keyboard`](https://github.com/clockworkpi/PicoCalc/tree/master/Code/picocalc_keyboard)
 STM32F103R8T6 firmware. In this workspace it is checked out at
-an arbitrary local checkout of that repository. R1 conformance is complete: the Rust
+`/home/fuyuki/pico_dvl/codex/PicoCalc/Code/picocalc_keyboard`. R1 conformance is complete: the Rust
 device pins the consumer-visible `0x01..0x0e` replies, 31-event FIFO, official matrix/button map,
 state and modifier transformations, strict hold/repeat thresholds, both overflow policies,
 backlights, battery, reset, C64, and power-off behavior to that source. It deliberately does not
@@ -127,78 +91,6 @@ cargo run --release -p picocalc-harness --bin picocalc-run -- \
   --psram --sd --keyboard --scenario /absolute/path/to/scenario.json \
   --snapshot-dir /tmp/picocalc-snapshots --json /tmp/picocalc-report.json
 ```
-
-For long-running firmware sessions, the runner can emit best-effort progress lines to stderr without
-changing the deterministic report or verdict inputs. The two options are deliberately an explicit pair:
-
-```bash
-cargo run --release -p picocalc-harness --bin picocalc-run -- \
-  --run-id run-a --progress-interval 10 \
-  --bin /absolute/path/to/picocalc_app.bin \
-  --bootrom "$PWD/roms/rp2040/bootrom-rp2040-b2.bin" \
-  --board picocalc --lcd-variant pio-rgb565 --psram --sd --keyboard \
-  --scenario /absolute/path/to/scenario.json \
-  --snapshot-dir /tmp/picocalc-runs/run-a/snapshots \
-  --json /tmp/picocalc-runs/run-a/report.json
-```
-
-The normal `picocalc_emu/tools/picocalc.py test --mode firmware` entry point enables a ten-second
-heartbeat by default and supplies `<target>-<wrapper-pid>` when `--run-id` is omitted. Use
-`--no-progress` to disable it. Allocate a distinct output directory for every concurrent run; the
-runner does not create a central run registry or protect shared artifact paths. Heartbeat lines are
-diagnostic stderr only, and `event=finish` carries the runner's authoritative `exit` value (`0=pass`,
-`1=fail`, `2=cannot_judge`). WSL supervisors should check `finish` and the report before trusting an
-outer shell exit code. See the canonical [concurrent-run guidance](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/CONCURRENT_RUNS.md).
-
-For the PicoCalc PWM5_CC path, the runner can also write a separate deterministic level-analysis
-artifact and an optional unnormalised listening WAV. The frozen NEXT-2 contracts remain the
-48 kHz stereo path; streams with another observed timer rate are emitted as
-the additive audio-analysis schema 2 instead of being forced into that historical contract:
-
-```bash
-cargo run --release -p picocalc-harness --bin picocalc-run -- \
-  <the normal PicoCalc firmware arguments> \
-  --audio-analysis /tmp/picocalc-audio-analysis.json \
-  --audio-wav /tmp/picocalc-audio-raw.wav
-```
-
-The analysis reconstructs signed 16-bit samples from the post-quantizer 8-bit duty stream and
-reports peak, whole-stream and maximum complete 1024-frame-block RMS, active-frame ratio, DC offset, PWM
-rail ratio, and the longest consecutive rail run. A rail sample is not automatically a firmware
-clip and is not an automatic failure. Project policy belongs in `picocalc_emu`'s schema-2 quality
-contract: it rejects needlessly low level while allowing bounded saturation and only rejecting
-extreme rail occupancy. The WAV preserves the observed digital level; it is never normalised and
-does not model the amplifier, physical volume control, speaker, enclosure, or room.
-
-The DMA arbitration rules, timer-miss field meanings, board-less audio capture,
-and the limits of this digital observation are documented in
-[`docs/DMA_AUDIO_OBSERVABILITY.md`](docs/DMA_AUDIO_OBSERVABILITY.md). That
-document is part of the public emulator contract; it also records the
-quantum-invariance test and the diagnostic-only UART-marker profile option.
-The current implementation and validation order for these backend changes,
-including the feature-gated OPT4 regression found during review, is fixed in
-[`docs/BACKEND_CHANGE_VALIDATION_PLAN.md`](docs/BACKEND_CHANGE_VALIDATION_PLAN.md).
-Do not update a promoted PicoCalc backend pin until that plan's local gates and
-firmware regressions are complete.
-
-NEXT-4 also exposes the same persistent machine session as a deterministic JSON Lines API.
-Artifact and device options are fixed at process startup; one stdin line produces one stdout line,
-while UART and diagnostics never contaminate stdout. `run` is always bounded and subscriptions are
-pulled at command boundaries rather than delivered by a wall-clock thread:
-
-```bash
-cargo run --release -p picocalc-harness --bin picocalc-run -- \
-  --machine-api --bin /absolute/path/to/picocalc_app.bin \
-  --bootrom "$PWD/roms/rp2040/bootrom-rp2040-b2.bin" \
-  --board picocalc --lcd-variant pio-rgb565 --psram --sd --keyboard \
-  --snapshot-dir /tmp/picocalc-machine-snapshots
-```
-
-The schema-1 operations are `run`, `step`, `run_until`, `input`, `observe`, `subscribe`, and
-`snapshot`. `step` means one scheduler dispatch, not one CPU instruction or one master cycle, and
-returns the actual cycle count. `snapshot` means a framebuffer snapshot, not a restorable emulator
-checkpoint. The normative wire schema and fail-closed rules are documented in
-[`picocalc_emu/docs/HEADLESS_MACHINE_API.md`](https://github.com/FuyukiYoneyama/picocalc_emu/blob/main/docs/HEADLESS_MACHINE_API.md).
 
 The command above is authoritative only when its structured report is checked against the
 target's declared expectations. The cross-repository acceptance order, source/toolchain pins,
@@ -408,7 +300,7 @@ at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
-This repository redistributes third-party content under their respective licenses — the Raspberry Pi RP2350 bootrom (BSD-3-Clause), the composite RP2040 B2 bootrom (BSD-3-Clause plus the separate `mufplib` terms), the PicoGUS firmware (GPL-2.0-or-later), OneROM RP2350 firmware fixtures (MIT), the SeaBIOS payload used by OneROM fixtures (LGPL-3.0), the `epio`/`apio` MIT submodules used by the PIO differential helper, and a vendored fork of probe-rs (MIT OR Apache-2.0). See [NOTICE](NOTICE) for the full list and attribution.
+This repository redistributes third-party content under their respective licenses — Raspberry Pi RP2350 and RP2040 bootroms (BSD-3-Clause), the PicoGUS firmware (GPL-2.0-or-later), and a vendored fork of probe-rs (MIT OR Apache-2.0). See [NOTICE](NOTICE) for the full list and attribution.
 
 ## Trademarks
 

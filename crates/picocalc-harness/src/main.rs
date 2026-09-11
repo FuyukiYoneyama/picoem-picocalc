@@ -15,10 +15,9 @@
 //!    executed*. It is there so SDK firmware can resolve ROM function
 //!    table pointers (`rom_func_lookup`). The real bootrom would sample
 //!    QSPI pads we do not model and park in USB-MSC boot forever.
-//! 3. `reset`, then the selected boot handoff: the default `app` path uses
-//!    `direct_boot_from_flash(0x100)`; explicit `--boot-mode boot2` enters
-//!    the flash-resident boot2 at XIP base so a loader artifact can execute
-//!    its own handoff.
+//! 3. `reset`, then `direct_boot_from_flash(0x100)` — seeds SP / PC /
+//!    VTOR straight from the SDK vector table at flash offset `0x100`,
+//!    exactly what boot2 does on silicon.
 //!
 //! Stop reasons: `cycle_limit` (budget exhausted — only acceptable when
 //! explicitly named by the conformance contract),
@@ -30,50 +29,25 @@
 //! absolute paths (basenames only), and no host-dependent values. The
 //! unsupported-MMIO list is sorted by `(addr, pc)`.
 
-use std::collections::BTreeSet;
-use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use picocalc_board::sha256::sha256_hex;
 use picocalc_board::{
-    Aht20, At24c32, Bmp280, Ds3231, Framebuffer, I2cBusMux, I2cBusObservation, KeyEvent, KeyState,
-    Keyboard, KeyboardWire, LcdPioWire, RtcDateTime, SdCard, SdCardWire, SdFormat, SdTraceData,
-    SdTraceDirection, SdTraceEvent, SdTraceSnapshot, St7365p, St7365pWire, pins,
+    Framebuffer, Keyboard, KeyboardWire, LcdPioWire, SdCard, SdCardWire, SdFormat, St7365p,
+    St7365pWire, pins,
 };
-use rp2040_emu::peripherals::i2c::I2cExternalDevice;
 #[cfg(feature = "behavior-trace")]
 use rp2040_emu::{BehaviorEventDomain, BehaviorTraceSnapshot};
-#[cfg(feature = "cpu-application-profiler")]
-use rp2040_emu::{
-    CPU_APPLICATION_PROFILE_SCHEMA_VERSION, CpuApplicationProfileSnapshot, CpuDecodeCounters,
-    CpuDecodeRegionCounters, CpuDecodeRegionCountersByRegion, CpuExceptionCounters,
-    CpuHandlerGroupCounters, CpuInvalidationCounters, CpuPcRegionCounters,
-};
-use rp2040_emu::{Config, Emulator, EmulatorBuilder, RP2040_SRAM_TOP, WatchdogResetEvent};
+use rp2040_emu::{Config, Emulator, EmulatorBuilder};
 #[cfg(feature = "idle-profiler")]
 use rp2040_emu::{
     CumulativeHistogramSnapshot, IDLE_HISTOGRAM_BUCKETS, IDLE_PROFILE_SCHEMA_VERSION,
     IdleBlockerCycles, IdleBlockerEpisodes, IdleHorizonEvents, IdleProfileSnapshot,
 };
-#[cfg(feature = "event-horizon-profiler")]
-use rp2040_emu::{
-    DecodeProfileSnapshot, RUNNING_EVENT_PROFILE_SCHEMA_VERSION, RunningBoundaryEvents,
-    RunningEventProfileSnapshot,
-};
 
-mod machine_protocol;
-mod preview_api;
-mod preview_protocol;
 mod scenario;
-mod session;
-
-use session::{
-    MachineSession, PREVIEW_OBSERVATION_SCHEMA_VERSION, ScenarioReplay, ScenarioReplayStep,
-    SessionStop,
-};
 
 /// Report schema version. Bump on any breaking field change.
 ///
@@ -167,8 +141,6 @@ const UART_DRAIN_INTERVAL: u64 = 256;
 /// shelled out to at run time: the report must be a pure function of
 /// its inputs.
 const BUILT_BACKEND_COMMIT: &str = env!("PICOEM_BUILT_COMMIT");
-#[cfg(feature = "cpu-application-profiler")]
-const BUILT_FEATURE_SET: &str = env!("PICOEM_FEATURE_SET");
 
 fn built_backend_dirty() -> bool {
     env!("PICOEM_BUILT_DIRTY") == "true"
@@ -244,37 +216,13 @@ impl LcdVariant {
     }
 }
 
-/// Explicit startup request. The runner keeps this separate from the
-/// reported [`BootMode`], because `app` may still fall back to the ROM
-/// reset vector for hand-assembled images.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BootRequest {
-    App,
-    Boot2,
-}
-
-impl BootRequest {
-    fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "app" => Ok(Self::App),
-            "boot2" => Ok(Self::Boot2),
-            other => Err(format!(
-                "unknown --boot-mode '{other}' (expected app|boot2)"
-            )),
-        }
-    }
-}
-
 struct Args {
     bin: PathBuf,
     bootrom: PathBuf,
-    boot_mode: BootRequest,
     cycles: u64,
     stop_pc: Option<u32>,
     json: Option<PathBuf>,
     uart: Option<PathBuf>,
-    host_timing: Option<PathBuf>,
-    flash_image_out: Option<PathBuf>,
     expected_backend_commit: Option<String>,
     board: Board,
     lcd_variant: LcdVariant,
@@ -283,188 +231,17 @@ struct Args {
     psram: bool,
     psram_verify_range: Option<(u32, u32)>,
     keyboard: bool,
-    i2c_profile: Option<String>,
-    i2c_fixture: Option<PathBuf>,
-    i2c_report: Option<PathBuf>,
     sd: bool,
-    sd_image: Option<PathBuf>,
-    sd_image_out: Option<PathBuf>,
-    sd_trace: Option<PathBuf>,
     sd_format: SdFormat,
     keys: Option<String>,
     scenario: Option<PathBuf>,
-    replay_scenario: Option<PathBuf>,
     snapshot_dir: PathBuf,
-    machine_api: bool,
-    preview_api: bool,
-    run_id: Option<String>,
-    progress_interval: Option<u64>,
     expected_stop: Option<StopReason>,
     expected_uart: Vec<String>,
-    expected_audio_sink_count: Option<u64>,
-    expected_audio_sink_sha256: Option<String>,
-    audio_analysis: Option<PathBuf>,
-    audio_wav: Option<PathBuf>,
     #[cfg(feature = "idle-profiler")]
     idle_profile: Option<PathBuf>,
     #[cfg(feature = "behavior-trace")]
     behavior_trace: Option<PathBuf>,
-    #[cfg(feature = "event-horizon-profiler")]
-    event_horizon_profile: Option<PathBuf>,
-    #[cfg(feature = "event-horizon-profiler")]
-    event_horizon_profile_after_uart: Option<String>,
-    #[cfg(feature = "cpu-application-profiler")]
-    cpu_application_profile: Option<PathBuf>,
-}
-
-const PROGRESS_CLOCK_CHECK_DISPATCHES: u64 = 256;
-
-fn validate_run_id(run_id: &str) -> Result<(), String> {
-    if run_id.is_empty() {
-        return Err("--run-id must not be empty".to_string());
-    }
-    if run_id.len() > 64 {
-        return Err("--run-id must be at most 64 ASCII characters".to_string());
-    }
-    if !run_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
-    {
-        return Err(
-            "--run-id may contain only ASCII letters, digits, '.', '_', ':' and '-'".to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_progress_interval(seconds: u64) -> Result<(), String> {
-    if seconds == 0 {
-        return Err("--progress-interval must be >= 1 second".to_string());
-    }
-    if Instant::now()
-        .checked_add(Duration::from_secs(seconds))
-        .is_none()
-    {
-        return Err("--progress-interval is too large for the host monotonic clock".to_string());
-    }
-    Ok(())
-}
-
-/// Best-effort wall-clock progress reporting. This type deliberately lives
-/// outside the report/verdict path: heartbeat output is diagnostic metadata,
-/// never an emulator observation or an acceptance input.
-struct ProgressReporter {
-    run_id: String,
-    pid: u32,
-    interval: Duration,
-    started_at: Instant,
-    next_deadline: Instant,
-    dispatches_since_check: u64,
-    sequence: u64,
-    enabled: bool,
-}
-
-impl ProgressReporter {
-    fn new(run_id: String, interval_seconds: u64) -> Result<Self, String> {
-        validate_progress_interval(interval_seconds)?;
-        let started_at = Instant::now();
-        let interval = Duration::from_secs(interval_seconds);
-        let next_deadline = started_at.checked_add(interval).ok_or_else(|| {
-            "--progress-interval is too large for the host monotonic clock".to_string()
-        })?;
-        Ok(Self {
-            run_id,
-            pid: std::process::id(),
-            interval,
-            started_at,
-            next_deadline,
-            dispatches_since_check: 0,
-            sequence: 0,
-            enabled: true,
-        })
-    }
-
-    fn write_line(&mut self, line: String) {
-        if !self.enabled {
-            return;
-        }
-        let mut stderr = std::io::stderr().lock();
-        if writeln!(stderr, "{line}")
-            .and_then(|_| stderr.flush())
-            .is_err()
-        {
-            // A closed pipe or redirected stderr must not change the
-            // firmware verdict. Stop attempting diagnostics after the first
-            // failure, but leave the run itself untouched.
-            self.enabled = false;
-        }
-    }
-
-    fn start(&mut self, budget: u64) {
-        self.write_line(format!(
-            "[PICOCALC][RUN] event=start run={} pid={} budget={budget}",
-            self.run_id, self.pid
-        ));
-    }
-
-    fn maybe_emit(&mut self, cycles: u64, budget: u64) {
-        if !self.enabled {
-            return;
-        }
-        self.dispatches_since_check = self.dispatches_since_check.saturating_add(1);
-        if self.dispatches_since_check < PROGRESS_CLOCK_CHECK_DISPATCHES {
-            return;
-        }
-        self.dispatches_since_check = 0;
-
-        let now = Instant::now();
-        if now < self.next_deadline {
-            return;
-        }
-
-        self.sequence = self.sequence.saturating_add(1);
-        let elapsed_s = now.duration_since(self.started_at).as_secs_f64();
-        let rate_mcycles_s = if elapsed_s > 0.0 {
-            cycles as f64 / elapsed_s / 1_000_000.0
-        } else {
-            0.0
-        };
-        let pct = if budget > 0 {
-            cycles as f64 * 100.0 / budget as f64
-        } else {
-            0.0
-        };
-        self.write_line(format!(
-            "[PICOCALC][RUN] event=heartbeat run={} pid={} seq={} cycles={} budget={} pct={pct:.3} elapsed_s={elapsed_s:.3} rate_mcycles_s={rate_mcycles_s:.3}",
-            self.run_id, self.pid, self.sequence, cycles, budget
-        ));
-
-        // Do not emit a burst after a long host stall. Advance the deadline
-        // past the current time while retaining the requested cadence.
-        while self.next_deadline <= now {
-            let Some(next_deadline) = self.next_deadline.checked_add(self.interval) else {
-                self.enabled = false;
-                break;
-            };
-            self.next_deadline = next_deadline;
-        }
-    }
-
-    fn finish(&mut self, outcome: &RunOutcome, status: Verdict) {
-        if !self.enabled {
-            return;
-        }
-        let now = Instant::now();
-        let elapsed_s = now.duration_since(self.started_at).as_secs_f64();
-        self.write_line(format!(
-            "[PICOCALC][RUN] event=finish run={} pid={} cycles={} elapsed_s={elapsed_s:.3} stop={} exit={}",
-            self.run_id,
-            self.pid,
-            outcome.cycles,
-            outcome.stop_reason.as_str(),
-            status.exit_code()
-        ));
-    }
 }
 
 /// Parse a `start:len` range, e.g. `0:10000` or `0x100:0x2000` (either
@@ -485,24 +262,9 @@ fn parse_range(raw: &str) -> Result<(u32, u32), String> {
     Ok((parse_num(start_raw)?, parse_num(len_raw)?))
 }
 
-fn validate_sd_selection(
-    sd: bool,
-    sd_image: Option<&Path>,
-    sd_image_out: Option<&Path>,
-    sd_trace: Option<&Path>,
-    format_explicit: bool,
-) -> Result<(), String> {
-    if sd && sd_image.is_some() {
-        return Err("--sd and --sd-image are mutually exclusive".to_string());
-    }
-    if sd_image_out.is_some() && sd_image.is_none() {
-        return Err("--sd-image-out requires --sd-image".to_string());
-    }
+fn validate_sd_selection(sd: bool, format_explicit: bool) -> Result<(), String> {
     if format_explicit && !sd {
         return Err("--sd-format requires --sd".to_string());
-    }
-    if sd_trace.is_some() && !sd && sd_image.is_none() {
-        return Err("--sd-trace requires --sd or --sd-image".to_string());
     }
     Ok(())
 }
@@ -513,11 +275,9 @@ fn print_usage() {
          picocalc-run --bin <firmware.bin> [options]\n\
          \n\
          --bin <path>             Required. Raw RP2040 flash image (.bin), loaded at\n\
-                                  0x1000_0000; startup uses --boot-mode (default app).\n\
+                                  0x1000_0000 and direct-booted from offset 0x100.\n\
          --bootrom <path>         16 KB RP2040 bootrom image, loaded but never executed.\n\
                                   Default: {DEFAULT_BOOTROM_PATH}\n\
-         --boot-mode <app|boot2>  Startup path. Default 'app' preserves direct boot from\n\
-                                  flash+0x100; 'boot2' enters the flash offset 0 loader stub.\n\
          --cycles <N>             Cycle budget. Exceeding it gives cycle_limit, which is\n\
                                   not a pass unless explicitly expected. Default: {DEFAULT_CYCLE_LIMIT}\n\
          --stop-pc <hex>          Stop with stop_reason=pc_match when core 0's PC equals\n\
@@ -526,9 +286,6 @@ fn print_usage() {
          --json <path>            Write the JSON report here. Default: stdout.\n\
          --uart <path>            Write raw UART0 TX bytes here. Default: discarded\n\
                                   (byte count + sha256 still reported).\n\
-         --host-timing <path>    Write an opt-in host-timing sidecar measured only around\n\
-                                  the in-process run_loop. Includes process CPU time and\n\
-                                  monotonic wall time; never changes the schema-8 report.\n\
          --backend-commit <str>   Require the runner's compile-time Git identity to match.\n\
          --board <none|picocalc>  Attach an off-chip board model. 'picocalc' hangs the\n\
                                   ST7365P display off SPI1 (CS=GP13, DC=GP14, RST=GP15)\n\
@@ -554,12 +311,6 @@ fn print_usage() {
                                   starts. Implies --keyboard. For input that has to be\n\
                                   timed against what the program is doing, use --scenario.\n\
          --sd                     Attach an SD card on SPI0, pre-formatted FAT32 by default.\n\
-         --sd-image <path>        Attach a non-empty 512-byte-aligned RAW SD image read-only;\n\
-                                  emulated writes use a sector copy-on-write overlay.\n\
-         --sd-image-out <path>    Atomically export the RAW image plus COW writes after the run.\n\
-                                  Requires --sd-image and must differ from the input path.\n\
-         --sd-trace <path>       Diagnostic-only structured SD SPI trace (separate JSON file).\n\
-                                  Requires --sd or --sd-image; not part of the normal report.\n\
          --sd-format <fat32|fat16>\n\
                                   Initial filesystem profile. FAT32 is the default, matching\n\
                                   PicoCalc's bundled 32 GB card. Requires --sd.\n\
@@ -568,38 +319,11 @@ fn print_usage() {
                                   'scenario' report section. Exit 1 if any step fails.\n\
                                   Milliseconds are virtual, derived from the system clock\n\
                                   the firmware has programmed.\n\
-         --replay-scenario <path> VRP-2 registered-target replay for --machine-api or\n\
-                                  --preview-api. Reuses the authoritative scenario timing\n\
-                                  boundary and emits no schema-8 report.\n\
          --snapshot-dir <path>    Where scenario 'snapshot' steps write their PNGs.\n\
                                   Default: the current directory.\n\
-         --machine-api            NEXT-4 JSON Lines API on stdin/stdout. Uses the same\n\
-                                  startup artifact/device options; no scenario/final report.\n\
-         --preview-api            VRP-2 framed realtime preview backend on stdin/stdout.\n\
-                                  Uses the shared MachineSession and Pacer; GUI is a separate\n\
-                                  process. Mutually exclusive with --machine-api/scenario.\n\
-         --run-id <ID>            Optional diagnostic ID; requires --progress-interval.\n\
-         --progress-interval <N> Emit stderr heartbeat lines every N seconds (opt-in).\n\
          --expect-stop <reason>   Required stop: cycle_limit, pc_match, or scenario_done.\n\
          --expect-uart <text>     Required UART substring. Repeat for each marker.\n\
-         --expect-audio-sink-count <N>\n\
-                                  Require exactly N DMA-origin PWM5_CC writes.\n\
-         --expect-audio-sink-sha256 <hex>\n\
-                                  Require the little-endian PWM5_CC stream SHA-256.\n\
-         --audio-analysis <path> Write deterministic digital-level metrics reconstructed\n\
-                                  from the 8-bit stereo PWM duty stream; may be used without\n\
-                                  --board picocalc for audio-only capture.\n\
-         --audio-wav <path>      Write the same unnormalised reconstructed stream as\n\
-                                  an observed-rate stereo signed-16 WAV for listening; may be\n\
-                                  used without --board picocalc for audio-only capture.\n\
-         --flash-image-out <path> Export the final 2 MiB XIP image after SSI erase/program.\n\\
          -h, --help               This message."
-    );
-    eprintln!(
-        "         --i2c-profile <name>     Attach optional picocalc-rtc-v1 (DS3231 + AT24C32)\n\
-                                  or picocalc-rtc-env-v1 (+ AHT20 + BMP280).\n\
-         --i2c-fixture <path>     Deterministic fixture JSON; defaults to a built-in fixture.\n\
-         --i2c-report <path>      Required sidecar report path when --i2c-profile is used."
     );
     #[cfg(feature = "idle-profiler")]
     eprintln!(
@@ -610,37 +334,16 @@ fn print_usage() {
         "         --behavior-trace <path> OPT0-B correctness artifact with streaming event hashes.\n\
                                           Not valid for wall-time measurement."
     );
-    #[cfg(feature = "event-horizon-profiler")]
-    eprintln!(
-        "         --event-horizon-profile <path>\n\
-                                          OPT2-D running-boundary/decode opportunity profile.\n\
-                                          Not valid for wall-time measurement."
-    );
-    #[cfg(feature = "event-horizon-profiler")]
-    eprintln!(
-        "         --event-horizon-profile-after-uart <text>\n\
-                                          Defer OPT2-D until this UART marker is observed.\n\
-                                          Requires --event-horizon-profile."
-    );
-    #[cfg(feature = "cpu-application-profiler")]
-    eprintln!(
-        "         --cpu-application-profile <path>\n\
-                                          P0-B emulated-cycle CPU application counters.\n\
-                                          Diagnostic only; not valid for wall-time measurement."
-    );
 }
 
 fn parse_args() -> Result<Args, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut bin: Option<PathBuf> = None;
     let mut bootrom: Option<PathBuf> = None;
-    let mut boot_mode = BootRequest::App;
     let mut cycles: Option<u64> = None;
     let mut stop_pc: Option<u32> = None;
     let mut json: Option<PathBuf> = None;
     let mut uart: Option<PathBuf> = None;
-    let mut host_timing: Option<PathBuf> = None;
-    let mut flash_image_out: Option<PathBuf> = None;
     let mut expected_backend_commit: Option<String> = None;
     let mut board = Board::None;
     // Variant B is the Canonical BSP default; variant A is what the
@@ -659,39 +362,18 @@ fn parse_args() -> Result<Args, String> {
     let mut psram = false;
     let mut psram_verify_range: Option<(u32, u32)> = None;
     let mut keyboard = false;
-    let mut i2c_profile: Option<String> = None;
-    let mut i2c_fixture: Option<PathBuf> = None;
-    let mut i2c_report: Option<PathBuf> = None;
     let mut sd = false;
-    let mut sd_image: Option<PathBuf> = None;
-    let mut sd_image_out: Option<PathBuf> = None;
-    let mut sd_trace: Option<PathBuf> = None;
     let mut sd_format = SdFormat::default();
     let mut sd_format_explicit = false;
     let mut keys: Option<String> = None;
     let mut scenario: Option<PathBuf> = None;
-    let mut replay_scenario: Option<PathBuf> = None;
     let mut snapshot_dir: Option<PathBuf> = None;
-    let mut machine_api = false;
-    let mut preview_api = false;
-    let mut run_id: Option<String> = None;
-    let mut progress_interval: Option<u64> = None;
     let mut expected_stop: Option<StopReason> = None;
     let mut expected_uart: Vec<String> = Vec::new();
-    let mut expected_audio_sink_count: Option<u64> = None;
-    let mut expected_audio_sink_sha256: Option<String> = None;
-    let mut audio_analysis: Option<PathBuf> = None;
-    let mut audio_wav: Option<PathBuf> = None;
     #[cfg(feature = "idle-profiler")]
     let mut idle_profile: Option<PathBuf> = None;
     #[cfg(feature = "behavior-trace")]
     let mut behavior_trace: Option<PathBuf> = None;
-    #[cfg(feature = "event-horizon-profiler")]
-    let mut event_horizon_profile: Option<PathBuf> = None;
-    #[cfg(feature = "event-horizon-profiler")]
-    let mut event_horizon_profile_after_uart: Option<String> = None;
-    #[cfg(feature = "cpu-application-profiler")]
-    let mut cpu_application_profile: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -705,7 +387,6 @@ fn parse_args() -> Result<Args, String> {
         match flag {
             "--bin" => bin = Some(PathBuf::from(value("--bin")?)),
             "--bootrom" => bootrom = Some(PathBuf::from(value("--bootrom")?)),
-            "--boot-mode" => boot_mode = BootRequest::parse(&value("--boot-mode")?)?,
             "--cycles" => {
                 let raw = value("--cycles")?;
                 let cleaned = raw.replace('_', "");
@@ -725,18 +406,6 @@ fn parse_args() -> Result<Args, String> {
             }
             "--json" => json = Some(PathBuf::from(value("--json")?)),
             "--uart" => uart = Some(PathBuf::from(value("--uart")?)),
-            "--host-timing" => {
-                if host_timing.is_some() {
-                    return Err("--host-timing may be specified only once".to_string());
-                }
-                host_timing = Some(PathBuf::from(value("--host-timing")?));
-            }
-            "--flash-image-out" => {
-                if flash_image_out.is_some() {
-                    return Err("--flash-image-out may be specified only once".to_string());
-                }
-                flash_image_out = Some(PathBuf::from(value("--flash-image-out")?));
-            }
             "--backend-commit" => expected_backend_commit = Some(value("--backend-commit")?),
             "--board" => board = Board::parse(&value("--board")?)?,
             "--lcd-variant" => lcd_variant = LcdVariant::parse(&value("--lcd-variant")?)?,
@@ -753,33 +422,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--psram" => psram = true,
             "--keyboard" => keyboard = true,
-            "--i2c-profile" => {
-                if i2c_profile.is_some() {
-                    return Err("--i2c-profile may be specified only once".to_string());
-                }
-                i2c_profile = Some(value("--i2c-profile")?);
-            }
-            "--i2c-fixture" => {
-                if i2c_fixture.is_some() {
-                    return Err("--i2c-fixture may be specified only once".to_string());
-                }
-                i2c_fixture = Some(PathBuf::from(value("--i2c-fixture")?));
-            }
-            "--i2c-report" => {
-                if i2c_report.is_some() {
-                    return Err("--i2c-report may be specified only once".to_string());
-                }
-                i2c_report = Some(PathBuf::from(value("--i2c-report")?));
-            }
             "--sd" => sd = true,
-            "--sd-image" => sd_image = Some(PathBuf::from(value("--sd-image")?)),
-            "--sd-image-out" => sd_image_out = Some(PathBuf::from(value("--sd-image-out")?)),
-            "--sd-trace" => {
-                if sd_trace.is_some() {
-                    return Err("--sd-trace may be specified only once".to_string());
-                }
-                sd_trace = Some(PathBuf::from(value("--sd-trace")?));
-            }
             "--sd-format" => {
                 let raw = value("--sd-format")?;
                 sd_format = raw.parse::<SdFormat>()?;
@@ -787,36 +430,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--keys" => keys = Some(value("--keys")?),
             "--scenario" => scenario = Some(PathBuf::from(value("--scenario")?)),
-            "--replay-scenario" => {
-                if replay_scenario.is_some() {
-                    return Err("--replay-scenario may be specified only once".to_string());
-                }
-                replay_scenario = Some(PathBuf::from(value("--replay-scenario")?));
-            }
             "--snapshot-dir" => snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
-            "--machine-api" => machine_api = true,
-            "--preview-api" => preview_api = true,
-            "--run-id" => {
-                if run_id.is_some() {
-                    return Err("--run-id may be specified only once".to_string());
-                }
-                let id = value("--run-id")?;
-                validate_run_id(&id)?;
-                run_id = Some(id);
-            }
-            "--progress-interval" => {
-                if progress_interval.is_some() {
-                    return Err("--progress-interval may be specified only once".to_string());
-                }
-                let raw = value("--progress-interval")?;
-                let interval = raw.parse::<u64>().map_err(|error| {
-                    format!(
-                        "invalid --progress-interval '{raw}' (expected integer seconds): {error}"
-                    )
-                })?;
-                validate_progress_interval(interval)?;
-                progress_interval = Some(interval);
-            }
             "--expect-stop" => {
                 if expected_stop.is_some() {
                     return Err("--expect-stop may be specified only once".to_string());
@@ -830,66 +444,10 @@ fn parse_args() -> Result<Args, String> {
                 }
                 expected_uart.push(marker);
             }
-            "--expect-audio-sink-count" => {
-                if expected_audio_sink_count.is_some() {
-                    return Err("--expect-audio-sink-count may be specified only once".to_string());
-                }
-                let raw = value("--expect-audio-sink-count")?;
-                let count = raw
-                    .parse::<u64>()
-                    .map_err(|e| format!("invalid --expect-audio-sink-count '{raw}': {e}"))?;
-                if count == 0 {
-                    return Err("--expect-audio-sink-count must be > 0".to_string());
-                }
-                expected_audio_sink_count = Some(count);
-            }
-            "--expect-audio-sink-sha256" => {
-                if expected_audio_sink_sha256.is_some() {
-                    return Err("--expect-audio-sink-sha256 may be specified only once".to_string());
-                }
-                let digest = value("--expect-audio-sink-sha256")?.to_ascii_lowercase();
-                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                    return Err("--expect-audio-sink-sha256 must be 64 hex characters".to_string());
-                }
-                expected_audio_sink_sha256 = Some(digest);
-            }
-            "--audio-analysis" => {
-                if audio_analysis.is_some() {
-                    return Err("--audio-analysis may be specified only once".to_string());
-                }
-                audio_analysis = Some(PathBuf::from(value("--audio-analysis")?));
-            }
-            "--audio-wav" => {
-                if audio_wav.is_some() {
-                    return Err("--audio-wav may be specified only once".to_string());
-                }
-                audio_wav = Some(PathBuf::from(value("--audio-wav")?));
-            }
             #[cfg(feature = "idle-profiler")]
             "--idle-profile" => idle_profile = Some(PathBuf::from(value("--idle-profile")?)),
             #[cfg(feature = "behavior-trace")]
             "--behavior-trace" => behavior_trace = Some(PathBuf::from(value("--behavior-trace")?)),
-            #[cfg(feature = "event-horizon-profiler")]
-            "--event-horizon-profile" => {
-                event_horizon_profile = Some(PathBuf::from(value("--event-horizon-profile")?))
-            }
-            #[cfg(feature = "event-horizon-profiler")]
-            "--event-horizon-profile-after-uart" => {
-                let marker = value("--event-horizon-profile-after-uart")?;
-                if marker.is_empty() {
-                    return Err(
-                        "--event-horizon-profile-after-uart marker must not be empty".to_string(),
-                    );
-                }
-                event_horizon_profile_after_uart = Some(marker);
-            }
-            #[cfg(feature = "cpu-application-profiler")]
-            "--cpu-application-profile" => {
-                if cpu_application_profile.is_some() {
-                    return Err("--cpu-application-profile may be specified only once".to_string());
-                }
-                cpu_application_profile = Some(PathBuf::from(value("--cpu-application-profile")?));
-            }
             "--psram-verify-range" => {
                 let raw = value("--psram-verify-range")?;
                 psram_verify_range = Some(parse_range(&raw)?);
@@ -909,65 +467,22 @@ fn parse_args() -> Result<Args, String> {
     if psram_verify_range.is_some() && !psram {
         return Err("--psram-verify-range requires --psram".to_string());
     }
-    if let Some(profile) = i2c_profile.as_deref() {
-        if board != Board::PicoCalc {
-            return Err("--i2c-profile requires --board picocalc".to_string());
-        }
-        if profile != "picocalc-rtc-v1" && profile != "picocalc-rtc-env-v1" {
-            return Err(format!(
-                "unknown --i2c-profile '{profile}' (expected picocalc-rtc-v1|picocalc-rtc-env-v1)"
-            ));
-        }
-        if i2c_report.is_none() {
-            return Err("--i2c-profile requires --i2c-report".to_string());
-        }
-    } else if i2c_fixture.is_some() || i2c_report.is_some() {
-        return Err("--i2c-fixture and --i2c-report require --i2c-profile".to_string());
-    }
-    validate_sd_selection(
-        sd,
-        sd_image.as_deref(),
-        sd_image_out.as_deref(),
-        sd_trace.as_deref(),
-        sd_format_explicit,
-    )?;
+    validate_sd_selection(sd, sd_format_explicit)?;
     // Queueing keys implies the controller they arrive through.
     if keys.is_some() {
         keyboard = true;
     }
-    if snapshot_dir.is_some() && scenario.is_none() && replay_scenario.is_none() && !machine_api {
-        return Err(
-            "--snapshot-dir requires --scenario, --replay-scenario or --machine-api".to_string(),
-        );
+    if snapshot_dir.is_some() && scenario.is_none() {
+        return Err("--snapshot-dir only means anything with --scenario".to_string());
     }
     if expected_stop == Some(StopReason::PcMatch) && stop_pc.is_none() {
         return Err("--expect-stop pc_match requires --stop-pc".to_string());
     }
-    if expected_stop == Some(StopReason::ScenarioDone)
-        && scenario.is_none()
-        && replay_scenario.is_none()
-    {
+    if expected_stop == Some(StopReason::ScenarioDone) && scenario.is_none() {
         return Err("--expect-stop scenario_done requires --scenario".to_string());
     }
     if scenario.is_some() && stop_pc.is_some() {
         return Err("--scenario and --stop-pc define competing successful stops".to_string());
-    }
-    if scenario.is_some() && replay_scenario.is_some() {
-        return Err("--scenario and --replay-scenario are mutually exclusive".to_string());
-    }
-    if replay_scenario.is_some() && !machine_api && !preview_api {
-        return Err("--replay-scenario requires --machine-api or --preview-api".to_string());
-    }
-    if replay_scenario.is_some() && stop_pc.is_some() {
-        return Err("--replay-scenario cannot be combined with --stop-pc".to_string());
-    }
-    if replay_scenario.is_some() && expected_stop.is_some() {
-        return Err("--replay-scenario cannot be combined with --expect-stop".to_string());
-    }
-    if replay_scenario.is_some()
-        && (!expected_uart.is_empty() || expected_audio_sink_count.is_some())
-    {
-        return Err("--replay-scenario cannot be combined with report expectations".to_string());
     }
     if scenario.is_some()
         && expected_stop.is_some()
@@ -978,186 +493,20 @@ fn parse_args() -> Result<Args, String> {
     if stop_pc.is_some() && expected_stop.is_some() && expected_stop != Some(StopReason::PcMatch) {
         return Err("--stop-pc only permits --expect-stop pc_match".to_string());
     }
-    if expected_audio_sink_count.is_some() != expected_audio_sink_sha256.is_some() {
-        return Err(
-            "--expect-audio-sink-count and --expect-audio-sink-sha256 must be used together"
-                .to_string(),
-        );
-    }
-    match (&run_id, progress_interval) {
-        (Some(_), None) => return Err("--run-id requires --progress-interval".to_string()),
-        (None, Some(_)) => {
-            return Err("--progress-interval requires --run-id".to_string());
-        }
-        _ => {}
-    }
-    if machine_api {
-        if boot_mode == BootRequest::Boot2 {
-            return Err("--machine-api cannot be combined with --boot-mode boot2".to_string());
-        }
-        let conflicts = [
-            (scenario.is_some(), "--scenario"),
-            (stop_pc.is_some(), "--stop-pc"),
-            (json.is_some(), "--json"),
-            (uart.is_some(), "--uart"),
-            (host_timing.is_some(), "--host-timing"),
-            (flash_image_out.is_some(), "--flash-image-out"),
-            (fb_png.is_some(), "--fb-png"),
-            (expected_stop.is_some(), "--expect-stop"),
-            (!expected_uart.is_empty(), "--expect-uart"),
-            (
-                expected_audio_sink_count.is_some(),
-                "audio sink expectations",
-            ),
-            (audio_analysis.is_some(), "--audio-analysis"),
-            (audio_wav.is_some(), "--audio-wav"),
-            (keys.is_some(), "--keys"),
-            (sd_image_out.is_some(), "--sd-image-out"),
-            (sd_trace.is_some(), "--sd-trace"),
-            (i2c_profile.is_some(), "--i2c-profile"),
-            (i2c_fixture.is_some(), "--i2c-fixture"),
-            (i2c_report.is_some(), "--i2c-report"),
-            (run_id.is_some(), "--run-id"),
-            (progress_interval.is_some(), "--progress-interval"),
-        ];
-        if let Some((_, name)) = conflicts.into_iter().find(|(present, _)| *present) {
-            return Err(format!("--machine-api cannot be combined with {name}"));
-        }
-    }
-    if preview_api {
-        if machine_api {
-            return Err("--preview-api cannot be combined with --machine-api".to_string());
-        }
-        if boot_mode == BootRequest::Boot2 {
-            return Err("--preview-api cannot be combined with --boot-mode boot2".to_string());
-        }
-        let conflicts = [
-            (scenario.is_some(), "--scenario"),
-            (stop_pc.is_some(), "--stop-pc"),
-            (json.is_some(), "--json"),
-            (uart.is_some(), "--uart"),
-            (host_timing.is_some(), "--host-timing"),
-            (flash_image_out.is_some(), "--flash-image-out"),
-            (fb_png.is_some(), "--fb-png"),
-            (expected_stop.is_some(), "--expect-stop"),
-            (!expected_uart.is_empty(), "--expect-uart"),
-            (
-                expected_audio_sink_count.is_some(),
-                "audio sink expectations",
-            ),
-            (audio_analysis.is_some(), "--audio-analysis"),
-            (audio_wav.is_some(), "--audio-wav"),
-            (keys.is_some(), "--keys"),
-            (sd_image_out.is_some(), "--sd-image-out"),
-            (sd_trace.is_some(), "--sd-trace"),
-            (i2c_profile.is_some(), "--i2c-profile"),
-            (i2c_fixture.is_some(), "--i2c-fixture"),
-            (i2c_report.is_some(), "--i2c-report"),
-            (run_id.is_some(), "--run-id"),
-            (progress_interval.is_some(), "--progress-interval"),
-        ];
-        if let Some((_, name)) = conflicts.into_iter().find(|(present, _)| *present) {
-            return Err(format!("--preview-api cannot be combined with {name}"));
-        }
-    }
-    #[cfg(feature = "idle-profiler")]
-    if machine_api && idle_profile.is_some() {
-        return Err("--machine-api cannot be combined with --idle-profile".to_string());
-    }
-    #[cfg(feature = "idle-profiler")]
-    if preview_api && idle_profile.is_some() {
-        return Err("--preview-api cannot be combined with --idle-profile".to_string());
-    }
-    #[cfg(feature = "behavior-trace")]
-    if machine_api && behavior_trace.is_some() {
-        return Err("--machine-api cannot be combined with --behavior-trace".to_string());
-    }
-    #[cfg(feature = "behavior-trace")]
-    if preview_api && behavior_trace.is_some() {
-        return Err("--preview-api cannot be combined with --behavior-trace".to_string());
-    }
-    #[cfg(feature = "event-horizon-profiler")]
-    if machine_api && event_horizon_profile.is_some() {
-        return Err("--machine-api cannot be combined with --event-horizon-profile".to_string());
-    }
-    #[cfg(feature = "event-horizon-profiler")]
-    if preview_api && event_horizon_profile.is_some() {
-        return Err("--preview-api cannot be combined with --event-horizon-profile".to_string());
-    }
-    #[cfg(feature = "event-horizon-profiler")]
-    if machine_api && event_horizon_profile_after_uart.is_some() {
-        return Err(
-            "--machine-api cannot be combined with --event-horizon-profile-after-uart".to_string(),
-        );
-    }
-    #[cfg(feature = "event-horizon-profiler")]
-    if preview_api && event_horizon_profile_after_uart.is_some() {
-        return Err(
-            "--preview-api cannot be combined with --event-horizon-profile-after-uart".to_string(),
-        );
-    }
     #[cfg(all(feature = "idle-profiler", feature = "behavior-trace"))]
     if idle_profile.is_some() && behavior_trace.is_some() {
         return Err(
             "--idle-profile and --behavior-trace are separate diagnostic modes".to_string(),
         );
     }
-    #[cfg(feature = "event-horizon-profiler")]
-    if event_horizon_profile.is_some() && (idle_profile.is_some() || behavior_trace.is_some()) {
-        return Err(
-            "--event-horizon-profile is a separate diagnostic mode from --idle-profile/--behavior-trace"
-                .to_string(),
-        );
-    }
-    #[cfg(feature = "event-horizon-profiler")]
-    if event_horizon_profile_after_uart.is_some() && event_horizon_profile.is_none() {
-        return Err(
-            "--event-horizon-profile-after-uart requires --event-horizon-profile".to_string(),
-        );
-    }
-    #[cfg(feature = "cpu-application-profiler")]
-    if machine_api && cpu_application_profile.is_some() {
-        return Err("--machine-api cannot be combined with --cpu-application-profile".to_string());
-    }
-    #[cfg(feature = "cpu-application-profiler")]
-    if preview_api && cpu_application_profile.is_some() {
-        return Err("--preview-api cannot be combined with --cpu-application-profile".to_string());
-    }
-    #[cfg(all(feature = "cpu-application-profiler", feature = "idle-profiler"))]
-    if cpu_application_profile.is_some() && idle_profile.is_some() {
-        return Err(
-            "--cpu-application-profile and --idle-profile are separate diagnostic modes"
-                .to_string(),
-        );
-    }
-    #[cfg(all(feature = "cpu-application-profiler", feature = "behavior-trace"))]
-    if cpu_application_profile.is_some() && behavior_trace.is_some() {
-        return Err(
-            "--cpu-application-profile and --behavior-trace are separate diagnostic modes"
-                .to_string(),
-        );
-    }
-    #[cfg(all(
-        feature = "cpu-application-profiler",
-        feature = "event-horizon-profiler"
-    ))]
-    if cpu_application_profile.is_some() && event_horizon_profile.is_some() {
-        return Err(
-            "--cpu-application-profile and --event-horizon-profile are separate diagnostic modes"
-                .to_string(),
-        );
-    }
 
     Ok(Args {
         bin: bin.ok_or_else(|| "missing required --bin <path>".to_string())?,
         bootrom: bootrom.unwrap_or_else(|| PathBuf::from(DEFAULT_BOOTROM_PATH)),
-        boot_mode,
         cycles: cycles.unwrap_or(DEFAULT_CYCLE_LIMIT),
         stop_pc,
         json,
         uart,
-        host_timing,
-        flash_image_out,
         expected_backend_commit,
         board,
         lcd_variant,
@@ -1166,38 +515,17 @@ fn parse_args() -> Result<Args, String> {
         psram,
         psram_verify_range,
         keyboard,
-        i2c_profile,
-        i2c_fixture,
-        i2c_report,
         sd,
-        sd_image,
-        sd_image_out,
-        sd_trace,
         sd_format,
         keys,
         scenario,
-        replay_scenario,
         snapshot_dir: snapshot_dir.unwrap_or_else(|| PathBuf::from(".")),
-        machine_api,
-        preview_api,
-        run_id,
-        progress_interval,
         expected_stop,
         expected_uart,
-        expected_audio_sink_count,
-        expected_audio_sink_sha256,
-        audio_analysis,
-        audio_wav,
         #[cfg(feature = "idle-profiler")]
         idle_profile,
         #[cfg(feature = "behavior-trace")]
         behavior_trace,
-        #[cfg(feature = "event-horizon-profiler")]
-        event_horizon_profile,
-        #[cfg(feature = "event-horizon-profiler")]
-        event_horizon_profile_after_uart,
-        #[cfg(feature = "cpu-application-profiler")]
-        cpu_application_profile,
     })
 }
 
@@ -1249,106 +577,6 @@ struct RunOutcome {
     exception: Option<&'static str>,
     error: Option<String>,
     uart_bytes: Vec<u8>,
-    watchdog_resets: Vec<WatchdogResetEvent>,
-}
-
-/// Host timing captured only around the authoritative in-process emulation
-/// loop. The sidecar is deliberately separate from the deterministic report:
-/// CPU scheduling and wall time are host observations, not guest behavior.
-struct HostTimingStart {
-    wall: Instant,
-    cpu_ns: Option<u64>,
-}
-
-struct HostTiming {
-    wall_ns: u64,
-    cpu_ns: Option<u64>,
-}
-
-fn process_cpu_time_ns() -> Option<u64> {
-    #[cfg(unix)]
-    {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `ts` is a valid writable timespec and the clock ID is a
-        // process-wide clock supplied by libc for this platform.
-        let status = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
-        if status != 0 {
-            return None;
-        }
-        let seconds = u64::try_from(ts.tv_sec).ok()?;
-        let nanos = u64::try_from(ts.tv_nsec).ok()?;
-        seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
-
-impl HostTimingStart {
-    fn start() -> Self {
-        Self {
-            wall: Instant::now(),
-            cpu_ns: process_cpu_time_ns(),
-        }
-    }
-
-    fn finish(self) -> HostTiming {
-        let wall_ns = self.wall.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        let cpu_ns = process_cpu_time_ns().and_then(|end| end.checked_sub(self.cpu_ns?));
-        HostTiming { wall_ns, cpu_ns }
-    }
-}
-
-const HOST_TIMING_SCHEMA_VERSION: u32 = 1;
-
-fn host_timing_json(
-    timing: &HostTiming,
-    firmware_name: &str,
-    firmware_sha: &str,
-    backend_commit: &str,
-    backend_dirty: bool,
-    board: Board,
-    step_quantum: u32,
-    outcome: &RunOutcome,
-) -> String {
-    let cpu_ns = timing
-        .cpu_ns
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let cpu_seconds = timing
-        .cpu_ns
-        .map(|value| value as f64 / 1_000_000_000.0)
-        .unwrap_or(0.0);
-    let cpu_throughput = timing
-        .cpu_ns
-        .filter(|&value| value > 0)
-        .map(|value| outcome.cycles as f64 / (value as f64 / 1_000_000_000.0))
-        .map(|value| format!("{value:.9}"))
-        .unwrap_or_else(|| "null".to_string());
-    let wall_throughput = if timing.wall_ns > 0 {
-        format!(
-            "{:.9}",
-            outcome.cycles as f64 / (timing.wall_ns as f64 / 1_000_000_000.0)
-        )
-    } else {
-        "null".to_string()
-    };
-    format!(
-        "{{\n  \"schema_version\": {HOST_TIMING_SCHEMA_VERSION},\n  \"artifact_type\": \"in-process-host-timing\",\n  \"timing_scope\": \"picocalc-harness::run_loop\",\n  \"cpu_clock\": \"CLOCK_PROCESS_CPUTIME_ID\",\n  \"firmware\": {{\"basename\": {}, \"sha256\": {}}},\n  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n  \"board\": {},\n  \"step_quantum\": {step_quantum},\n  \"cycles\": {},\n  \"stop_reason\": {},\n  \"emulation_wall_ns\": {},\n  \"emulation_cpu_ns\": {},\n  \"emulation_cpu_seconds\": {cpu_seconds:.9},\n  \"cycles_per_emulation_cpu_second\": {cpu_throughput},\n  \"cycles_per_emulation_wall_second\": {wall_throughput}\n}}\n",
-        json_string(firmware_name),
-        json_string(firmware_sha),
-        json_string(backend_commit),
-        backend_dirty,
-        json_string(board.as_str()),
-        outcome.cycles,
-        json_string(outcome.stop_reason.as_str()),
-        timing.wall_ns,
-        cpu_ns,
-    )
 }
 
 /// Process result. `CannotJudge` is distinct from a negative firmware
@@ -1367,14 +595,6 @@ impl Verdict {
             Verdict::Pass => "pass",
             Verdict::Fail => "fail",
             Verdict::CannotJudge => "cannot_judge",
-        }
-    }
-
-    fn exit_code(self) -> u8 {
-        match self {
-            Verdict::Pass => 0,
-            Verdict::Fail => 1,
-            Verdict::CannotJudge => 2,
         }
     }
 }
@@ -1500,37 +720,13 @@ fn judge_run(
     }
 }
 
-fn apply_audio_sink_expectation(verdict: &mut VerdictReport, audio_sink: Option<&AudioSinkReport>) {
-    if audio_sink.is_some_and(|report| report.expectation_failed()) {
-        verdict.status = Verdict::Fail;
-        verdict.reasons.push("audio_sink_mismatch");
-    }
-}
-
-#[cfg(feature = "sd-gen1-multiblock")]
-fn apply_sd_protocol_errors(verdict: &mut VerdictReport, sd: Option<&SdReport>) {
-    if sd.is_some_and(|report| !report.protocol_errors.is_empty()) {
-        verdict.status = Verdict::Fail;
-        verdict.reasons.push("sd_protocol_error");
-    }
-}
-
-fn apply_i2c_protocol_errors(verdict: &mut VerdictReport, observation: &I2cBusObservation) {
-    if observation.protocol_errors > 0 || observation.data_nacks > 0 {
-        verdict.status = Verdict::Fail;
-        verdict.reasons.push("i2c_protocol_error");
-    }
-}
-
 /// ARMv6-M IPSR exception numbers that mean "the firmware has fallen
 /// over". Ordinary IRQs (>= 16), SVCall, PendSV and SysTick are normal
 /// operation and must not stop the run.
-fn fatal_exception_name(core: usize, ipsr: u32) -> Option<&'static str> {
-    match (core, ipsr) {
-        (0, 2) => Some("NMI"),
-        (0, 3) => Some("HardFault"),
-        (1, 2) => Some("core1 NMI"),
-        (1, 3) => Some("core1 HardFault"),
+fn fatal_exception_name(ipsr: u32) -> Option<&'static str> {
+    match ipsr {
+        2 => Some("NMI"),
+        3 => Some("HardFault"),
         _ => None,
     }
 }
@@ -1555,570 +751,6 @@ fn load_image(path: &Path, what: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Runtime metadata for one explicitly selected optional I2C profile.
-struct I2cProfileRuntime {
-    profile: String,
-    fixture_id: String,
-    fixture_basename: Option<String>,
-    fixture_sha256: Option<String>,
-    attached_addresses: Vec<u16>,
-    mux: Arc<Mutex<I2cBusMux>>,
-}
-
-impl I2cProfileRuntime {
-    fn observation(&self) -> I2cBusObservation {
-        self.mux.lock().expect("I2C mux mutex").observation()
-    }
-}
-
-/// The emulator owns the trait object while the runner retains a shared
-/// handle for the profile sidecar. This keeps observation out of the primary
-/// report and avoids downcasting a board-specific model through rp2040-emu.
-struct SharedI2cBusMux {
-    inner: Arc<Mutex<I2cBusMux>>,
-}
-
-impl I2cExternalDevice for SharedI2cBusMux {
-    fn responds_to(&self, addr: u16) -> bool {
-        self.inner.lock().expect("I2C mux mutex").responds_to(addr)
-    }
-
-    fn address_phase(&mut self, addr: u16) -> bool {
-        self.inner
-            .lock()
-            .expect("I2C mux mutex")
-            .address_phase(addr)
-    }
-
-    fn write_byte(&mut self, byte: u8) -> bool {
-        self.inner.lock().expect("I2C mux mutex").write_byte(byte)
-    }
-
-    fn read_byte(&mut self) -> u8 {
-        self.inner.lock().expect("I2C mux mutex").read_byte()
-    }
-
-    fn transaction_end(&mut self) {
-        self.inner.lock().expect("I2C mux mutex").transaction_end();
-    }
-
-    fn advance_virtual_time(&mut self, delta: rp2040_emu::peripherals::i2c::I2cVirtualTimeDelta) {
-        self.inner
-            .lock()
-            .expect("I2C mux mutex")
-            .advance_virtual_time(delta);
-    }
-}
-
-fn fixture_object<'a>(
-    value: &'a serde_json::Value,
-    path: &str,
-) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
-    value
-        .as_object()
-        .ok_or_else(|| format!("{path} must be an object"))
-}
-
-fn fixture_u64(value: &serde_json::Value, path: &str) -> Result<u64, String> {
-    value
-        .as_u64()
-        .ok_or_else(|| format!("{path} must be an unsigned integer"))
-}
-
-fn fixture_string<'a>(
-    object: &'a serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    path: &str,
-) -> Result<&'a str, String> {
-    object
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("{path}.{key} must be a string"))
-}
-
-fn parse_fixture_hex_byte(value: &serde_json::Value, path: &str) -> Result<u8, String> {
-    let number = fixture_u64(value, path)?;
-    u8::try_from(number).map_err(|_| format!("{path} must be in the range 0..=255"))
-}
-
-fn parse_fixture_registers(
-    state: &serde_json::Map<String, serde_json::Value>,
-    path: &str,
-) -> Result<[u8; picocalc_board::AT24C32_SIZE], String> {
-    let mut image = [0u8; picocalc_board::AT24C32_SIZE];
-    let Some(registers) = state.get("registers") else {
-        return Ok(image);
-    };
-    let registers = fixture_object(registers, &format!("{path}.registers"))?;
-    for (key, value) in registers {
-        let raw = key
-            .strip_prefix("0x")
-            .ok_or_else(|| format!("{path}.registers.{key} must use a 0x prefix"))?;
-        let address = u16::from_str_radix(raw, 16)
-            .map_err(|_| format!("{path}.registers.{key} is not hexadecimal"))?;
-        if usize::from(address) >= image.len() {
-            return Err(format!(
-                "{path}.registers.{key} is outside the AT24C32 image"
-            ));
-        }
-        image[usize::from(address)] =
-            parse_fixture_hex_byte(value, &format!("{path}.registers.{key}"))?;
-    }
-    Ok(image)
-}
-
-fn parse_fixture_bytes<const N: usize>(
-    state: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    path: &str,
-) -> Result<[u8; N], String> {
-    let raw = fixture_string(state, key, path)?;
-    let compact = raw
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace() && *character != '-')
-        .collect::<String>();
-    if compact.len() != N * 2 {
-        return Err(format!(
-            "{path}.{key} must contain exactly {N} hexadecimal bytes"
-        ));
-    }
-    let mut bytes = [0u8; N];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16).map_err(|_| {
-            format!("{path}.{key} contains a non-hexadecimal byte at index {index}")
-        })?;
-    }
-    Ok(bytes)
-}
-
-fn parse_fixture_datetime(raw: &str) -> Result<RtcDateTime, String> {
-    if raw.len() != 20
-        || raw.as_bytes().get(4) != Some(&b'-')
-        || raw.as_bytes().get(7) != Some(&b'-')
-        || raw.as_bytes().get(10) != Some(&b'T')
-        || raw.as_bytes().get(13) != Some(&b':')
-        || raw.as_bytes().get(16) != Some(&b':')
-        || raw.as_bytes().get(19) != Some(&b'Z')
-    {
-        return Err(format!(
-            "invalid DS3231 initial_datetime '{raw}' (expected YYYY-MM-DDTHH:MM:SSZ)"
-        ));
-    }
-    let parse = |range: std::ops::Range<usize>, name: &str| {
-        raw[range]
-            .parse::<u16>()
-            .map_err(|_| format!("invalid {name} in DS3231 initial_datetime '{raw}'"))
-    };
-    let year = parse(0..4, "year")?;
-    let month = u8::try_from(parse(5..7, "month")?)
-        .map_err(|_| "month is outside the u8 range".to_string())?;
-    let day = u8::try_from(parse(8..10, "day")?)
-        .map_err(|_| "day is outside the u8 range".to_string())?;
-    let hour = u8::try_from(parse(11..13, "hour")?)
-        .map_err(|_| "hour is outside the u8 range".to_string())?;
-    let minute = u8::try_from(parse(14..16, "minute")?)
-        .map_err(|_| "minute is outside the u8 range".to_string())?;
-    let second = u8::try_from(parse(17..19, "second")?)
-        .map_err(|_| "second is outside the u8 range".to_string())?;
-
-    // DS3231 uses 1=Sunday..7=Saturday.  Count from Saturday 2000-01-01.
-    let mut days = 0u64;
-    for y in 2000..year {
-        days += if (y % 400 == 0) || (y % 4 == 0 && y % 100 != 0) {
-            366
-        } else {
-            365
-        };
-    }
-    for m in 1..month {
-        days += match m {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 if (year % 400 == 0) || (year % 4 == 0 && year % 100 != 0) => 29,
-            2 => 28,
-            _ => 0,
-        };
-    }
-    days += u64::from(day.saturating_sub(1));
-    let day_of_week = ((6 + days % 7) % 7 + 1) as u8;
-    RtcDateTime::new(year, month, day, day_of_week, hour, minute, second)
-        .ok_or_else(|| format!("invalid DS3231 initial_datetime '{raw}'"))
-}
-
-fn build_i2c_profile(
-    profile: &str,
-    fixture_path: Option<&Path>,
-    keyboard: Option<Arc<Mutex<Keyboard>>>,
-) -> Result<I2cProfileRuntime, String> {
-    if profile != "picocalc-rtc-v1" && profile != "picocalc-rtc-env-v1" {
-        return Err(format!("unsupported I2C profile '{profile}'"));
-    }
-
-    // The values are deliberately ordinary, deterministic sensor samples;
-    // callers needing another environment provide a fixture instead.
-    let builtin_aht20 = [0x18, 0x80, 0x00, 0x06, 0x00, 0x00, 0x23];
-    let builtin_bmp280_calibration = [
-        0x70, 0x6b, 0x43, 0x67, 0x18, 0xfc, 0x7d, 0x8e, 0x43, 0xd6, 0xd0, 0x0b, 0x27, 0x0b, 0x8c,
-        0x00, 0xf9, 0xff, 0x8c, 0x3c, 0xf8, 0xc6, 0x70, 0x17,
-    ];
-    let builtin_bmp280_measurement = [0x65, 0x5a, 0xc0, 0x7e, 0xed, 0x00];
-    let (
-        fixture_id,
-        fixture_basename,
-        fixture_sha256,
-        datetime,
-        osf,
-        eeprom,
-        aht_measurement,
-        bmp_calibration,
-        bmp_measurement,
-        seen_aht20,
-        seen_bmp280,
-    ) = if let Some(path) = fixture_path {
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("reading I2C fixture {}: {e}", path.display()))?;
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|e| format!("I2C fixture {} is not UTF-8: {e}", path.display()))?;
-        let value: serde_json::Value = serde_json::from_str(text)
-            .map_err(|e| format!("parsing I2C fixture {}: {e}", path.display()))?;
-        let root = fixture_object(&value, "fixture")?;
-        if fixture_u64(
-            root.get("schema_version")
-                .ok_or_else(|| "fixture.schema_version is required".to_string())?,
-            "fixture.schema_version",
-        )? != 1
-        {
-            return Err("fixture.schema_version must be 1".to_string());
-        }
-        let fixture_profile = fixture_string(root, "profile", "fixture")?;
-        if fixture_profile != profile {
-            return Err(format!(
-                "fixture.profile '{}' does not match --i2c-profile '{}'",
-                fixture_profile, profile
-            ));
-        }
-        let bus = fixture_object(
-            root.get("bus")
-                .ok_or_else(|| "fixture.bus is required".to_string())?,
-            "fixture.bus",
-        )?;
-        if fixture_string(bus, "controller", "fixture.bus")? != "i2c1"
-            || fixture_u64(
-                bus.get("sda_gpio")
-                    .ok_or_else(|| "fixture.bus.sda_gpio is required".to_string())?,
-                "fixture.bus.sda_gpio",
-            )? != 6
-            || fixture_u64(
-                bus.get("scl_gpio")
-                    .ok_or_else(|| "fixture.bus.scl_gpio is required".to_string())?,
-                "fixture.bus.scl_gpio",
-            )? != 7
-            || fixture_u64(
-                bus.get("address_bits")
-                    .ok_or_else(|| "fixture.bus.address_bits is required".to_string())?,
-                "fixture.bus.address_bits",
-            )? != 7
-        {
-            return Err(
-                "fixture.bus must describe i2c1 on GPIO6/GPIO7 with 7-bit addresses".to_string(),
-            );
-        }
-        let devices = root
-            .get("devices")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "fixture.devices must be an array".to_string())?;
-        let mut datetime = None;
-        let mut osf = false;
-        let mut eeprom = [0u8; picocalc_board::AT24C32_SIZE];
-        let mut seen_ds3231 = false;
-        let mut seen_at24c32 = false;
-        let mut aht_measurement = builtin_aht20;
-        let mut bmp_calibration = builtin_bmp280_calibration;
-        let mut bmp_measurement = builtin_bmp280_measurement;
-        let mut seen_aht20 = false;
-        let mut seen_bmp280 = false;
-        let mut seen_keyboard = false;
-        for (index, device) in devices.iter().enumerate() {
-            let path = format!("fixture.devices[{index}]");
-            let device = fixture_object(device, &path)?;
-            let kind = fixture_string(device, "kind", &path)?;
-            let address = fixture_u64(
-                device
-                    .get("address")
-                    .ok_or_else(|| format!("{path}.address is required"))?,
-                &format!("{path}.address"),
-            )?;
-            let state = fixture_object(
-                device
-                    .get("state")
-                    .ok_or_else(|| format!("{path}.state is required"))?,
-                &format!("{path}.state"),
-            )?;
-            if fixture_string(state, "encoding", &format!("{path}.state"))? != "register_bytes" {
-                return Err(format!("{path}.state.encoding must be register_bytes"));
-            }
-            match kind {
-                "ds3231" => {
-                    if address != u64::from(picocalc_board::DS3231_ADDRESS) || seen_ds3231 {
-                        return Err(format!("{path} must be the unique DS3231 at 0x68"));
-                    }
-                    let raw_datetime =
-                        fixture_string(state, "initial_datetime", &format!("{path}.state"))?;
-                    datetime = Some(parse_fixture_datetime(raw_datetime)?);
-                    osf = state
-                        .get("osf")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                    seen_ds3231 = true;
-                }
-                "at24c32" => {
-                    if address != u64::from(picocalc_board::AT24C32_ADDRESS) || seen_at24c32 {
-                        return Err(format!("{path} must be the unique AT24C32 at 0x57"));
-                    }
-                    eeprom = parse_fixture_registers(state, &format!("{path}.state"))?;
-                    seen_at24c32 = true;
-                }
-                "aht20" => {
-                    if profile != "picocalc-rtc-env-v1"
-                        || address != u64::from(picocalc_board::AHT20_ADDRESS)
-                        || seen_aht20
-                    {
-                        return Err(format!(
-                            "{path} must be the unique AHT20 at 0x38 in picocalc-rtc-env-v1"
-                        ));
-                    }
-                    aht_measurement =
-                        parse_fixture_bytes(state, "measurement_bytes", &format!("{path}.state"))?;
-                    // Aht20::new performs the CRC check before the model is
-                    // attached, so malformed fixtures fail closed here.
-                    Aht20::new(aht_measurement)
-                        .map_err(|error| format!("{path}.state: {error}"))?;
-                    seen_aht20 = true;
-                }
-                "bmp280" => {
-                    if profile != "picocalc-rtc-env-v1"
-                        || address != u64::from(picocalc_board::BMP280_ADDRESS)
-                        || seen_bmp280
-                    {
-                        return Err(format!(
-                            "{path} must be the unique BMP280 at 0x77 in picocalc-rtc-env-v1"
-                        ));
-                    }
-                    bmp_calibration =
-                        parse_fixture_bytes(state, "calibration_bytes", &format!("{path}.state"))?;
-                    bmp_measurement =
-                        parse_fixture_bytes(state, "measurement_bytes", &format!("{path}.state"))?;
-                    Bmp280::new(bmp_calibration, bmp_measurement)
-                        .map_err(|error| format!("{path}.state: {error}"))?;
-                    seen_bmp280 = true;
-                }
-                "keyboard" => {
-                    if address != u64::from(picocalc_board::keyboard::KEYBOARD_I2C_ADDR)
-                        || seen_keyboard
-                    {
-                        return Err(format!("{path} must use keyboard address 0x1f"));
-                    }
-                    seen_keyboard = true;
-                }
-                other => {
-                    return Err(format!(
-                        "{path}.kind '{other}' is not implemented by {profile}"
-                    ));
-                }
-            }
-        }
-        let datetime = datetime.ok_or_else(|| "fixture is missing ds3231".to_string())?;
-        if !seen_at24c32 {
-            return Err("fixture is missing at24c32".to_string());
-        }
-        if profile == "picocalc-rtc-env-v1" && !seen_aht20 {
-            return Err("picocalc-rtc-env-v1 fixture is missing aht20".to_string());
-        }
-        if profile == "picocalc-rtc-env-v1" && !seen_bmp280 {
-            return Err("picocalc-rtc-env-v1 fixture is missing bmp280".to_string());
-        }
-        if seen_keyboard && keyboard.is_none() {
-            return Err(
-                "fixture declares keyboard 0x1f; rerun with --keyboard to attach it".to_string(),
-            );
-        }
-        (
-            fixture_string(root, "fixture_id", "fixture")?.to_string(),
-            Some(basename(path)),
-            Some(sha256_hex(&bytes)),
-            datetime,
-            osf,
-            eeprom,
-            aht_measurement,
-            bmp_calibration,
-            bmp_measurement,
-            seen_aht20,
-            seen_bmp280,
-        )
-    } else {
-        (
-            format!("builtin-{profile}"),
-            None,
-            None,
-            parse_fixture_datetime("2024-01-01T00:00:00Z")?,
-            false,
-            [0u8; picocalc_board::AT24C32_SIZE],
-            builtin_aht20,
-            builtin_bmp280_calibration,
-            builtin_bmp280_measurement,
-            profile == "picocalc-rtc-env-v1",
-            profile == "picocalc-rtc-env-v1",
-        )
-    };
-
-    let mut mux = I2cBusMux::new();
-    if let Some(keyboard) = keyboard {
-        mux.add_device(
-            picocalc_board::keyboard::KEYBOARD_I2C_ADDR,
-            Box::new(KeyboardWire::new(keyboard)),
-        )
-        .map_err(|e| format!("adding keyboard to I2C profile: {e}"))?;
-    }
-    mux.add_device(
-        picocalc_board::DS3231_ADDRESS,
-        Box::new(Ds3231::new(datetime, osf)),
-    )
-    .map_err(|e| format!("adding DS3231 to I2C profile: {e}"))?;
-    mux.add_device(
-        picocalc_board::AT24C32_ADDRESS,
-        Box::new(At24c32::new(eeprom)),
-    )
-    .map_err(|e| format!("adding AT24C32 to I2C profile: {e}"))?;
-    if profile == "picocalc-rtc-env-v1" {
-        if !seen_aht20 || !seen_bmp280 {
-            return Err("picocalc-rtc-env-v1 requires AHT20 and BMP280".to_string());
-        }
-        mux.add_device(
-            picocalc_board::AHT20_ADDRESS,
-            Box::new(
-                Aht20::new(aht_measurement)
-                    .map_err(|error| format!("adding AHT20 to I2C profile: {error}"))?,
-            ),
-        )
-        .map_err(|e| format!("adding AHT20 to I2C profile: {e}"))?;
-        mux.add_device(
-            picocalc_board::BMP280_ADDRESS,
-            Box::new(
-                Bmp280::new(bmp_calibration, bmp_measurement)
-                    .map_err(|error| format!("adding BMP280 to I2C profile: {error}"))?,
-            ),
-        )
-        .map_err(|e| format!("adding BMP280 to I2C profile: {e}"))?;
-    }
-    let attached_addresses = mux.addresses().collect();
-    let mux = Arc::new(Mutex::new(mux));
-
-    Ok(I2cProfileRuntime {
-        profile: profile.to_string(),
-        fixture_id,
-        fixture_basename,
-        fixture_sha256,
-        attached_addresses,
-        mux,
-    })
-}
-
-fn write_i2c_profile_report(
-    path: &Path,
-    profile: &I2cProfileRuntime,
-    outcome: &RunOutcome,
-    verdict: &VerdictReport,
-) -> Result<(), String> {
-    let observation = profile.observation();
-    let status = if verdict.status == Verdict::Pass {
-        "pass"
-    } else {
-        "fail"
-    };
-    let addresses = profile
-        .attached_addresses
-        .iter()
-        .map(|address| json_string(&format!("0x{address:02x}")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let error = outcome
-        .error
-        .as_deref()
-        .map(json_string)
-        .unwrap_or_else(|| "null".to_string());
-    let reasons = verdict
-        .reasons
-        .iter()
-        .map(|reason| json_string(reason))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let child_json = observation
-        .children
-        .iter()
-        .map(|child| {
-            let state = serde_json::from_str::<serde_json::Value>(&child.state_summary)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|_| json_string(&child.state_summary));
-            format!(
-                "{{\"address\":\"0x{:02x}\",\"model\":{},\"address_phases\":{},\"address_acks\":{},\"address_nacks\":{},\"write_bytes\":{},\"read_bytes\":{},\"stop_count\":{},\"data_nacks\":{},\"protocol_errors\":{},\"state\":{}}}",
-                child.address,
-                json_string(&child.model),
-                child.address_phases,
-                child.address_acks,
-                child.address_nacks,
-                child.write_bytes,
-                child.read_bytes,
-                child.stop_count,
-                child.data_nacks,
-                child.protocol_errors,
-                state,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let model_scope = if profile.profile == "picocalc-rtc-env-v1" {
-        "E3-AHT20-BMP280-profile-attach"
-    } else {
-        "E2-DS3231-AT24C32-profile-attach"
-    };
-    let report = format!(
-        "{{\n  \"schema_version\": 2,\n  \"profile\": {},\n  \"fixture\": {{\"id\": {}, \"basename\": {}, \"sha256\": {}}},\n  \"bus\": {{\"controller\": \"i2c1\", \"sda_gpio\": 6, \"scl_gpio\": 7, \"address_bits\": 7}},\n  \"attached_addresses\": [{}],\n  \"model_scope\": {},\n  \"observation\": {{\"address_phases\": {}, \"address_acks\": {}, \"address_nacks\": {}, \"unknown_addresses\": {}, \"write_bytes\": {}, \"read_bytes\": {}, \"stop_count\": {}, \"data_nacks\": {}, \"protocol_errors\": {}, \"transaction_digest_sha256\": {}, \"children\": [{}]}},\n  \"status\": {},\n  \"verdict_status\": {},\n  \"verdict_reasons\": [{}],\n  \"stop_reason\": {},\n  \"cycles\": {},\n  \"error\": {}\n}}\n",
-        json_string(&profile.profile),
-        json_string(&profile.fixture_id),
-        profile
-            .fixture_basename
-            .as_deref()
-            .map(json_string)
-            .unwrap_or_else(|| "null".to_string()),
-        profile
-            .fixture_sha256
-            .as_deref()
-            .map(json_string)
-            .unwrap_or_else(|| "null".to_string()),
-        addresses,
-        json_string(model_scope),
-        observation.address_phases,
-        observation.address_acks,
-        observation.address_nacks,
-        observation.unknown_addresses,
-        observation.write_bytes,
-        observation.read_bytes,
-        observation.stop_count,
-        observation.data_nacks,
-        observation.protocol_errors,
-        json_string(&observation.transaction_digest_sha256),
-        child_json,
-        json_string(status),
-        json_string(verdict.status.as_str()),
-        reasons,
-        json_string(outcome.stop_reason.as_str()),
-        outcome.cycles,
-        error,
-    );
-    std::fs::write(path, report.as_bytes())
-        .map_err(|e| format!("writing I2C profile report {}: {e}", path.display()))
-}
-
 /// How execution was started. Reported so a run can never be mistaken
 /// for a direct boot that did not happen.
 ///
@@ -2130,13 +762,10 @@ fn write_i2c_profile_report(
 /// SDK vector table at flash+0x100 to seed from. It is *not* the real
 /// bootrom's USB-MSC path: nothing in the bootrom image executes; the
 /// reset vector is taken from ROM word 1 by `Emulator::reset`.
-/// `Boot2FromFlash` is the explicit U5-A path: the flash-resident boot2
-/// starts at XIP base and owns the subsequent handoff.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BootMode {
     DirectBootFromFlash,
     BootromResetVector,
-    Boot2FromFlash,
 }
 
 impl BootMode {
@@ -2144,46 +773,22 @@ impl BootMode {
         match self {
             BootMode::DirectBootFromFlash => "direct_boot_from_flash",
             BootMode::BootromResetVector => "bootrom_reset_vector",
-            BootMode::Boot2FromFlash => "boot2",
         }
     }
 }
 
-fn boot_report_fragment(boot_mode: BootMode) -> String {
-    match boot_mode {
-        BootMode::Boot2FromFlash => format!(
-            "  \"boot\": {{\"mode\": {}, \"vtor_flash_offset\": null}},\n",
-            json_string(boot_mode.as_str())
-        ),
-        BootMode::DirectBootFromFlash | BootMode::BootromResetVector => format!(
-            "  \"boot\": {{\"mode\": {}, \"vtor_flash_offset\": \"{:#06x}\"}},\n",
-            json_string(boot_mode.as_str()),
-            SDK_VTOR_FLASH_OFFSET
-        ),
-    }
-}
-
-/// Build the emulator and perform the selected startup handoff.
+/// Build the emulator and perform the direct-boot handoff.
 #[allow(clippy::type_complexity)]
 fn boot(
     firmware: Vec<u8>,
     bootrom: &[u8],
     step_quantum: u32,
-    boot_request: BootRequest,
     board: Board,
     lcd_variant: LcdVariant,
     psram: bool,
     keyboard: Option<Arc<Mutex<Keyboard>>>,
-    i2c_profile_device: Option<Box<dyn I2cExternalDevice>>,
     sd: Option<Arc<Mutex<SdCard>>>,
 ) -> Result<(Emulator, BootMode, Option<Arc<Mutex<St7365p>>>), String> {
-    if boot_request == BootRequest::Boot2 && firmware.len() < 256 {
-        return Err(format!(
-            "--boot-mode boot2 requires at least 256 firmware bytes for the boot2 region (got {})",
-            firmware.len()
-        ));
-    }
-
     let mut builder = EmulatorBuilder::new(Config {
         sys_clk_hz: DEFAULT_SYS_CLK_HZ,
     })
@@ -2221,15 +826,6 @@ fn boot(
                             Box::new(St7365pWire::new(lcd.clone())),
                         )
                         .map_err(|i| format!("no SPI instance {i} on RP2040"))?;
-                    // Variant A normally writes through SPI1, but its RAMRD
-                    // diagnostic temporarily deinitialises SPI1 and drives
-                    // the same pads from SIO. The SPI wire receives FIFO
-                    // frames; this pin wire receives only the SIO pad edges
-                    // and returns panel MISO through GPIO_IN. `update_gpio`
-                    // does not synthesize SPI-peripheral SCK/MOSI edges, so
-                    // attaching both paths cannot double-count normal writes.
-                    emu.bus
-                        .attach_pin_device(Box::new(LcdPioWire::new(lcd.clone())));
                 }
                 LcdVariant::B => {
                     emu.bus
@@ -2242,11 +838,7 @@ fn boot(
 
     // The keyboard/power controller hangs off I2C1 regardless of the
     // display model, same as the real mainboard.
-    if let Some(profile) = i2c_profile_device {
-        emu.bus
-            .attach_i2c_device_exclusive(pins::KEYBOARD_I2C_INSTANCE, profile)
-            .map_err(|i| format!("no I2C instance {i} on RP2040"))?;
-    } else if let Some(kbd) = keyboard {
+    if let Some(kbd) = keyboard {
         emu.bus
             .attach_i2c_device(
                 pins::KEYBOARD_I2C_INSTANCE,
@@ -2258,7 +850,6 @@ fn boot(
     // The card sits on SPI0. Card detect is an input to the chip, so it
     // is forced low here rather than driven by the device: the slot
     // reports "occupied" for as long as a card is attached.
-    let sd_attached = sd.is_some();
     if let Some(card) = sd {
         emu.bus
             .attach_spi_device(pins::SD_SPI_INSTANCE, Box::new(SdCardWire::new(card)))
@@ -2271,30 +862,6 @@ fn boot(
     // Loaded, never executed — see the module docs.
     emu.load_bootrom(bootrom);
     emu.reset();
-
-    // `Emulator::reset` models the MCU reset domain and deliberately clears
-    // harness GPIO overrides (cold-reset tests rely on that).  Card detect
-    // is an external slot signal, however, so restore the attached-card
-    // level after reset before entering boot2.  Without this re-assertion a
-    // real SD-backed loader sees the card electrically present on the first
-    // boot, while the emulator reports "SD card not found".
-    if sd_attached {
-        let detect = 1u32 << pins::SD_PIN_DETECT;
-        emu.bus.external_gpio_in_mask |= detect;
-        // The slot switch is physically active-low.  Firmware that needs a
-        // logical-high signal (the pinned uf2loader sets GPIO_CTRL.INOVER to
-        // INVERT) gets that transformation from IO_BANK0 in
-        // `Emulator::update_gpio`, rather than from a workload-specific
-        // harness polarity shortcut.
-        emu.bus.external_gpio_in_override &= !detect;
-        emu.bus.gpio_in &= !detect;
-    }
-
-    if boot_request == BootRequest::Boot2 {
-        emu.boot2_from_flash(RP2040_SRAM_TOP, 0)
-            .map_err(|error| format!("entering flash boot2: {error}"))?;
-        return Ok((emu, BootMode::Boot2FromFlash, lcd));
-    }
 
     // Sanity-check the vector table before seeding from it: a garbage
     // SP/PC pair means the image is not an SDK flash image and the run
@@ -2328,32 +895,97 @@ fn park_state(emu: &Emulator, core: usize) -> &'static str {
     }
 }
 
+/// Emulated cycles converted to virtual nanoseconds.
+///
+/// The system clock is not a constant: firmware boots on ROSC and moves
+/// to a PLL, so a fixed divisor would put every timestamp taken before
+/// the switch off by a factor of twenty. Instead the conversion is
+/// re-based whenever `clk_sys` changes — time already elapsed keeps the
+/// rate it was measured at, and only the new stretch uses the new rate.
+struct VirtualClock {
+    epoch_cycles: u64,
+    epoch_ns: u64,
+    hz: u64,
+}
+
+impl VirtualClock {
+    fn new(hz: u32) -> Self {
+        Self {
+            epoch_cycles: 0,
+            epoch_ns: 0,
+            hz: u64::from(hz).max(1),
+        }
+    }
+
+    fn ns_at(&self, cycles: u64) -> u64 {
+        let elapsed = u128::from(cycles.saturating_sub(self.epoch_cycles));
+        self.epoch_ns + (elapsed * 1_000_000_000 / u128::from(self.hz)) as u64
+    }
+
+    /// The cycle count at which the clock will read `ns`, saturating at
+    /// `u64::MAX` so a far-future deadline simply never arrives.
+    fn cycles_at(&self, ns: u64) -> u64 {
+        let ahead = u128::from(ns.saturating_sub(self.epoch_ns));
+        let cycles = ahead * u128::from(self.hz) / 1_000_000_000;
+        self.epoch_cycles
+            .saturating_add(u64::try_from(cycles).unwrap_or(u64::MAX))
+    }
+
+    /// Adopt a new rate from `cycles` onwards. No-op if unchanged.
+    fn rebase(&mut self, cycles: u64, hz: u32) -> bool {
+        let hz = u64::from(hz).max(1);
+        if hz == self.hz {
+            return false;
+        }
+        self.epoch_ns = self.ns_at(cycles);
+        self.epoch_cycles = cycles;
+        self.hz = hz;
+        true
+    }
+}
+
 /// Board models the scenario engine can reach into mid-run.
 #[derive(Default)]
 struct BoardHandles {
     lcd: Option<Arc<Mutex<St7365p>>>,
     keyboard: Option<Arc<Mutex<Keyboard>>>,
-    sd: Option<Arc<Mutex<SdCard>>>,
 }
 
 fn run_loop(
-    machine: &mut MachineSession,
+    emu: &mut Emulator,
     cycle_limit: u64,
     stop_pc: Option<u32>,
     mut engine: Option<&mut scenario::Engine>,
-    mut progress: Option<&mut ProgressReporter>,
+    board: &BoardHandles,
 ) -> RunOutcome {
-    // Keep the established batch hot loop byte-for-byte simple. The
-    // persistent API uses `MachineSession::advance_once`; the scenario client
-    // owns the same session state but retains its historical local dispatch
-    // counter so NEXT-4 does not add protocol bookkeeping to conformance runs.
-    let mut steps = 0u64;
+    let mut uart_bytes: Vec<u8> = Vec::new();
+    let mut steps: u64 = 0;
+
+    let mut vclock = VirtualClock::new(emu.bus.clock_tree.sys_clk_hz);
     // Comparing cycles rather than converting to nanoseconds keeps the
     // per-step check to one integer compare; the division only happens
     // at a poll or a clock change.
     let mut next_poll_cycles = match engine.as_deref() {
-        Some(e) => machine.emu.bus.virtual_time_cycles_at(e.next_poll_ns()),
+        Some(e) => vclock.cycles_at(e.next_poll_ns()),
         None => u64::MAX,
+    };
+
+    let finish = |emu: &mut Emulator,
+                  vclock: &VirtualClock,
+                  uart_bytes: &mut Vec<u8>,
+                  stop_reason: StopReason,
+                  exception: Option<&'static str>,
+                  error: Option<String>| {
+        uart_bytes.extend_from_slice(&emu.drain_uart0_tx_log());
+        RunOutcome {
+            stop_reason,
+            cycles: emu.clock.cycles,
+            elapsed_ns: vclock.ns_at(emu.clock.cycles),
+            pc: emu.cores[0].regs.pc(),
+            exception,
+            error,
+            uart_bytes: std::mem::take(uart_bytes),
+        }
     };
 
     loop {
@@ -2361,12 +993,19 @@ fn run_loop(
         // `--stop-pc` equal to the reset vector matches immediately, and
         // that a scenario's first step sees the machine at reset.
         if let Some(e) = engine.as_deref_mut()
-            && machine.cycles() >= next_poll_cycles
+            && emu.clock.cycles >= next_poll_cycles
         {
             // The engine may test the UART stream, so it must see every
             // byte sent so far — not just those the periodic drain has
             // collected.
-            machine.poll_scenario(e);
+            uart_bytes.extend_from_slice(&emu.drain_uart0_tx_log());
+            e.poll(&scenario::Observation {
+                now_ns: vclock.ns_at(emu.clock.cycles),
+                cycles: emu.clock.cycles,
+                lcd: board.lcd.as_deref(),
+                keyboard: board.keyboard.as_deref(),
+                uart: &uart_bytes,
+            });
             #[cfg(feature = "behavior-trace")]
             {
                 // The scenario file digest identifies the complete input
@@ -2376,47 +1015,74 @@ fn run_loop(
                 payload.extend_from_slice(&(e.results().len() as u64).to_be_bytes());
                 payload.push(u8::from(e.is_done()));
                 payload.extend_from_slice(&e.next_poll_ns().to_be_bytes());
-                payload.extend_from_slice(&(machine.uart_bytes.len() as u64).to_be_bytes());
-                machine
-                    .emu
-                    .record_behavior_event(BehaviorEventDomain::ScenarioInput, 1, &payload);
+                payload.extend_from_slice(&(uart_bytes.len() as u64).to_be_bytes());
+                emu.record_behavior_event(BehaviorEventDomain::ScenarioInput, 1, &payload);
             }
             if e.is_done() {
-                return machine.finish(StopReason::ScenarioDone, None, None);
+                return finish(
+                    emu,
+                    &vclock,
+                    &mut uart_bytes,
+                    StopReason::ScenarioDone,
+                    None,
+                    None,
+                );
             }
-            next_poll_cycles = machine.emu.bus.virtual_time_cycles_at(e.next_poll_ns());
+            next_poll_cycles = vclock.cycles_at(e.next_poll_ns());
             // A poll that changed nothing would otherwise re-fire every
             // step until virtual time moved on.
-            next_poll_cycles = next_poll_cycles.max(machine.cycles() + 1);
+            next_poll_cycles = next_poll_cycles.max(emu.clock.cycles + 1);
         }
 
         if let Some(target) = stop_pc
-            && machine.emu.cores[0].regs.pc() == target
+            && emu.cores[0].regs.pc() == target
         {
-            return machine.finish(StopReason::PcMatch, None, None);
+            return finish(
+                emu,
+                &vclock,
+                &mut uart_bytes,
+                StopReason::PcMatch,
+                None,
+                None,
+            );
         }
-        for (core, state) in machine.emu.cores.iter().enumerate() {
-            if let Some(name) = fatal_exception_name(core, state.regs.xpsr & 0x1FF) {
-                return machine.finish(StopReason::Exception, Some(name), None);
-            }
+        if let Some(name) = fatal_exception_name(emu.cores[0].regs.xpsr & 0x1FF) {
+            return finish(
+                emu,
+                &vclock,
+                &mut uart_bytes,
+                StopReason::Exception,
+                Some(name),
+                None,
+            );
         }
-        if machine.cycles() >= cycle_limit {
-            return machine.finish(StopReason::CycleLimit, None, None);
+        if emu.clock.cycles >= cycle_limit {
+            return finish(
+                emu,
+                &vclock,
+                &mut uart_bytes,
+                StopReason::CycleLimit,
+                None,
+                None,
+            );
         }
 
         let external_event_cycle = next_poll_cycles.min(cycle_limit);
-        let previous_hz = machine.emu.bus.clock_tree.sys_clk_hz;
-        let consumed = match machine.emu.step_until(external_event_cycle) {
-            Ok(consumed) => consumed,
-            Err(error) => {
-                return machine.finish(StopReason::Error, None, Some(error.to_string()));
+        let consumed = match emu.step_until(external_event_cycle) {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                return finish(
+                    emu,
+                    &vclock,
+                    &mut uart_bytes,
+                    StopReason::Error,
+                    None,
+                    Some(msg),
+                );
             }
         };
         steps += 1;
-
-        if let Err(error) = machine.handle_watchdog_reset() {
-            return machine.finish(StopReason::Error, None, Some(error));
-        }
 
         if consumed == 0 {
             // Every core is halted or parked on WFE, so the master
@@ -2428,18 +1094,21 @@ fn run_loop(
             let detail = format!(
                 "clock stalled: core0 {}, core1 {} — no wake source can fire \
                  while the master clock is frozen",
-                park_state(&machine.emu, 0),
-                park_state(&machine.emu, 1)
+                park_state(emu, 0),
+                park_state(emu, 1)
             );
-            return machine.finish(StopReason::Error, None, Some(detail));
+            return finish(
+                emu,
+                &vclock,
+                &mut uart_bytes,
+                StopReason::Error,
+                None,
+                Some(detail),
+            );
         }
 
         if steps.is_multiple_of(UART_DRAIN_INTERVAL) {
-            machine.drain_uart();
-        }
-
-        if let Some(reporter) = progress.as_mut() {
-            reporter.maybe_emit(machine.cycles(), cycle_limit);
+            uart_bytes.extend_from_slice(&emu.drain_uart0_tx_log());
         }
 
         // Firmware reprograms the clock tree during init; from here on,
@@ -2447,963 +1116,12 @@ fn run_loop(
         // mean. The pending poll deadline is expressed in nanoseconds, so
         // it moves with the rebase rather than being stranded at the old
         // rate.
-        if machine.emu.bus.clock_tree.sys_clk_hz != previous_hz
+        if vclock.rebase(emu.clock.cycles, emu.bus.clock_tree.sys_clk_hz)
             && let Some(e) = engine.as_deref()
         {
-            next_poll_cycles = machine
-                .emu
-                .bus
-                .virtual_time_cycles_at(e.next_poll_ns())
-                .max(machine.cycles() + 1);
+            next_poll_cycles = vclock.cycles_at(e.next_poll_ns()).max(emu.clock.cycles + 1);
         }
     }
-}
-
-/// Run a registered scenario to completion for the VRP-2 digest gate.  The
-/// replay driver shares the exact polling/advance semantics with `run_loop`,
-/// but deliberately stops without building a schema-8 report; callers inspect
-/// the shared observation projection through machine API or preview status.
-fn run_replay_to_completion(
-    machine: &mut MachineSession,
-    replay: &mut ScenarioReplay,
-) -> Result<(), String> {
-    loop {
-        match replay.step(machine)? {
-            ScenarioReplayStep::Advanced { .. } => {}
-            ScenarioReplayStep::Complete => {
-                machine.drain_uart();
-                return Ok(());
-            }
-            ScenarioReplayStep::Failed(error) => return Err(error),
-        }
-    }
-}
-
-const MACHINE_MAX_DISPATCHES: u64 = 1_000_000;
-const MACHINE_MAX_CYCLES: u64 = 100_000_000_000;
-const MACHINE_MAX_REQUEST_BYTES: usize = 1_048_576;
-const MACHINE_MAX_EVENT_BYTES: usize = 1_048_576;
-
-#[derive(Default)]
-struct MachineApiState {
-    subscriptions: BTreeSet<String>,
-    next_event_sequence: u64,
-    uart_cursor: usize,
-    framebuffer_sha: Option<String>,
-    stop_seen: bool,
-}
-
-fn protocol_error(
-    code: machine_protocol::ErrorCode,
-    message: impl Into<String>,
-) -> machine_protocol::ProtocolError {
-    machine_protocol::ProtocolError::new(code, message)
-}
-
-fn invalid_request(message: impl Into<String>) -> machine_protocol::ProtocolError {
-    protocol_error(machine_protocol::ErrorCode::InvalidRequest, message)
-}
-
-fn request_object(
-    request: &serde_json::Value,
-) -> Result<&serde_json::Map<String, serde_json::Value>, machine_protocol::ProtocolError> {
-    request
-        .as_object()
-        .ok_or_else(|| invalid_request("request root must be an object"))
-}
-
-fn required_u64(
-    object: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-    min: u64,
-    max: u64,
-) -> Result<u64, machine_protocol::ProtocolError> {
-    let value = object
-        .get(field)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            invalid_request(format!("field '{field}' must be a non-negative integer"))
-        })?;
-    if !(min..=max).contains(&value) {
-        return Err(invalid_request(format!(
-            "field '{field}' must be in {min}..={max}"
-        )));
-    }
-    Ok(value)
-}
-
-fn string_array(
-    object: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<Vec<String>, machine_protocol::ProtocolError> {
-    let values = object
-        .get(field)
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| invalid_request(format!("field '{field}' must be an array")))?;
-    if values.is_empty() {
-        return Err(invalid_request(format!(
-            "field '{field}' must not be empty"
-        )));
-    }
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            value.as_str().map(str::to_string).ok_or_else(|| {
-                invalid_request(format!("field '{field}[{index}]' must be a string"))
-            })
-        })
-        .collect()
-}
-
-fn session_stop_json(stop: Option<&SessionStop>) -> serde_json::Value {
-    match stop {
-        None => serde_json::Value::Null,
-        Some(SessionStop::Exception(exception)) => serde_json::json!({
-            "reason": "exception",
-            "exception": exception,
-        }),
-        Some(SessionStop::Error(error)) => serde_json::json!({
-            "reason": "error",
-            "error": error,
-        }),
-    }
-}
-
-fn framebuffer_json(
-    machine: &MachineSession,
-) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
-    let lcd = machine.board.lcd.as_ref().ok_or_else(|| {
-        protocol_error(
-            machine_protocol::ErrorCode::UnsupportedObservation,
-            "framebuffer observation requires --board picocalc",
-        )
-    })?;
-    let framebuffer = lcd
-        .lock()
-        .map_err(|_| {
-            protocol_error(
-                machine_protocol::ErrorCode::ModelError,
-                "LCD mutex poisoned",
-            )
-        })?
-        .framebuffer();
-    Ok(serde_json::json!({
-        "width": framebuffer.width,
-        "height": framebuffer.height,
-        "rgb565_sha256": framebuffer.rgb565_sha256(),
-        "non_black_pixels": framebuffer.non_black_pixels(),
-    }))
-}
-
-fn observe_domain(
-    machine: &mut MachineSession,
-    domain: &str,
-) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
-    match domain {
-        "machine" => {
-            machine.refresh_sticky_stop();
-            Ok(serde_json::json!({
-                "cycle": machine.cycles(),
-                "virtual_ns": machine.elapsed_ns(),
-                "core0": {
-                    "pc": machine.emu.cores[0].regs.pc(),
-                    "park": park_state(&machine.emu, 0),
-                },
-                "core1": {
-                    "pc": machine.emu.cores[1].regs.pc(),
-                    "park": park_state(&machine.emu, 1),
-                },
-                "stop": session_stop_json(machine.stopped()),
-            }))
-        }
-        "uart" => {
-            machine.drain_uart();
-            Ok(serde_json::json!({
-                "bytes": machine.uart_bytes.len(),
-                "sha256": sha256_hex(&machine.uart_bytes),
-                "text": String::from_utf8_lossy(&machine.uart_bytes),
-            }))
-        }
-        "framebuffer" => framebuffer_json(machine),
-        "preview" => {
-            machine.drain_uart();
-            let projection = machine.preview_observation_projection();
-            let canonical = serde_json::to_vec(&projection).map_err(|error| {
-                protocol_error(
-                    machine_protocol::ErrorCode::ModelError,
-                    format!("serializing preview observation: {error}"),
-                )
-            })?;
-            Ok(serde_json::json!({
-                "digest_sha256": sha256_hex(&canonical),
-                "projection": projection,
-                "schema_version": PREVIEW_OBSERVATION_SCHEMA_VERSION,
-                "virtual_cycle": machine.cycles(),
-            }))
-        }
-        "keyboard" => {
-            let keyboard = machine.board.keyboard.as_ref().ok_or_else(|| {
-                protocol_error(
-                    machine_protocol::ErrorCode::UnsupportedObservation,
-                    "keyboard observation requires --keyboard",
-                )
-            })?;
-            let keyboard = keyboard.lock().map_err(|_| {
-                protocol_error(
-                    machine_protocol::ErrorCode::ModelError,
-                    "keyboard mutex poisoned",
-                )
-            })?;
-            Ok(serde_json::json!({
-                "queued": keyboard.queued(),
-                "delivered": keyboard.key_events_delivered,
-                "dropped": keyboard.key_events_dropped,
-                "overwritten": keyboard.key_events_overwritten,
-                "caps_lock": keyboard.caps_lock,
-                "num_lock": keyboard.num_lock,
-            }))
-        }
-        "sd" => {
-            let card = machine.board.sd.as_ref().ok_or_else(|| {
-                protocol_error(
-                    machine_protocol::ErrorCode::UnsupportedObservation,
-                    "SD observation requires --sd",
-                )
-            })?;
-            let card = card.lock().map_err(|_| {
-                protocol_error(machine_protocol::ErrorCode::ModelError, "SD mutex poisoned")
-            })?;
-            Ok(serde_json::json!({
-                "format": card.format().as_str(),
-                "commands_seen": card.commands_seen,
-                "blocks_read": card.blocks_read,
-                "blocks_written": card.blocks_written,
-                "unknown_commands": card.unknown_commands,
-            }))
-        }
-        "unsupported_mmio" => Ok(serde_json::json!({
-            "entries": machine.emu.bus.unsupported_mmio_log(),
-            "truncated": machine.emu.bus.unsupported_mmio_log_truncated(),
-        })),
-        other => Err(protocol_error(
-            machine_protocol::ErrorCode::UnsupportedObservation,
-            format!("unknown observation domain '{other}'"),
-        )),
-    }
-}
-
-fn run_machine_budget(
-    machine: &mut MachineSession,
-    max_cycles: u64,
-) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
-    machine.refresh_sticky_stop();
-    if machine.stopped().is_some() {
-        return Err(protocol_error(
-            machine_protocol::ErrorCode::MachineStopped,
-            "machine is already stopped",
-        ));
-    }
-    let start = machine.cycles();
-    let target = start
-        .checked_add(max_cycles)
-        .ok_or_else(|| invalid_request("max_cycles overflows the master-cycle counter"))?;
-    let reason = loop {
-        machine.refresh_sticky_stop();
-        if machine.stopped().is_some() {
-            break "stopped";
-        }
-        if machine.cycles() >= target {
-            break "cycle_budget";
-        }
-        match machine.advance_once(target) {
-            Ok((0, _)) => {
-                machine.mark_clock_stalled();
-                break "stopped";
-            }
-            Ok(_) => {}
-            Err(_) if machine.stopped().is_some() => break "stopped",
-            Err(error) => {
-                return Err(protocol_error(
-                    machine_protocol::ErrorCode::ModelError,
-                    error,
-                ));
-            }
-        }
-    };
-    machine.drain_uart();
-    Ok(serde_json::json!({
-        "reason": reason,
-        "advanced_cycles": machine.cycles().saturating_sub(start),
-        "stop": session_stop_json(machine.stopped()),
-    }))
-}
-
-fn condition_holds(
-    machine: &mut MachineSession,
-    condition: &serde_json::Value,
-) -> Result<bool, machine_protocol::ProtocolError> {
-    let object = condition
-        .as_object()
-        .ok_or_else(|| invalid_request("field 'condition' must be an object"))?;
-    let kind = object
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| invalid_request("field 'condition.kind' must be a string"))?;
-    let allowed: &[&str] = match kind {
-        "pc_equals" | "cycle_at_least" => &["kind", "value"],
-        "uart_contains" => &["kind", "text"],
-        "pixel_equals" => &["kind", "x", "y", "value"],
-        "region_hash_equals" => &["kind", "x", "y", "w", "h", "sha256"],
-        other => {
-            return Err(invalid_request(format!("unknown condition kind '{other}'")));
-        }
-    };
-    let mut unknown = object
-        .keys()
-        .filter(|field| !allowed.contains(&field.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    unknown.sort();
-    if !unknown.is_empty() {
-        return Err(invalid_request(format!(
-            "condition contains unknown field(s): {}",
-            unknown.join(", ")
-        )));
-    }
-    let number = |field: &str| -> Result<u64, machine_protocol::ProtocolError> {
-        object
-            .get(field)
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| {
-                invalid_request(format!(
-                    "field 'condition.{field}' must be a non-negative integer"
-                ))
-            })
-    };
-    match kind {
-        "pc_equals" => {
-            let pc = u32::try_from(number("value")?)
-                .map_err(|_| invalid_request("field 'condition.value' does not fit in u32"))?;
-            Ok(machine.emu.cores[0].regs.pc() == pc)
-        }
-        "cycle_at_least" => Ok(machine.cycles() >= number("value")?),
-        "uart_contains" => {
-            let text = object
-                .get("text")
-                .and_then(serde_json::Value::as_str)
-                .filter(|text| !text.is_empty())
-                .ok_or_else(|| {
-                    invalid_request("field 'condition.text' must be a non-empty string")
-                })?;
-            machine.drain_uart();
-            Ok(machine
-                .uart_bytes
-                .windows(text.len())
-                .any(|window| window == text.as_bytes()))
-        }
-        "pixel_equals" => {
-            let x = usize::try_from(number("x")?)
-                .map_err(|_| invalid_request("condition.x is too large"))?;
-            let y = usize::try_from(number("y")?)
-                .map_err(|_| invalid_request("condition.y is too large"))?;
-            let value = u16::try_from(number("value")?)
-                .map_err(|_| invalid_request("condition.value does not fit in RGB565"))?;
-            let lcd = machine.board.lcd.as_ref().ok_or_else(|| {
-                protocol_error(
-                    machine_protocol::ErrorCode::UnsupportedObservation,
-                    "pixel condition requires --board picocalc",
-                )
-            })?;
-            let lcd = lcd.lock().map_err(|_| {
-                protocol_error(
-                    machine_protocol::ErrorCode::ModelError,
-                    "LCD mutex poisoned",
-                )
-            })?;
-            let pixel = lcd
-                .gram_pixel(x, y)
-                .ok_or_else(|| invalid_request("pixel coordinate is outside the framebuffer"))?;
-            Ok(pixel == value)
-        }
-        "region_hash_equals" => {
-            let x = usize::try_from(number("x")?)
-                .map_err(|_| invalid_request("condition.x is too large"))?;
-            let y = usize::try_from(number("y")?)
-                .map_err(|_| invalid_request("condition.y is too large"))?;
-            let w = usize::try_from(number("w")?)
-                .map_err(|_| invalid_request("condition.w is too large"))?;
-            let h = usize::try_from(number("h")?)
-                .map_err(|_| invalid_request("condition.h is too large"))?;
-            if w == 0 || h == 0 {
-                return Err(invalid_request(
-                    "condition region dimensions must be non-zero",
-                ));
-            }
-            let expected = object
-                .get("sha256")
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| {
-                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-                .ok_or_else(|| {
-                    invalid_request("field 'condition.sha256' must be 64 hexadecimal characters")
-                })?;
-            let lcd = machine.board.lcd.as_ref().ok_or_else(|| {
-                protocol_error(
-                    machine_protocol::ErrorCode::UnsupportedObservation,
-                    "region condition requires --board picocalc",
-                )
-            })?;
-            let lcd = lcd.lock().map_err(|_| {
-                protocol_error(
-                    machine_protocol::ErrorCode::ModelError,
-                    "LCD mutex poisoned",
-                )
-            })?;
-            let framebuffer = lcd.framebuffer();
-            if x.checked_add(w)
-                .is_none_or(|right| right > framebuffer.width)
-                || y.checked_add(h)
-                    .is_none_or(|bottom| bottom > framebuffer.height)
-            {
-                return Err(invalid_request(
-                    "condition region is outside the framebuffer",
-                ));
-            }
-            let mut bytes = Vec::with_capacity(w.saturating_mul(h).saturating_mul(2));
-            for row in y..y + h {
-                for column in x..x + w {
-                    bytes
-                        .extend_from_slice(&lcd.gram_pixel(column, row).unwrap_or(0).to_le_bytes());
-                }
-            }
-            Ok(sha256_hex(&bytes).eq_ignore_ascii_case(expected))
-        }
-        _ => unreachable!("condition kind was validated above"),
-    }
-}
-
-fn run_machine_until(
-    machine: &mut MachineSession,
-    condition: &serde_json::Value,
-    max_cycles: u64,
-    poll_cycles: u64,
-) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
-    machine.refresh_sticky_stop();
-    if machine.stopped().is_some() {
-        return Err(protocol_error(
-            machine_protocol::ErrorCode::MachineStopped,
-            "machine is already stopped",
-        ));
-    }
-    let start = machine.cycles();
-    let target = start
-        .checked_add(max_cycles)
-        .ok_or_else(|| invalid_request("max_cycles overflows the master-cycle counter"))?;
-    let mut next_poll = start;
-    let reason = loop {
-        machine.refresh_sticky_stop();
-        if machine.stopped().is_some() {
-            break "stopped";
-        }
-        if machine.cycles() >= next_poll {
-            if condition_holds(machine, condition)? {
-                break "condition";
-            }
-            next_poll = machine.cycles().saturating_add(poll_cycles).min(target);
-        }
-        if machine.cycles() >= target {
-            break "cycle_budget";
-        }
-        let boundary = next_poll.min(target);
-        match machine.advance_once(boundary) {
-            Ok((0, _)) => {
-                machine.mark_clock_stalled();
-                break "stopped";
-            }
-            Ok(_) => {}
-            Err(_) if machine.stopped().is_some() => break "stopped",
-            Err(error) => {
-                return Err(protocol_error(
-                    machine_protocol::ErrorCode::ModelError,
-                    error,
-                ));
-            }
-        }
-    };
-    machine.drain_uart();
-    Ok(serde_json::json!({
-        "reason": reason,
-        "condition_met": reason == "condition",
-        "advanced_cycles": machine.cycles().saturating_sub(start),
-        "stop": session_stop_json(machine.stopped()),
-    }))
-}
-
-fn inject_input(
-    machine: &mut MachineSession,
-    request: &serde_json::Value,
-) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
-    machine.refresh_sticky_stop();
-    if machine.stopped().is_some() {
-        return Err(protocol_error(
-            machine_protocol::ErrorCode::MachineStopped,
-            "machine is already stopped",
-        ));
-    }
-    let object = request_object(request)?;
-    let has_text = object.contains_key("text");
-    let has_events = object.contains_key("events");
-    if has_text == has_events {
-        return Err(invalid_request(
-            "input requires exactly one of 'text' or 'events'",
-        ));
-    }
-    let keyboard = machine.board.keyboard.as_ref().ok_or_else(|| {
-        protocol_error(
-            machine_protocol::ErrorCode::UnsupportedObservation,
-            "input requires --keyboard",
-        )
-    })?;
-    let mut parsed = Vec::new();
-    if let Some(text) = object.get("text") {
-        let text = text
-            .as_str()
-            .filter(|text| !text.is_empty())
-            .ok_or_else(|| invalid_request("field 'text' must be a non-empty string"))?;
-        for character in text.chars() {
-            let code = u8::try_from(character as u32).map_err(|_| {
-                invalid_request(format!("character {character:?} is not an 8-bit key code"))
-            })?;
-            parsed.push(KeyEvent::pressed(code));
-            parsed.push(KeyEvent::released(code));
-        }
-    } else {
-        let events = object
-            .get("events")
-            .and_then(serde_json::Value::as_array)
-            .filter(|events| !events.is_empty())
-            .ok_or_else(|| invalid_request("field 'events' must be a non-empty array"))?;
-        for (index, event) in events.iter().enumerate() {
-            let event = event.as_object().ok_or_else(|| {
-                invalid_request(format!("field 'events[{index}]' must be an object"))
-            })?;
-            if event
-                .keys()
-                .any(|field| field != "state" && field != "code")
-            {
-                return Err(invalid_request(format!(
-                    "field 'events[{index}]' contains an unknown field"
-                )));
-            }
-            let state = match event.get("state").and_then(serde_json::Value::as_str) {
-                Some("pressed") => KeyState::Pressed,
-                Some("held") => KeyState::Held,
-                Some("released") => KeyState::Released,
-                _ => {
-                    return Err(invalid_request(format!(
-                        "field 'events[{index}].state' must be pressed, held, or released"
-                    )));
-                }
-            };
-            let code = event
-                .get("code")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| u8::try_from(value).ok())
-                .ok_or_else(|| {
-                    invalid_request(format!("field 'events[{index}].code' must be in 0..=255"))
-                })?;
-            parsed.push(KeyEvent { state, code });
-        }
-    }
-    let mut keyboard = keyboard.lock().map_err(|_| {
-        protocol_error(
-            machine_protocol::ErrorCode::ModelError,
-            "keyboard mutex poisoned",
-        )
-    })?;
-    let dropped_before = keyboard.key_events_dropped;
-    for event in &parsed {
-        keyboard.push_event(*event);
-    }
-    let dropped = keyboard.key_events_dropped.saturating_sub(dropped_before);
-    Ok(serde_json::json!({
-        "status": if dropped == 0 { "accepted" } else { "dropped" },
-        "events": parsed.len(),
-        "dropped": dropped,
-        "queued": keyboard.queued(),
-    }))
-}
-
-fn snapshot_machine(
-    machine: &MachineSession,
-    request: &serde_json::Value,
-    snapshot_dir: &Path,
-) -> Result<serde_json::Value, machine_protocol::ProtocolError> {
-    let object = request_object(request)?;
-    let lcd = machine.board.lcd.as_ref().ok_or_else(|| {
-        protocol_error(
-            machine_protocol::ErrorCode::UnsupportedObservation,
-            "snapshot requires --board picocalc",
-        )
-    })?;
-    let framebuffer = lcd
-        .lock()
-        .map_err(|_| {
-            protocol_error(
-                machine_protocol::ErrorCode::ModelError,
-                "LCD mutex poisoned",
-            )
-        })?
-        .framebuffer();
-    let png = object
-        .get("png")
-        .map(|value| {
-            let name = value
-                .as_str()
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| invalid_request("field 'png' must be a non-empty basename"))?;
-            let path = Path::new(name);
-            if path.is_absolute()
-                || path.components().count() != 1
-                || path.file_name().and_then(|value| value.to_str()) != Some(name)
-            {
-                return Err(invalid_request(
-                    "field 'png' must be a basename without path separators or '..'",
-                ));
-            }
-            let output = snapshot_dir.join(path);
-            framebuffer.write_png(&output).map_err(|error| {
-                protocol_error(
-                    machine_protocol::ErrorCode::ModelError,
-                    format!("writing snapshot {name}: {error}"),
-                )
-            })?;
-            Ok::<_, machine_protocol::ProtocolError>(name.to_string())
-        })
-        .transpose()?;
-    Ok(serde_json::json!({
-        "width": framebuffer.width,
-        "height": framebuffer.height,
-        "rgb565_sha256": framebuffer.rgb565_sha256(),
-        "non_black_pixels": framebuffer.non_black_pixels(),
-        "png": png,
-    }))
-}
-
-fn collect_subscription_events(
-    machine: &mut MachineSession,
-    state: &mut MachineApiState,
-) -> Result<Vec<serde_json::Value>, machine_protocol::ProtocolError> {
-    let mut events = Vec::new();
-    for topic in state.subscriptions.clone() {
-        let data = match topic.as_str() {
-            "uart" => {
-                machine.drain_uart();
-                let bytes = &machine.uart_bytes[state.uart_cursor..];
-                if bytes.len() > MACHINE_MAX_EVENT_BYTES {
-                    return Err(protocol_error(
-                        machine_protocol::ErrorCode::EventOverflow,
-                        format!(
-                            "UART event contains {} bytes, limit is {MACHINE_MAX_EVENT_BYTES}",
-                            bytes.len()
-                        ),
-                    ));
-                }
-                if bytes.is_empty() {
-                    continue;
-                }
-                let offset = state.uart_cursor;
-                state.uart_cursor = machine.uart_bytes.len();
-                serde_json::json!({
-                    "offset": offset,
-                    "bytes": bytes,
-                    "text": String::from_utf8_lossy(bytes),
-                })
-            }
-            "stop" => {
-                machine.refresh_sticky_stop();
-                if machine.stopped().is_none() || state.stop_seen {
-                    continue;
-                }
-                state.stop_seen = true;
-                session_stop_json(machine.stopped())
-            }
-            "framebuffer" => {
-                let current = framebuffer_json(machine)?;
-                let sha = current
-                    .get("rgb565_sha256")
-                    .and_then(serde_json::Value::as_str)
-                    .expect("framebuffer result always has sha256")
-                    .to_string();
-                if state.framebuffer_sha.as_deref() == Some(&sha) {
-                    continue;
-                }
-                state.framebuffer_sha = Some(sha);
-                current
-            }
-            _ => unreachable!("subscribe validates every topic"),
-        };
-        let sequence = state.next_event_sequence;
-        state.next_event_sequence = state.next_event_sequence.saturating_add(1);
-        events.push(serde_json::json!({
-            "sequence": sequence,
-            "topic": topic,
-            "cycle": machine.cycles(),
-            "data": data,
-        }));
-    }
-    Ok(events)
-}
-
-fn dispatch_machine_request(
-    machine: &mut MachineSession,
-    state: &mut MachineApiState,
-    request: &serde_json::Value,
-    header: &machine_protocol::RequestHeader,
-    snapshot_dir: &Path,
-) -> Result<(serde_json::Value, bool), machine_protocol::ProtocolError> {
-    let object = request_object(request)?;
-    match header.op.as_str() {
-        "run" => {
-            machine_protocol::reject_unknown_top_level_fields(request, &["max_cycles"])?;
-            let max_cycles = required_u64(object, "max_cycles", 1, MACHINE_MAX_CYCLES)?;
-            Ok((run_machine_budget(machine, max_cycles)?, true))
-        }
-        "step" => {
-            machine_protocol::reject_unknown_top_level_fields(request, &["count"])?;
-            let count = object
-                .get("count")
-                .map(|_| required_u64(object, "count", 1, MACHINE_MAX_DISPATCHES))
-                .transpose()?
-                .unwrap_or(1);
-            machine.refresh_sticky_stop();
-            if machine.stopped().is_some() {
-                return Err(protocol_error(
-                    machine_protocol::ErrorCode::MachineStopped,
-                    "machine is already stopped",
-                ));
-            }
-            let start = machine.cycles();
-            let mut completed = 0;
-            while completed < count {
-                machine.refresh_sticky_stop();
-                if machine.stopped().is_some() {
-                    break;
-                }
-                match machine.advance_once(u64::MAX) {
-                    Ok((0, _)) => {
-                        machine.mark_clock_stalled();
-                        break;
-                    }
-                    Ok(_) => completed += 1,
-                    Err(_) if machine.stopped().is_some() => break,
-                    Err(error) => {
-                        return Err(protocol_error(
-                            machine_protocol::ErrorCode::ModelError,
-                            error,
-                        ));
-                    }
-                }
-            }
-            machine.drain_uart();
-            Ok((
-                serde_json::json!({
-                    "requested_dispatches": count,
-                    "completed_dispatches": completed,
-                    "advanced_cycles": machine.cycles().saturating_sub(start),
-                    "stop": session_stop_json(machine.stopped()),
-                }),
-                true,
-            ))
-        }
-        "run_until" => {
-            machine_protocol::reject_unknown_top_level_fields(
-                request,
-                &["condition", "max_cycles", "poll_cycles"],
-            )?;
-            let condition = object
-                .get("condition")
-                .ok_or_else(|| invalid_request("missing required field 'condition'"))?;
-            let max_cycles = required_u64(object, "max_cycles", 1, MACHINE_MAX_CYCLES)?;
-            let poll_cycles = required_u64(object, "poll_cycles", 1, max_cycles)?;
-            Ok((
-                run_machine_until(machine, condition, max_cycles, poll_cycles)?,
-                true,
-            ))
-        }
-        "input" => {
-            machine_protocol::reject_unknown_top_level_fields(request, &["text", "events"])?;
-            Ok((inject_input(machine, request)?, true))
-        }
-        "observe" => {
-            machine_protocol::reject_unknown_top_level_fields(request, &["domains"])?;
-            let domains = string_array(object, "domains")?;
-            let mut result = serde_json::Map::new();
-            for domain in domains {
-                if result.contains_key(&domain) {
-                    return Err(invalid_request(format!(
-                        "observation domain '{domain}' is duplicated"
-                    )));
-                }
-                result.insert(domain.clone(), observe_domain(machine, &domain)?);
-            }
-            Ok((serde_json::Value::Object(result), false))
-        }
-        "subscribe" => {
-            machine_protocol::reject_unknown_top_level_fields(request, &["domains"])?;
-            let domains = string_array(object, "domains")?;
-            let mut subscriptions = BTreeSet::new();
-            for domain in domains {
-                if !matches!(domain.as_str(), "uart" | "stop" | "framebuffer") {
-                    return Err(protocol_error(
-                        machine_protocol::ErrorCode::UnsupportedObservation,
-                        format!("unsupported subscription topic '{domain}'"),
-                    ));
-                }
-                if !subscriptions.insert(domain.clone()) {
-                    return Err(invalid_request(format!(
-                        "subscription topic '{domain}' is duplicated"
-                    )));
-                }
-            }
-            machine.drain_uart();
-            state.uart_cursor = machine.uart_bytes.len();
-            state.stop_seen = machine.stopped().is_some();
-            state.framebuffer_sha = if subscriptions.contains("framebuffer") {
-                Some(
-                    framebuffer_json(machine)?
-                        .get("rgb565_sha256")
-                        .and_then(serde_json::Value::as_str)
-                        .expect("framebuffer result always has sha256")
-                        .to_string(),
-                )
-            } else {
-                None
-            };
-            state.subscriptions = subscriptions;
-            Ok((
-                serde_json::json!({
-                    "domains": state.subscriptions,
-                    "next_event_sequence": state.next_event_sequence,
-                }),
-                false,
-            ))
-        }
-        "snapshot" => {
-            machine_protocol::reject_unknown_top_level_fields(request, &["png"])?;
-            Ok((snapshot_machine(machine, request, snapshot_dir)?, false))
-        }
-        other => Err(protocol_error(
-            machine_protocol::ErrorCode::UnsupportedOperation,
-            format!("unknown operation '{other}'"),
-        )),
-    }
-}
-
-fn run_machine_api(machine: &mut MachineSession, snapshot_dir: &Path) -> Result<(), String> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
-    let mut state = MachineApiState::default();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|error| format!("reading machine API stdin: {error}"))?;
-        if line.len() > MACHINE_MAX_REQUEST_BYTES {
-            let error = invalid_request(format!(
-                "request contains {} bytes, limit is {MACHINE_MAX_REQUEST_BYTES}",
-                line.len()
-            ));
-            stdout
-                .write_all(
-                    machine_protocol::error_response_line(None, machine.cycles(), &error)
-                        .as_bytes(),
-                )
-                .map_err(|write| format!("writing machine API response: {write}"))?;
-            stdout
-                .flush()
-                .map_err(|flush| format!("flushing machine API response: {flush}"))?;
-            continue;
-        }
-        let parsed = match machine_protocol::parse_request_line(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                stdout
-                    .write_all(
-                        machine_protocol::error_response_line(None, machine.cycles(), &error)
-                            .as_bytes(),
-                    )
-                    .map_err(|write| format!("writing machine API response: {write}"))?;
-                stdout
-                    .flush()
-                    .map_err(|flush| format!("flushing machine API response: {flush}"))?;
-                continue;
-            }
-        };
-        let correlation = machine_protocol::correlation_id(&parsed);
-        let header = match machine_protocol::parse_request_header(&parsed) {
-            Ok(header) => header,
-            Err(error) => {
-                stdout
-                    .write_all(
-                        machine_protocol::error_response_line(
-                            correlation.as_ref(),
-                            machine.cycles(),
-                            &error,
-                        )
-                        .as_bytes(),
-                    )
-                    .map_err(|write| format!("writing machine API response: {write}"))?;
-                stdout
-                    .flush()
-                    .map_err(|flush| format!("flushing machine API response: {flush}"))?;
-                continue;
-            }
-        };
-        let response =
-            match dispatch_machine_request(machine, &mut state, &parsed, &header, snapshot_dir) {
-                Ok((result, state_changed)) => {
-                    let events = if state_changed {
-                        match collect_subscription_events(machine, &mut state) {
-                            Ok(events) => events,
-                            Err(error) => {
-                                let line = machine_protocol::error_response_line(
-                                    Some(&header.id),
-                                    machine.cycles(),
-                                    &error,
-                                );
-                                stdout.write_all(line.as_bytes()).map_err(|write| {
-                                    format!("writing machine API response: {write}")
-                                })?;
-                                stdout.flush().map_err(|flush| {
-                                    format!("flushing machine API response: {flush}")
-                                })?;
-                                continue;
-                            }
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    machine_protocol::success_response_line(
-                        &header.id,
-                        machine.cycles(),
-                        result,
-                        events,
-                    )
-                }
-                Err(error) => machine_protocol::error_response_line(
-                    Some(&header.id),
-                    machine.cycles(),
-                    &error,
-                ),
-            };
-        stdout
-            .write_all(response.as_bytes())
-            .map_err(|error| format!("writing machine API response: {error}"))?;
-        stdout
-            .flush()
-            .map_err(|error| format!("flushing machine API response: {error}"))?;
-    }
-    Ok(())
 }
 
 /// JSON string escaping per RFC 8259 §7.
@@ -3427,14 +1145,6 @@ fn json_escape(s: &str) -> String {
 
 fn json_string(s: &str) -> String {
     format!("\"{}\"", json_escape(s))
-}
-
-fn json_array_strings(values: &[String]) -> String {
-    values
-        .iter()
-        .map(|value| json_string(value))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 #[cfg(feature = "idle-profiler")]
@@ -3602,214 +1312,6 @@ fn build_idle_profile_report(
         source_episodes_json(&profile.stationary_source_episodes),
         source_cycles_json(&profile.exact_bulk_sources),
         source_episodes_json(&profile.exact_bulk_source_episodes),
-    )
-}
-
-#[cfg(feature = "event-horizon-profiler")]
-fn running_boundary_events_json(value: &RunningBoundaryEvents) -> String {
-    format!(
-        concat!(
-            "{{\"cpu_mmio\": {}, \"gpio_in\": {}, \"fifo_dreq\": {}, ",
-            "\"irq_exception\": {}, \"pio_device\": {}, \"dma_dreq\": {}, ",
-            "\"timer_systick_pwm\": {}, \"serial\": {}, \"clock\": {}, ",
-            "\"external\": {}}}"
-        ),
-        value.cpu_mmio,
-        value.gpio_in,
-        value.fifo_dreq,
-        value.irq_exception,
-        value.pio_device,
-        value.dma_dreq,
-        value.timer_systick_pwm,
-        value.serial,
-        value.clock,
-        value.external,
-    )
-}
-
-#[cfg(feature = "event-horizon-profiler")]
-fn decode_profile_json(value: &DecodeProfileSnapshot) -> String {
-    let lookup_hits_by_region = format!(
-        "{{\"rom\": {}, \"immutable_xip_flash_aliases\": {}, \"xip_sram\": {}, \"sram\": {}, \"other\": {}}}",
-        value.lookup_hits_by_region.rom,
-        value.lookup_hits_by_region.immutable_xip_flash_aliases,
-        value.lookup_hits_by_region.xip_sram,
-        value.lookup_hits_by_region.sram,
-        value.lookup_hits_by_region.other,
-    );
-    let lookup_misses_by_region = format!(
-        "{{\"rom\": {}, \"immutable_xip_flash_aliases\": {}, \"xip_sram\": {}, \"sram\": {}, \"other\": {}}}",
-        value.lookup_misses_by_region.rom,
-        value.lookup_misses_by_region.immutable_xip_flash_aliases,
-        value.lookup_misses_by_region.xip_sram,
-        value.lookup_misses_by_region.sram,
-        value.lookup_misses_by_region.other,
-    );
-    let immutable_xip_hit_run_termination_counters = format!(
-        "{{\"post_execute_next_pc_redirect\": {}, \"xip_miss\": {}, \"region_exit\": {}, \"prefetch_exception\": {}, \"fault\": {}}}",
-        value
-            .immutable_xip_hit_run_termination_counters
-            .post_execute_next_pc_redirect,
-        value.immutable_xip_hit_run_termination_counters.xip_miss,
-        value.immutable_xip_hit_run_termination_counters.region_exit,
-        value
-            .immutable_xip_hit_run_termination_counters
-            .prefetch_exception,
-        value.immutable_xip_hit_run_termination_counters.fault,
-    );
-    let decode_cache_invalidation_observations = format!(
-        "{{\"entry_address_count\": {}, \"rom\": {}, \"xip\": {}, \"sram\": {}, \"bulk\": {}, \"all\": {}}}",
-        value
-            .decode_cache_invalidation_observations
-            .entry_address_count,
-        value.decode_cache_invalidation_observations.rom,
-        value.decode_cache_invalidation_observations.xip,
-        value.decode_cache_invalidation_observations.sram,
-        value.decode_cache_invalidation_observations.bulk,
-        value.decode_cache_invalidation_observations.all,
-    );
-
-    format!(
-        concat!(
-            "{{\"cacheable_hits\": {}, \"cacheable_misses\": {}, ",
-            "\"noncacheable_fetches\": {}, ",
-            "\"cacheable_hits_narrow\": {}, \"cacheable_hits_wide\": {}, ",
-            "\"lookup_hits_by_region\": {}, ",
-            "\"lookup_misses_by_region\": {}, ",
-            "\"sequential_cache_hit_runs\": {}, ",
-            "\"immutable_xip_hit_runs\": {}, ",
-            "\"immutable_xip_hit_run_termination_counters\": {}, ",
-            "\"decode_cache_invalidation_observations\": {}}}"
-        ),
-        value.cacheable_hits,
-        value.cacheable_misses,
-        value.noncacheable_fetches,
-        value.cacheable_hits_narrow,
-        value.cacheable_hits_wide,
-        lookup_hits_by_region,
-        lookup_misses_by_region,
-        histogram_json(&value.sequential_cache_hit_runs),
-        histogram_json(&value.immutable_xip_hit_runs),
-        immutable_xip_hit_run_termination_counters,
-        decode_cache_invalidation_observations,
-    )
-}
-
-#[cfg(all(feature = "event-horizon-profiler", test))]
-#[allow(clippy::too_many_arguments)]
-fn build_running_event_profile_report(
-    backend_commit: &str,
-    backend_dirty: bool,
-    firmware_name: &str,
-    firmware_sha: &str,
-    step_quantum: u32,
-    outcome: &RunOutcome,
-    profile: &RunningEventProfileSnapshot,
-) -> String {
-    build_running_event_profile_report_with_activation(
-        backend_commit,
-        backend_dirty,
-        firmware_name,
-        firmware_sha,
-        step_quantum,
-        None,
-        None,
-        outcome,
-        profile,
-    )
-}
-
-#[cfg(feature = "event-horizon-profiler")]
-#[allow(clippy::too_many_arguments)]
-fn build_running_event_profile_report_with_activation(
-    backend_commit: &str,
-    backend_dirty: bool,
-    firmware_name: &str,
-    firmware_sha: &str,
-    step_quantum: u32,
-    activation_marker: Option<&str>,
-    activation_cycle: Option<u64>,
-    outcome: &RunOutcome,
-    profile: &RunningEventProfileSnapshot,
-) -> String {
-    let boundary = &profile.boundary;
-    let thresholds: [u64; IDLE_HISTOGRAM_BUCKETS] = std::array::from_fn(|i| 1u64 << i);
-    let activation = match activation_marker {
-        Some(marker) => format!(
-            "{{\"mode\":\"after_uart\",\"marker\":{},\"start_cycle\":{}}}",
-            json_string(marker),
-            activation_cycle.unwrap_or(0),
-        ),
-        None => "{\"mode\":\"from_start\"}".to_string(),
-    };
-    format!(
-        concat!(
-            "{{\n",
-            "  \"schema_version\": {},\n",
-            "  \"kind\": \"rp2040_serial_running_event_horizon_profile\",\n",
-            "  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n",
-            "  \"firmware\": {{\"basename\": {}, \"sha256\": {}}},\n",
-            "  \"execution_model\": \"Serial\",\n",
-            "  \"instrumented\": true,\n",
-            "  \"valid_for_wall_time\": false,\n",
-            "  \"observed_gaps_are_safe_windows\": false,\n",
-            "  \"fallback_occupancy_is_safe_window\": false,\n",
-            "  \"decode_hit_runs_are_speedup_prediction\": false,\n",
-            "  \"immutable_xip_hit_runs_are_speedup_prediction\": false,\n",
-            "  \"conservative_horizon_complete_for_current_model\": true,\n",
-            "  \"step_quantum\": {},\n",
-            "  \"activation\": {},\n",
-            "  \"stop_reason\": {},\n",
-            "  \"run_cycles\": {},\n",
-            "  \"histogram_thresholds_cycles\": [{}],\n",
-            "  \"counters\": {{\"running_steps\": {}, \"total_running_cycles\": {}, ",
-            "\"boundary_steps\": {}, \"no_known_horizon_steps\": {}, ",
-            "\"no_known_horizon_cycles\": {}, \"candidate_dispatches\": {}, ",
-            "\"candidate_cycles\": {}}},\n",
-            "  \"observed_inter_boundary_dispatches\": {},\n",
-            "  \"observed_inter_boundary_cycles\": {},\n",
-            "  \"observed_candidate_dispatches\": {},\n",
-            "  \"observed_candidate_cycles\": {},\n",
-            "  \"conservative_horizon_distances\": {},\n",
-            "  \"boundary_events\": {},\n",
-            "  \"one_cycle_fallback_cycles\": {},\n",
-            "  \"one_cycle_fallback_signatures\": {{\"bit_order\": ",
-            "[\"pio\", \"uart\", \"dma\", \"any_other\"], ",
-            "\"steps\": [{}], \"cycle_mass\": [{}]}},\n",
-            "  \"decode_opportunity_by_core\": [\n",
-            "    {},\n",
-            "    {}\n",
-            "  ]\n",
-            "}}\n"
-        ),
-        RUNNING_EVENT_PROFILE_SCHEMA_VERSION,
-        json_string(backend_commit),
-        backend_dirty,
-        json_string(firmware_name),
-        json_string(firmware_sha),
-        step_quantum,
-        activation,
-        json_string(outcome.stop_reason.as_str()),
-        outcome.cycles,
-        u64_json_array(&thresholds),
-        boundary.running_steps,
-        boundary.total_running_cycles,
-        boundary.boundary_steps,
-        boundary.no_known_horizon_steps,
-        boundary.no_known_horizon_cycles,
-        boundary.candidate_dispatches,
-        boundary.candidate_cycles,
-        histogram_json(&boundary.observed_inter_boundary_dispatches),
-        histogram_json(&boundary.observed_inter_boundary_cycles),
-        histogram_json(&boundary.observed_candidate_dispatches),
-        histogram_json(&boundary.observed_candidate_cycles),
-        histogram_json(&boundary.conservative_horizon_distances),
-        running_boundary_events_json(&boundary.boundary_events),
-        horizon_events_json(&boundary.one_cycle_fallback_cycles),
-        u64_json_array(&boundary.one_cycle_fallback_signatures.steps),
-        u64_json_array(&boundary.one_cycle_fallback_signatures.cycle_mass),
-        decode_profile_json(&profile.decode_by_core[0]),
-        decode_profile_json(&profile.decode_by_core[1]),
     )
 }
 
@@ -4094,396 +1596,11 @@ impl PwmReport {
     }
 }
 
-/// Digital sample stream observed at the DMA-to-PWM boundary.
-struct AudioSinkReport {
-    snapshot: rp2040_emu::AudioSinkSnapshot,
-    expected_count: Option<u64>,
-    expected_sha256: Option<String>,
-    status: &'static str,
-}
-
-impl AudioSinkReport {
-    fn status_for_expected(
-        snapshot: &rp2040_emu::AudioSinkSnapshot,
-        expected_count: Option<u64>,
-        expected_sha256: Option<&str>,
-    ) -> &'static str {
-        match (expected_count, expected_sha256) {
-            (Some(count), Some(digest)) => {
-                if snapshot.status == "pass"
-                    && snapshot.dma_write_count == count
-                    && snapshot.pcm_sha256 == digest
-                {
-                    "pass"
-                } else {
-                    "fail"
-                }
-            }
-            (None, None) => snapshot.status,
-            _ => "fail",
-        }
-    }
-
-    fn collect(
-        bus: &rp2040_emu::Bus,
-        expected_count: Option<u64>,
-        expected_sha256: Option<&str>,
-    ) -> Self {
-        let snapshot = bus.audio_sink_snapshot();
-        let status = Self::status_for_expected(&snapshot, expected_count, expected_sha256);
-        Self {
-            snapshot,
-            expected_count,
-            expected_sha256: expected_sha256.map(str::to_owned),
-            status,
-        }
-    }
-
-    fn expectation_failed(&self) -> bool {
-        self.expected_count.is_some() && self.status != "pass"
-    }
-
-    fn analysis_json(
-        &self,
-        backend_commit: &str,
-        backend_dirty: bool,
-        firmware_name: &str,
-        firmware_sha256: &str,
-    ) -> String {
-        // Schema 1 is the frozen NEXT-2 48 kHz artifact. A non-48 kHz
-        // stream uses the additive generic schema 2. Block lengths remain
-        // visible in the report's audio_sink projection.
-        let schema_version = if self.snapshot.sample_rate_hz == 48_000 {
-            1
-        } else {
-            2
-        };
-        format!(
-            concat!(
-                "{{\n",
-                "  \"schema_version\": {},\n",
-                "  \"boundary\": \"dma_to_pwm5_cc\",\n",
-                "  \"interpretation\": \"digital_level_only_not_speaker_loudness\",\n",
-                "  \"backend_build\": {{\"commit\": {}, \"dirty\": {}}},\n",
-                "  \"firmware\": {{\"file\": {}, \"sha256\": {}}},\n",
-                "  \"observation_status\": {},\n",
-                "  \"pcm_sha256\": {},\n",
-                "  \"pcm_format\": {},\n",
-                "  \"sample_rate_hz\": {},\n",
-                "  \"channel_count\": {},\n",
-                "  \"frame_count\": {},\n",
-                "  \"window_frames\": {},\n",
-                "  \"active_abs_threshold\": {},\n",
-                "  \"peak_abs_left\": {},\n",
-                "  \"peak_abs_right\": {},\n",
-                "  \"stream_rms\": {},\n",
-                "  \"max_window_rms\": {},\n",
-                "  \"dc_offset_left\": {},\n",
-                "  \"dc_offset_right\": {},\n",
-                "  \"active_frame_count\": {},\n",
-                "  \"active_frame_ratio_ppm\": {},\n",
-                "  \"rail_sample_count\": {},\n",
-                "  \"rail_sample_ratio_ppm\": {},\n",
-                "  \"max_consecutive_rail_frames\": {},\n",
-                "  \"out_of_range_duty_sample_count\": {},\n",
-                "  \"rail_interpretation\": \"post_quantizer_pwm_rail_usage_not_source_clip_count\"\n",
-                "}}\n"
-            ),
-            schema_version,
-            json_string(backend_commit),
-            backend_dirty,
-            json_string(firmware_name),
-            json_string(firmware_sha256),
-            json_string(self.snapshot.status),
-            json_string(&self.snapshot.pcm_sha256),
-            json_string(self.snapshot.reconstructed_pcm_format),
-            self.snapshot.sample_rate_hz,
-            self.snapshot.channel_count,
-            self.snapshot.analysis_frame_count,
-            self.snapshot.analysis_window_frames,
-            self.snapshot.active_abs_threshold,
-            self.snapshot.peak_abs_left,
-            self.snapshot.peak_abs_right,
-            self.snapshot.stream_rms,
-            self.snapshot.max_window_rms,
-            self.snapshot.dc_offset_left,
-            self.snapshot.dc_offset_right,
-            self.snapshot.active_frame_count,
-            self.snapshot.active_frame_ratio_ppm,
-            self.snapshot.rail_sample_count,
-            self.snapshot.rail_sample_ratio_ppm,
-            self.snapshot.max_consecutive_rail_frames,
-            self.snapshot.out_of_range_duty_sample_count,
-        )
-    }
-
-    fn to_json(&self) -> String {
-        let words = |values: &[u32]| {
-            values
-                .iter()
-                .map(|value| json_string(&format!("0x{value:08x}")))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let option_u64 = |value: Option<u64>| {
-            value
-                .map(|number| number.to_string())
-                .unwrap_or_else(|| "null".to_string())
-        };
-        format!(
-            concat!(
-                "  \"audio_sink\": {{\n",
-                "    \"status\": {},\n",
-                "    \"dma_write_count\": {},\n",
-                "    \"target_write_attempt_count\": {},\n",
-                "    \"other_pwm_cc_write_count\": {},\n",
-                "    \"wrong_width_count\": {},\n",
-                "    \"wrong_treq_count\": {},\n",
-                "    \"missing_due_cycle_count\": {},\n",
-                "    \"pcm_sha256\": {},\n",
-                "    \"expected_count\": {},\n",
-                "    \"expected_sha256\": {},\n",
-                "    \"first_words\": [{}],\n",
-                "    \"last_words\": [{}],\n",
-                "    \"timer_index\": {},\n",
-                "    \"treq\": {},\n",
-                "    \"timer_fraction\": \"{}/{}\",\n",
-                "    \"sample_rate_hz\": {},\n",
-                "    \"timer_event_count\": {},\n",
-                "    \"timer_miss_count\": {},\n",
-                "    \"timer_miss_audio_not_busy\": {},\n",
-                "    \"timer_miss_other_dma_selected\": {},\n",
-                "    \"timer_miss_no_dma_selected\": {},\n",
-                "    \"timer_miss_multiple_due_in_window\": {},\n",
-                "    \"timer_due_cycle_sha256\": {},\n",
-                "    \"block_start_count\": {},\n",
-                "    \"block_frame_min\": {},\n",
-                "    \"block_frame_max\": {},\n",
-                "    \"malformed_block_count\": {},\n",
-                "    \"block_boundary_gap_count\": {},\n",
-                "    \"block_boundary_gap_min_cycles\": {},\n",
-                "    \"block_boundary_gap_max_cycles\": {},\n",
-                "    \"block_boundary_gap_sha256\": {},\n",
-                "    \"gap_5208_count\": {},\n",
-                "    \"gap_5209_count\": {},\n",
-                "    \"unexpected_gap_count\": {},\n",
-                "    \"service_latency_min_cycles\": {},\n",
-                "    \"service_latency_max_cycles\": {},\n",
-                "    \"service_latency_sha256\": {}\n",
-                "  }},\n"
-            ),
-            json_string(self.status),
-            self.snapshot.dma_write_count,
-            self.snapshot.target_write_attempt_count,
-            self.snapshot.other_pwm_cc_write_count,
-            self.snapshot.wrong_width_count,
-            self.snapshot.wrong_treq_count,
-            self.snapshot.missing_due_cycle_count,
-            json_string(&self.snapshot.pcm_sha256),
-            option_u64(self.expected_count),
-            self.expected_sha256
-                .as_deref()
-                .map(json_string)
-                .unwrap_or_else(|| "null".to_string()),
-            words(&self.snapshot.first_words),
-            words(&self.snapshot.last_words),
-            self.snapshot.timer_index,
-            self.snapshot.treq,
-            self.snapshot.timer_fraction_x,
-            self.snapshot.timer_fraction_y,
-            self.snapshot.sample_rate_hz,
-            self.snapshot.timer_event_count,
-            self.snapshot.timer_miss_count,
-            self.snapshot.timer_miss_audio_not_busy,
-            self.snapshot.timer_miss_other_dma_selected,
-            self.snapshot.timer_miss_no_dma_selected,
-            self.snapshot.timer_miss_multiple_due_in_window,
-            json_string(&self.snapshot.timer_due_cycle_sha256),
-            self.snapshot.block_start_count,
-            option_u64(self.snapshot.block_frame_min),
-            option_u64(self.snapshot.block_frame_max),
-            self.snapshot.malformed_block_count,
-            self.snapshot.block_boundary_gap_count,
-            option_u64(self.snapshot.block_boundary_gap_min_cycles),
-            option_u64(self.snapshot.block_boundary_gap_max_cycles),
-            json_string(&self.snapshot.block_boundary_gap_sha256),
-            self.snapshot.gap_5208_count,
-            self.snapshot.gap_5209_count,
-            self.snapshot.unexpected_gap_count,
-            option_u64(self.snapshot.service_latency_min_cycles),
-            option_u64(self.snapshot.service_latency_max_cycles),
-            json_string(&self.snapshot.service_latency_sha256),
-        )
-    }
-}
-
-fn write_audio_wav(path: &Path, samples: &[i16], sample_rate_hz: u32) -> Result<(), String> {
-    if !samples.len().is_multiple_of(2) {
-        return Err("audio PCM capture is not interleaved stereo".to_string());
-    }
-    if sample_rate_hz == 0 {
-        return Err("audio PCM capture has no observed sample rate".to_string());
-    }
-    let data_size = u32::try_from(samples.len().saturating_mul(2))
-        .map_err(|_| "audio WAV exceeds the RIFF 32-bit size limit".to_string())?;
-    let riff_size = 36u32
-        .checked_add(data_size)
-        .ok_or_else(|| "audio WAV exceeds the RIFF 32-bit size limit".to_string())?;
-    let byte_rate = sample_rate_hz
-        .checked_mul(4)
-        .ok_or_else(|| "audio WAV sample rate exceeds the RIFF byte-rate limit".to_string())?;
-    let file = std::fs::File::create(path)
-        .map_err(|e| format!("creating audio WAV {}: {e}", path.display()))?;
-    let mut output = BufWriter::new(file);
-    output
-        .write_all(b"RIFF")
-        .and_then(|_| output.write_all(&riff_size.to_le_bytes()))
-        .and_then(|_| output.write_all(b"WAVEfmt "))
-        .and_then(|_| output.write_all(&16u32.to_le_bytes()))
-        .and_then(|_| output.write_all(&1u16.to_le_bytes()))
-        .and_then(|_| output.write_all(&2u16.to_le_bytes()))
-        .and_then(|_| output.write_all(&sample_rate_hz.to_le_bytes()))
-        .and_then(|_| output.write_all(&byte_rate.to_le_bytes()))
-        .and_then(|_| output.write_all(&4u16.to_le_bytes()))
-        .and_then(|_| output.write_all(&16u16.to_le_bytes()))
-        .and_then(|_| output.write_all(b"data"))
-        .and_then(|_| output.write_all(&data_size.to_le_bytes()))
-        .map_err(|e| format!("writing audio WAV header {}: {e}", path.display()))?;
-    for sample in samples {
-        output
-            .write_all(&sample.to_le_bytes())
-            .map_err(|e| format!("writing audio WAV samples {}: {e}", path.display()))?;
-    }
-    output
-        .flush()
-        .map_err(|e| format!("flushing audio WAV {}: {e}", path.display()))
-}
-
-fn write_flash_image(path: &Path, image: &[u8]) -> Result<(), String> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temporary, image)
-        .map_err(|error| format!("writing flash image {}: {error}", temporary.display()))?;
-    std::fs::rename(&temporary, path)
-        .map_err(|error| format!("publishing flash image {}: {error}", path.display()))
-}
-
 /// TOP register reset value; a slice still holding it was never given a
 /// wrap point.
 const TOP_RESET_VALUE: u16 = 0xFFFF;
 
 /// The attached SD card and the initial filesystem profile supplied to it.
-fn sd_trace_data_json(data: &SdTraceData) -> String {
-    let direction = match data.direction {
-        SdTraceDirection::Read => "read",
-        SdTraceDirection::Write => "write",
-    };
-    format!(
-        "{{\"direction\":{},\"block\":{},\"token\":{},\"length\":{},\"crc\":[{},{}]}}",
-        json_string(direction),
-        data.block,
-        data.token,
-        data.length,
-        data.crc[0],
-        data.crc[1]
-    )
-}
-
-fn sd_trace_event_json(event: &SdTraceEvent) -> String {
-    match event {
-        SdTraceEvent::Command {
-            sequence,
-            cs_epoch,
-            transfers,
-            index,
-            argument,
-            crc,
-            crc_valid,
-            response,
-            data,
-        } => {
-            let response = response
-                .iter()
-                .map(|byte| byte.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let data = data
-                .as_ref()
-                .map(sd_trace_data_json)
-                .unwrap_or_else(|| "null".to_string());
-            format!(
-                "{{\"kind\":\"command\",\"sequence\":{},\"cs_epoch\":{},\"transfers\":{},\"index\":{},\"argument\":{},\"crc\":{},\"crc_valid\":{},\"response\":[{}],\"data\":{}}}",
-                sequence, cs_epoch, transfers, index, argument, crc, crc_valid, response, data
-            )
-        }
-        SdTraceEvent::BlockData {
-            sequence,
-            cs_epoch,
-            transfers,
-            data,
-        } => format!(
-            "{{\"kind\":\"block_data\",\"sequence\":{},\"cs_epoch\":{},\"transfers\":{},\"data\":{}}}",
-            sequence,
-            cs_epoch,
-            transfers,
-            sd_trace_data_json(data)
-        ),
-        SdTraceEvent::Deselect {
-            sequence,
-            cs_epoch,
-            transfers,
-        } => format!(
-            "{{\"kind\":\"deselect\",\"sequence\":{},\"cs_epoch\":{},\"transfers\":{}}}",
-            sequence, cs_epoch, transfers
-        ),
-    }
-}
-
-fn sd_trace_json(snapshot: &SdTraceSnapshot) -> String {
-    let mut out = String::new();
-    out.push_str("{\n");
-    out.push_str(&format!(
-        "  \"schema_version\": {},\n  \"trace_kind\": \"sd-spi-structured-v1\",\n  \"event_count\": {},\n  \"digest_sha256\": {},\n  \"preview_truncated\": {},\n  \"preview\": [",
-        snapshot.schema_version,
-        snapshot.event_count,
-        json_string(&snapshot.digest_sha256),
-        snapshot.preview_truncated
-    ));
-    for (index, event) in snapshot.preview.iter().enumerate() {
-        if index == 0 {
-            out.push('\n');
-        } else {
-            out.push_str(",\n");
-        }
-        out.push_str("    ");
-        out.push_str(&sd_trace_event_json(event));
-    }
-    if !snapshot.preview.is_empty() {
-        out.push('\n');
-    }
-    out.push_str("  ]\n}\n");
-    out
-}
-
-fn write_sd_trace(path: &Path, contents: &str) -> Result<(), String> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temporary)?;
-        file.write_all(contents.as_bytes())?;
-        file.flush()?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)
-    })();
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(format!("writing SD trace {}: {error}", path.display()));
-    }
-    Ok(())
-}
-
 struct SdReport {
     format: SdFormat,
     block_count: usize,
@@ -4491,9 +1608,6 @@ struct SdReport {
     blocks_read: u64,
     blocks_written: u64,
     unknown_commands: Vec<(u8, u32)>,
-    #[cfg(feature = "sd-gen1-multiblock")]
-    protocol_errors: Vec<String>,
-    raw: Option<picocalc_board::sdcard::RawMetadata>,
 }
 
 impl SdReport {
@@ -4507,9 +1621,6 @@ impl SdReport {
             blocks_read: card.blocks_read,
             blocks_written: card.blocks_written,
             unknown_commands,
-            #[cfg(feature = "sd-gen1-multiblock")]
-            protocol_errors: card.protocol_errors().to_vec(),
-            raw: card.raw_metadata(),
         }
     }
 
@@ -4526,30 +1637,6 @@ impl SdReport {
             "    \"commands_seen\": {}, \"blocks_read\": {}, \"blocks_written\": {},\n",
             self.commands_seen, self.blocks_read, self.blocks_written
         ));
-        if let Some(raw) = self.raw.as_ref() {
-            s.push_str(&format!(
-                "    \"raw_image\": {{\"bytes\": {}, \"blocks\": {}, \"dirty_blocks\": {}, \"source_sha256\": {} }},\n",
-                raw.bytes,
-                raw.blocks,
-                raw.dirty_blocks,
-                json_string(&raw.source_sha256),
-            ));
-        }
-        #[cfg(feature = "sd-gen1-multiblock")]
-        {
-            s.push_str("    \"protocol_errors\": [");
-            if self.protocol_errors.is_empty() {
-                s.push_str("],\n");
-            } else {
-                for (index, error) in self.protocol_errors.iter().enumerate() {
-                    if index > 0 {
-                        s.push_str(", ");
-                    }
-                    s.push_str(&json_string(error));
-                }
-                s.push_str("],\n");
-            }
-        }
         s.push_str("    \"unknown_commands\": [");
         if self.unknown_commands.is_empty() {
             s.push_str("]\n");
@@ -4697,43 +1784,6 @@ impl PsramReport {
     }
 }
 
-struct FlashReport {
-    image_bytes: usize,
-    erase_count: u64,
-    program_count: u64,
-    program_bytes: u64,
-    command_counts: Vec<(u8, u32)>,
-    unknown_commands: Vec<(u8, u32)>,
-    errors: Vec<String>,
-}
-
-impl FlashReport {
-    fn to_json(&self) -> String {
-        let unknown = self
-            .unknown_commands
-            .iter()
-            .map(|(command, count)| format!("{{\"command\": {command}, \"count\": {count}}}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let commands = self
-            .command_counts
-            .iter()
-            .map(|(command, count)| format!("{{\"command\": {command}, \"count\": {count}}}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "  \"flash\": {{\"image_bytes\": {}, \"erase_count\": {}, \"program_count\": {}, \"program_bytes\": {}, \"command_counts\": [{}], \"unknown_commands\": [{}], \"errors\": [{}]}},\n",
-            self.image_bytes,
-            self.erase_count,
-            self.program_count,
-            self.program_bytes,
-            commands,
-            unknown,
-            json_array_strings(&self.errors),
-        )
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_report(
     backend_commit: &str,
@@ -4755,11 +1805,9 @@ fn build_report(
     lcd: Option<&LcdReport>,
     fb: Option<&FramebufferReport>,
     psram: Option<&PsramReport>,
-    flash: Option<&FlashReport>,
     sd: Option<&SdReport>,
     keyboard: Option<&KeyboardReport>,
     pwm: Option<&PwmReport>,
-    audio_sink: Option<&AudioSinkReport>,
     pio: Option<&PioReport>,
     scenario: Option<(&scenario::Engine, String)>,
     verdict: &VerdictReport,
@@ -4796,7 +1844,11 @@ fn build_report(
         "  \"lcd_variant\": {},\n",
         json_string(lcd_variant.as_str())
     ));
-    s.push_str(&boot_report_fragment(boot_mode));
+    s.push_str(&format!(
+        "  \"boot\": {{\"mode\": {}, \"vtor_flash_offset\": \"{:#06x}\"}},\n",
+        json_string(boot_mode.as_str()),
+        SDK_VTOR_FLASH_OFFSET
+    ));
     s.push_str(&format!("  \"step_quantum\": {step_quantum},\n"));
     s.push_str(&format!("  \"cycle_limit\": {cycle_limit},\n"));
     s.push_str(&format!(
@@ -4836,21 +1888,6 @@ fn build_report(
             None => "null".to_string(),
         }
     ));
-    if !outcome.watchdog_resets.is_empty() {
-        s.push_str("  \"watchdog_resets\": [\n");
-        for (index, event) in outcome.watchdog_resets.iter().enumerate() {
-            s.push_str(&format!(
-                "    {{\"epoch\": {}, \"cycle\": {}, \"core\": {}, \"pc\": {}, \"reason\": {}}}{}\n",
-                event.epoch,
-                event.cycle,
-                event.core,
-                json_string(&format!("{:#010x}", event.pc)),
-                event.reason,
-                if index + 1 == outcome.watchdog_resets.len() { "" } else { "," },
-            ));
-        }
-        s.push_str("  ],\n");
-    }
     s.push_str(&verdict.to_json());
 
     s.push_str("  \"unsupported_mmio\": [");
@@ -4882,9 +1919,6 @@ fn build_report(
     if let Some(psram) = psram {
         s.push_str(&psram.to_json());
     }
-    if let Some(flash) = flash {
-        s.push_str(&flash.to_json());
-    }
     if let Some(sd) = sd {
         s.push_str(&sd.to_json());
     }
@@ -4893,9 +1927,6 @@ fn build_report(
     }
     if let Some(pwm) = pwm {
         s.push_str(&pwm.to_json());
-    }
-    if let Some(audio_sink) = audio_sink {
-        s.push_str(&audio_sink.to_json());
     }
     if let Some(pio) = pio {
         s.push_str(&pio.to_json());
@@ -4959,7 +1990,6 @@ fn behavior_projection(
         "unsupported_mmio_truncated",
         "lcd",
         "psram",
-        "flash",
         "sd",
         "keyboard",
         "pwm",
@@ -5136,209 +2166,12 @@ fn build_framebuffer_report(
     }))
 }
 
-#[cfg(feature = "cpu-application-profiler")]
-fn cpu_profile_region_json(value: &CpuPcRegionCounters) -> serde_json::Value {
-    serde_json::json!({
-        "boot_rom": value.boot_rom,
-        "immutable_xip": value.immutable_xip,
-        "xip_sram": value.xip_sram,
-        "sram": value.sram,
-        "other": value.other,
-    })
-}
-
-#[cfg(feature = "cpu-application-profiler")]
-fn cpu_profile_decode_region_json(value: &CpuDecodeRegionCounters) -> serde_json::Value {
-    serde_json::json!({
-        "lookups": value.lookups,
-        "hits": value.hits,
-        "misses": value.misses,
-    })
-}
-
-#[cfg(feature = "cpu-application-profiler")]
-fn cpu_profile_decode_regions_json(value: &CpuDecodeRegionCountersByRegion) -> serde_json::Value {
-    serde_json::json!({
-        "boot_rom": cpu_profile_decode_region_json(&value.boot_rom),
-        "immutable_xip": cpu_profile_decode_region_json(&value.immutable_xip),
-        "xip_sram": cpu_profile_decode_region_json(&value.xip_sram),
-        "sram": cpu_profile_decode_region_json(&value.sram),
-        "other": cpu_profile_decode_region_json(&value.other),
-    })
-}
-
-#[cfg(feature = "cpu-application-profiler")]
-fn cpu_profile_decode_json(value: &CpuDecodeCounters) -> serde_json::Value {
-    serde_json::json!({
-        "lookups": value.lookups,
-        "hits": value.hits,
-        "misses": value.misses,
-        "noncacheable_fetches": value.noncacheable_fetches,
-        "by_region": cpu_profile_decode_regions_json(&value.by_region),
-    })
-}
-
-#[cfg(feature = "cpu-application-profiler")]
-fn cpu_profile_invalidation_json(value: &CpuInvalidationCounters) -> serde_json::Value {
-    serde_json::json!({
-        "requests": value.requests,
-        "examined_slots": value.examined_slots,
-        "matching_clears": value.matching_clears,
-        "unrelated_would_clear": value.unrelated_would_clear,
-        "wide_predecessor_clears": value.wide_predecessor_clears,
-    })
-}
-
-#[cfg(feature = "cpu-application-profiler")]
-fn cpu_profile_exception_json(value: &CpuExceptionCounters) -> serde_json::Value {
-    serde_json::json!({
-        "polls": value.polls,
-        "reject_primask": value.reject_primask,
-        "reject_no_candidate": value.reject_no_candidate,
-        "reject_active_handler": value.reject_active_handler,
-        "entries": value.entries,
-        "source": {
-            "pendsv": value.source.pendsv,
-            "systick": value.source.systick,
-            "nvic": value.source.nvic,
-        },
-    })
-}
-
-#[cfg(feature = "cpu-application-profiler")]
-fn cpu_profile_handler_json(value: &CpuHandlerGroupCounters) -> serde_json::Value {
-    serde_json::json!({
-        "thumb16_shift_add_sub": value.thumb16_shift_add_sub,
-        "data_processing": value.data_processing,
-        "load_store": value.load_store,
-        "branch_system": value.branch_system,
-        "thumb32": value.thumb32,
-        "other": value.other,
-    })
-}
-
-#[cfg(feature = "cpu-application-profiler")]
-fn cpu_profile_counters_json(value: &CpuApplicationProfileSnapshot) -> serde_json::Value {
-    serde_json::json!({
-        "active": value.active,
-        "retired_instructions": value.retired_instructions,
-        "emulated_cycles": value.emulated_cycles,
-        "pc_region": cpu_profile_region_json(&value.pc_region),
-        "decode": cpu_profile_decode_json(&value.decode),
-        "invalidation": cpu_profile_invalidation_json(&value.invalidation),
-        "exception": cpu_profile_exception_json(&value.exception),
-        "handler_group": cpu_profile_handler_json(&value.handler_group),
-    })
-}
-
-#[cfg(feature = "cpu-application-profiler")]
-fn build_cpu_application_profile_report(
-    backend_commit: &str,
-    backend_dirty: bool,
-    firmware_basename: &str,
-    firmware_sha: &str,
-    step_quantum: u32,
-    outcome: &RunOutcome,
-    cores: &[CpuApplicationProfileSnapshot; 2],
-) -> Result<String, String> {
-    let aggregate = CpuApplicationProfileSnapshot::aggregate(cores);
-    let core_invariants_valid = cores
-        .iter()
-        .all(CpuApplicationProfileSnapshot::invariants_valid);
-    let invariants_valid = core_invariants_valid && aggregate.invariants_valid();
-    let feature_set = BUILT_FEATURE_SET
-        .split(',')
-        .filter(|feature| !feature.is_empty())
-        .map(serde_json::Value::from)
-        .collect::<Vec<_>>();
-    let core_records = cores
-        .iter()
-        .enumerate()
-        .map(|(core_id, value)| {
-            serde_json::json!({
-                "core_id": core_id,
-                "active": value.active,
-                "retired_instructions": value.retired_instructions,
-                "emulated_cycles": value.emulated_cycles,
-                "pc_region": cpu_profile_region_json(&value.pc_region),
-                "decode": cpu_profile_decode_json(&value.decode),
-                "invalidation": cpu_profile_invalidation_json(&value.invalidation),
-                "exception": cpu_profile_exception_json(&value.exception),
-                "handler_group": cpu_profile_handler_json(&value.handler_group),
-                "overflowed": value.overflowed,
-                "invariants": {"valid": value.invariants_valid()},
-            })
-        })
-        .collect::<Vec<_>>();
-    let report = serde_json::json!({
-        "schema_id": "picocalc.rp2040-cpu-profile",
-        "schema_version": CPU_APPLICATION_PROFILE_SCHEMA_VERSION,
-        "instrumented": true,
-        "valid_for_wall_time": false,
-        "backend_build": {"commit": backend_commit, "dirty": backend_dirty},
-        "firmware": {"basename": firmware_basename, "sha256": firmware_sha},
-        "execution_model": "serial",
-        "step_quantum": step_quantum,
-        "interval": {
-            "start_emulated_cycle": 0,
-            "end_emulated_cycle": outcome.cycles,
-        },
-        "stop_reason": outcome.stop_reason.as_str(),
-        "cores": core_records,
-        "overflowed": aggregate.overflowed,
-        "profile_valid": invariants_valid,
-        "counters": cpu_profile_counters_json(&aggregate),
-        "invariants": {
-            "valid": invariants_valid,
-            "core_records_valid": core_invariants_valid,
-            "pc_region_conservation": aggregate
-                .pc_region
-                .boot_rom
-                .saturating_add(aggregate.pc_region.immutable_xip)
-                .saturating_add(aggregate.pc_region.xip_sram)
-                .saturating_add(aggregate.pc_region.sram)
-                .saturating_add(aggregate.pc_region.other)
-                == aggregate.retired_instructions,
-            "decode_lookup_conservation": aggregate.decode.lookups
-                == aggregate.decode.hits.saturating_add(aggregate.decode.misses),
-            "decode_region_conservation": aggregate.decode_region_conservation_valid(),
-            "exception_poll_conservation": aggregate.exception.polls
-                == aggregate.exception.reject_primask
-                    .saturating_add(aggregate.exception.reject_no_candidate)
-                    .saturating_add(aggregate.exception.reject_active_handler)
-                    .saturating_add(aggregate.exception.entries),
-            "exception_source_conservation": aggregate.exception.entries
-                == aggregate.exception.source.pendsv
-                    .saturating_add(aggregate.exception.source.systick)
-                    .saturating_add(aggregate.exception.source.nvic),
-            "handler_group_conservation": aggregate.handler_group_conservation_valid(),
-        },
-        "feature_set": feature_set,
-    });
-    serde_json::to_string_pretty(&report)
-        .map(|mut value| {
-            value.push('\n');
-            value
-        })
-        .map_err(|error| format!("serialising CPU application profile: {error}"))
-}
-
 fn run() -> Result<Verdict, String> {
     let mut args = parse_args().inspect_err(|_| print_usage())?;
 
     if let Some(expected) = &args.expected_backend_commit {
         validate_backend_identity(expected, BUILT_BACKEND_COMMIT, built_backend_dirty())?;
     }
-
-    let mut progress = match (args.run_id.clone(), args.progress_interval) {
-        (Some(run_id), Some(interval)) => {
-            let mut reporter = ProgressReporter::new(run_id, interval)?;
-            reporter.start(args.cycles);
-            Some(reporter)
-        }
-        (None, None) => None,
-        _ => unreachable!("parse_args validates heartbeat option pairing"),
-    };
 
     #[cfg(feature = "behavior-trace")]
     let scenario_sha256 = match &args.scenario {
@@ -5355,11 +2188,7 @@ fn run() -> Result<Verdict, String> {
         Some(path) => Some(scenario::load(path)?),
         None => None,
     };
-    let replay_scenario = match &args.replay_scenario {
-        Some(path) => Some(scenario::load(path)?),
-        None => None,
-    };
-    if let Some(s) = scenario.as_ref().or(replay_scenario.as_ref()) {
+    if let Some(s) = &scenario {
         if s.needs_lcd() && args.board != Board::PicoCalc {
             return Err(format!(
                 "scenario '{}' looks at the panel, which needs --board picocalc",
@@ -5406,51 +2235,24 @@ fn run() -> Result<Verdict, String> {
         kbd
     });
 
-    let i2c_profile_runtime = match args.i2c_profile.as_deref() {
-        Some(profile) => Some(build_i2c_profile(
-            profile,
-            args.i2c_fixture.as_deref(),
-            keyboard.clone(),
-        )?),
-        None => None,
-    };
-    let i2c_profile_device = i2c_profile_runtime.as_ref().map(|runtime| {
-        Box::new(SharedI2cBusMux {
-            inner: Arc::clone(&runtime.mux),
-        }) as Box<dyn I2cExternalDevice>
-    });
-
     // The BSP mounts but does not format (FF_USE_MKFS=0), so the card
     // constructor supplies the selected pre-formatted volume. FAT32 is
     // the default; FAT16 is retained for compatibility targets.
-    let sd_card = if args.sd {
-        Some(Arc::new(Mutex::new(SdCard::new_with_format(
+    let sd_card = args.sd.then(|| {
+        Arc::new(Mutex::new(SdCard::new_with_format(
             picocalc_board::sdcard::DEFAULT_BLOCKS,
             args.sd_format,
-        ))))
-    } else if let Some(path) = args.sd_image.as_deref() {
-        let card = SdCard::from_raw_file_with_format(path, args.sd_format)
-            .map_err(|e| format!("opening SD RAW image {}: {e}", path.display()))?;
-        Some(Arc::new(Mutex::new(card)))
-    } else {
-        None
-    };
-    if args.sd_trace.is_some()
-        && let Some(card) = sd_card.as_ref()
-    {
-        card.lock().expect("SD mutex").enable_trace();
-    }
+        )))
+    });
 
     let (mut emu, boot_mode, lcd) = boot(
         firmware,
         &bootrom,
         step_quantum,
-        args.boot_mode,
         args.board,
         args.lcd_variant,
         args.psram,
         keyboard.clone(),
-        i2c_profile_device,
         sd_card.clone(),
     )?;
     emu.bus.unsupported_mmio_log_enabled = true;
@@ -5471,121 +2273,20 @@ fn run() -> Result<Verdict, String> {
             emu.map_behavior_gpio_input_domain(BehaviorEventDomain::Psram);
         }
     }
-    #[cfg(feature = "event-horizon-profiler")]
-    if args.event_horizon_profile.is_some() && args.event_horizon_profile_after_uart.is_none() {
-        emu.enable_running_event_profiler()
-            .map_err(|e| format!("enabling running event-horizon profiler: {e}"))?;
-    }
-    #[cfg(feature = "cpu-application-profiler")]
-    if args.cpu_application_profile.is_some() {
-        emu.enable_cpu_application_profiler()
-            .map_err(|e| format!("enabling CPU application profiler: {e}"))?;
-    }
-    if args.audio_wav.is_some() {
-        emu.bus.enable_audio_pcm_capture();
-    }
 
     let handles = BoardHandles {
         lcd: lcd.clone(),
         keyboard: keyboard.clone(),
-        sd: sd_card.clone(),
     };
-    let mut machine = MachineSession::new(emu, handles);
-    machine.set_boot_mode(boot_mode);
-    let mut replay = replay_scenario
-        .map(|scenario| ScenarioReplay::new(scenario, args.snapshot_dir.clone(), args.cycles));
-    if args.preview_api {
-        machine.enable_preview_uart_cycle_tap();
-    }
-    #[cfg(feature = "event-horizon-profiler")]
-    if let Some(marker) = args.event_horizon_profile_after_uart.clone() {
-        machine.arm_event_profile_after_uart(marker);
-    }
-    if args.preview_api {
-        preview_api::run(&mut machine, replay.take())?;
-        return Ok(Verdict::Pass);
-    }
-    if args.machine_api {
-        if let Some(mut replay) = replay.take() {
-            run_replay_to_completion(&mut machine, &mut replay)?;
-        }
-        run_machine_api(&mut machine, &args.snapshot_dir)?;
-        return Ok(Verdict::Pass);
-    }
     let mut engine = scenario.map(|s| scenario::Engine::new(s, args.snapshot_dir.clone()));
 
-    // Start host timing immediately before the emulation loop. Report and
-    // artifact generation happen after this point and therefore cannot
-    // contaminate the CPU-time denominator.
-    let host_timing_start = args.host_timing.as_ref().map(|_| HostTimingStart::start());
     let outcome = run_loop(
-        &mut machine,
+        &mut emu,
         args.cycles,
         args.stop_pc,
         engine.as_mut(),
-        progress.as_mut(),
+        &handles,
     );
-    let host_timing = host_timing_start.map(HostTimingStart::finish);
-    // Report generation still consumes the emulator after the shared
-    // session ends. Moving it back out preserves the existing schema bytes.
-    #[cfg(feature = "event-horizon-profiler")]
-    let event_profile_start_cycle = machine.event_profile_start_cycle;
-    let MachineSession { mut emu, .. } = machine;
-    #[cfg(feature = "cpu-application-profiler")]
-    let cpu_application_profile_snapshots = if args.cpu_application_profile.is_some() {
-        Some(emu.cpu_application_profile_snapshot().ok_or_else(|| {
-            "--cpu-application-profile enabled the profiler before the run".to_string()
-        })?)
-    } else {
-        None
-    };
-
-    if let (Some(path), Some(timing)) = (args.host_timing.as_deref(), host_timing.as_ref()) {
-        let sidecar = host_timing_json(
-            timing,
-            &basename(&args.bin),
-            &firmware_sha,
-            BUILT_BACKEND_COMMIT,
-            built_backend_dirty(),
-            args.board,
-            step_quantum,
-            &outcome,
-        );
-        std::fs::write(path, sidecar.as_bytes())
-            .map_err(|e| format!("writing host timing {}: {e}", path.display()))?;
-    }
-
-    let flash_image = emu.bus.flash_image();
-    if let Some(path) = args.flash_image_out.as_deref() {
-        let input_canonical = std::fs::canonicalize(&args.bin).ok();
-        let output_canonical = std::fs::canonicalize(path).ok();
-        if input_canonical.is_some() && input_canonical == output_canonical {
-            return Err("--flash-image-out must differ from --bin".to_string());
-        }
-        write_flash_image(path, &flash_image)?;
-    }
-    let flash_unknown_commands = emu.bus.flash_unknown_commands().to_vec();
-    let flash_command_counts = emu.bus.flash_command_counts().to_vec();
-    let flash_errors = emu.bus.flash_mutation_errors().to_vec();
-    let flash_report = if args.flash_image_out.is_some()
-        || emu.bus.flash_erase_count() != 0
-        || emu.bus.flash_program_count() != 0
-        || !flash_command_counts.is_empty()
-        || !flash_unknown_commands.is_empty()
-        || !flash_errors.is_empty()
-    {
-        Some(FlashReport {
-            image_bytes: flash_image.len(),
-            erase_count: emu.bus.flash_erase_count(),
-            program_count: emu.bus.flash_program_count(),
-            program_bytes: emu.bus.flash_program_bytes(),
-            command_counts: flash_command_counts,
-            unknown_commands: flash_unknown_commands,
-            errors: flash_errors,
-        })
-    } else {
-        None
-    };
 
     #[cfg(feature = "idle-profiler")]
     if let Some(path) = &args.idle_profile {
@@ -5603,43 +2304,6 @@ fn run() -> Result<Verdict, String> {
         );
         std::fs::write(path, profile_report.as_bytes())
             .map_err(|e| format!("writing idle profile {}: {e}", path.display()))?;
-    }
-    #[cfg(feature = "event-horizon-profiler")]
-    if let Some(path) = &args.event_horizon_profile {
-        let snapshot = emu.running_event_profile_snapshot().ok_or_else(|| {
-            "--event-horizon-profile-after-uart marker was not observed before the run ended"
-                .to_string()
-        })?;
-        let profile_report = build_running_event_profile_report_with_activation(
-            BUILT_BACKEND_COMMIT,
-            built_backend_dirty(),
-            &basename(&args.bin),
-            &firmware_sha,
-            step_quantum,
-            args.event_horizon_profile_after_uart.as_deref(),
-            event_profile_start_cycle,
-            &outcome,
-            &snapshot,
-        );
-        std::fs::write(path, profile_report.as_bytes())
-            .map_err(|e| format!("writing event-horizon profile {}: {e}", path.display()))?;
-    }
-    #[cfg(feature = "cpu-application-profiler")]
-    if let (Some(path), Some(cores)) = (
-        &args.cpu_application_profile,
-        cpu_application_profile_snapshots.as_ref(),
-    ) {
-        let profile_report = build_cpu_application_profile_report(
-            BUILT_BACKEND_COMMIT,
-            built_backend_dirty(),
-            &basename(&args.bin),
-            &firmware_sha,
-            step_quantum,
-            &outcome,
-            cores,
-        )?;
-        std::fs::write(path, profile_report.as_bytes())
-            .map_err(|e| format!("writing CPU application profile {}: {e}", path.display()))?;
     }
 
     // A run that ended for its own reasons — cycle limit, HardFault —
@@ -5713,26 +2377,6 @@ fn run() -> Result<Verdict, String> {
         SdReport::snapshot(&card)
     });
 
-    if let Some(path) = args.sd_trace.as_deref() {
-        let card = sd_card
-            .as_ref()
-            .ok_or_else(|| "--sd-trace requires an attached SD card".to_string())?;
-        let card = card.lock().expect("SD mutex");
-        let snapshot = card
-            .trace_snapshot()
-            .ok_or_else(|| "SD trace was not enabled before the run".to_string())?;
-        write_sd_trace(path, &sd_trace_json(&snapshot))?;
-    }
-
-    if let Some(path) = args.sd_image_out.as_deref() {
-        let card = sd_card
-            .as_ref()
-            .ok_or_else(|| "--sd-image-out requires an attached RAW SD image".to_string())?;
-        let mut card = card.lock().expect("SD mutex");
-        card.export_raw(path)
-            .map_err(|e| format!("exporting SD RAW image {}: {e}", path.display()))?;
-    }
-
     let keyboard_report = keyboard.as_ref().map(|kbd| {
         let k = kbd.lock().expect("keyboard mutex");
         KeyboardReport {
@@ -5761,42 +2405,6 @@ fn run() -> Result<Verdict, String> {
     // sample configures PWM during init, and Gate 5 requires that to be
     // observable.
     let pwm_report = (args.board == Board::PicoCalc).then(|| PwmReport::collect(&emu.bus));
-
-    // PWM/DMA audio observation is independent of the LCD board model. Keep
-    // the report absent for ordinary board-less runs, but enable it whenever
-    // an audio expectation or capture output was requested so an audio-only
-    // run can omit the expensive PIO LCD observer. Screen assertions still
-    // require `--board picocalc` in the scenario layer above.
-    let audio_requested = args.expected_audio_sink_count.is_some()
-        || args.audio_analysis.is_some()
-        || args.audio_wav.is_some();
-    let audio_sink_report = audio_requested.then(|| {
-        AudioSinkReport::collect(
-            &emu.bus,
-            args.expected_audio_sink_count,
-            args.expected_audio_sink_sha256.as_deref(),
-        )
-    });
-    if let (Some(path), Some(audio_sink)) = (&args.audio_analysis, &audio_sink_report) {
-        let analysis = audio_sink.analysis_json(
-            BUILT_BACKEND_COMMIT,
-            built_backend_dirty(),
-            &basename(&args.bin),
-            &firmware_sha,
-        );
-        std::fs::write(path, analysis.as_bytes())
-            .map_err(|e| format!("writing audio analysis {}: {e}", path.display()))?;
-    }
-    if let Some(path) = &args.audio_wav {
-        let samples = emu
-            .bus
-            .take_audio_pcm_capture()
-            .expect("--audio-wav enabled PCM capture before the run");
-        let sample_rate_hz = audio_sink_report
-            .as_ref()
-            .map_or(0, |report| report.snapshot.sample_rate_hz);
-        write_audio_wav(path, &samples, sample_rate_hz)?;
-    }
 
     let pio_report = (args.board == Board::PicoCalc).then(|| PioReport::collect(&mut emu.bus));
 
@@ -5828,7 +2436,7 @@ fn run() -> Result<Verdict, String> {
     let keyboard_protocol_errors = keyboard_report.as_ref().map_or(0, |value| {
         value.unknown_reg_selects + value.unknown_reg_writes
     });
-    let mut verdict = judge_run(
+    let verdict = judge_run(
         &outcome,
         unsupported.len(),
         unsupported_truncated,
@@ -5839,16 +2447,6 @@ fn run() -> Result<Verdict, String> {
         effective_expected_stop,
         &args.expected_uart,
     );
-    apply_audio_sink_expectation(&mut verdict, audio_sink_report.as_ref());
-    #[cfg(feature = "sd-gen1-multiblock")]
-    apply_sd_protocol_errors(&mut verdict, sd_report.as_ref());
-    if let Some(runtime) = &i2c_profile_runtime {
-        let observation = runtime.observation();
-        apply_i2c_protocol_errors(&mut verdict, &observation);
-    }
-    if let (Some(runtime), Some(path)) = (&i2c_profile_runtime, args.i2c_report.as_deref()) {
-        write_i2c_profile_report(path, runtime, &outcome, &verdict)?;
-    }
 
     let report = build_report(
         backend_commit,
@@ -5870,11 +2468,9 @@ fn run() -> Result<Verdict, String> {
         lcd_report.as_ref(),
         fb_report.as_ref(),
         psram_report.as_ref(),
-        flash_report.as_ref(),
         sd_report.as_ref(),
         keyboard_report.as_ref(),
         pwm_report.as_ref(),
-        audio_sink_report.as_ref(),
         pio_report.as_ref(),
         engine.as_ref().map(|e| {
             (
@@ -5928,113 +2524,23 @@ fn run() -> Result<Verdict, String> {
             picocalc_board::keyboard::MAX_QUEUED_EVENTS
         );
     }
-    if let Some(reporter) = progress.as_mut() {
-        reporter.finish(&outcome, verdict.status);
-    }
     Ok(verdict.status)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioSinkReport, BoardHandles, BootMode, BootRequest, MachineApiState, MachineSession,
-        RunOutcome, SdReport, StopReason, Verdict, apply_audio_sink_expectation,
-        boot_report_fragment, build_i2c_profile, dispatch_machine_request, fatal_exception_name,
-        json_escape, judge_run, run_loop, sd_trace_json, sha256_hex, snapshot_machine,
-        validate_backend_identity, validate_progress_interval, validate_run_id,
-        validate_sd_selection, write_audio_wav,
+        RunOutcome, SdReport, StopReason, Verdict, fatal_exception_name, json_escape, judge_run,
+        validate_backend_identity, validate_sd_selection,
     };
-    #[cfg(feature = "sd-gen1-multiblock")]
-    use super::{VerdictReport, apply_sd_protocol_errors};
-    use picocalc_board::{Keyboard, SdFormat, St7365p};
-    use rp2040_emu::AudioSinkSnapshot;
-    #[cfg(feature = "cpu-application-profiler")]
-    use rp2040_emu::CpuApplicationProfiler;
+    use picocalc_board::SdFormat;
     #[cfg(feature = "idle-profiler")]
     use rp2040_emu::IdleProfileSnapshot;
-    use rp2040_emu::{Config, EmulatorBuilder};
-    use std::path::Path;
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn i2c_profile_builtin_has_only_the_declared_rtc_devices() {
-        let profile = build_i2c_profile("picocalc-rtc-v1", None, None).unwrap();
-        assert_eq!(profile.fixture_id, "builtin-picocalc-rtc-v1");
-        assert_eq!(profile.fixture_basename, None);
-        assert_eq!(
-            profile.attached_addresses,
-            vec![
-                picocalc_board::DS3231_ADDRESS,
-                picocalc_board::AT24C32_ADDRESS
-            ]
-        );
-        assert_eq!(profile.observation().protocol_errors, 0);
-    }
-
-    #[test]
-    fn i2c_profile_fixture_checks_bus_devices_and_records_provenance() {
-        let path =
-            std::env::temp_dir().join(format!("picocalc-i2c-fixture-{}.json", std::process::id()));
-        let fixture = r#"{
-          "schema_version": 1,
-          "fixture_id": "test-rtc",
-          "profile": "picocalc-rtc-v1",
-          "bus": {"controller": "i2c1", "sda_gpio": 6, "scl_gpio": 7, "address_bits": 7},
-          "devices": [
-            {"kind": "ds3231", "address": 104, "state": {
-              "encoding": "register_bytes",
-              "initial_datetime": "2024-02-29T12:34:56Z",
-              "osf": true
-            }},
-            {"kind": "at24c32", "address": 87, "state": {
-              "encoding": "register_bytes",
-              "registers": {"0x0000": 165, "0x0fff": 90}
-            }}
-          ]
-        }"#;
-        std::fs::write(&path, fixture).unwrap();
-        let profile = build_i2c_profile("picocalc-rtc-v1", Some(&path), None).unwrap();
-        assert_eq!(profile.fixture_id, "test-rtc");
-        assert_eq!(
-            profile.fixture_basename.as_deref(),
-            path.file_name().and_then(|name| name.to_str())
-        );
-        assert_eq!(
-            profile.fixture_sha256.as_deref(),
-            Some(sha256_hex(fixture.as_bytes()).as_str())
-        );
-        assert_eq!(profile.attached_addresses.len(), 2);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn i2c_environment_profile_builtin_attaches_both_sensors() {
-        let profile = build_i2c_profile("picocalc-rtc-env-v1", None, None).unwrap();
-        assert_eq!(profile.fixture_id, "builtin-picocalc-rtc-env-v1");
-        assert_eq!(
-            profile.attached_addresses,
-            vec![
-                picocalc_board::DS3231_ADDRESS,
-                picocalc_board::AT24C32_ADDRESS,
-                picocalc_board::AHT20_ADDRESS,
-                picocalc_board::BMP280_ADDRESS,
-            ]
-        );
-        assert_eq!(profile.observation().protocol_errors, 0);
-    }
 
     #[cfg(feature = "behavior-trace")]
     use super::behavior_projection;
-    #[cfg(feature = "cpu-application-profiler")]
-    use super::build_cpu_application_profile_report;
     #[cfg(feature = "idle-profiler")]
     use super::build_idle_profile_report;
-    #[cfg(feature = "event-horizon-profiler")]
-    use super::build_running_event_profile_report;
-    #[cfg(feature = "event-horizon-profiler")]
-    use rp2040_emu::RunningEventProfileSnapshot;
-    #[cfg(feature = "event-horizon-profiler")]
-    use rp2040_emu::bus::UART0_BASE;
     #[cfg(feature = "behavior-trace")]
     use rp2040_emu::{BehaviorEventDomain, BehaviorTraceDomainSnapshot, BehaviorTraceSnapshot};
 
@@ -6099,55 +2605,6 @@ mod tests {
         assert_eq!(StopReason::Error.as_str(), "error");
     }
 
-    #[test]
-    fn boot_mode_request_is_explicit_and_fail_closed() {
-        assert_eq!(BootRequest::parse("app"), Ok(BootRequest::App));
-        assert_eq!(BootRequest::parse("boot2"), Ok(BootRequest::Boot2));
-        assert!(BootRequest::parse("bootrom").is_err());
-        assert_eq!(BootMode::Boot2FromFlash.as_str(), "boot2");
-    }
-
-    #[test]
-    fn boot_report_keeps_vtor_meaning_explicit_per_mode() {
-        assert_eq!(
-            boot_report_fragment(BootMode::Boot2FromFlash),
-            "  \"boot\": {\"mode\": \"boot2\", \"vtor_flash_offset\": null},\n"
-        );
-        assert_eq!(
-            boot_report_fragment(BootMode::DirectBootFromFlash),
-            "  \"boot\": {\"mode\": \"direct_boot_from_flash\", \"vtor_flash_offset\": \"0x0100\"},\n"
-        );
-    }
-
-    #[test]
-    fn run_id_validation_accepts_safe_identifiers() {
-        assert_eq!(validate_run_id("mapper19-case.a_1:ok"), Ok(()));
-        assert_eq!(validate_run_id(&"a".repeat(64)), Ok(()));
-    }
-
-    #[test]
-    fn run_id_validation_rejects_ambiguous_or_injectable_identifiers() {
-        let too_long = "a".repeat(65);
-        for invalid in ["", "has space", "line\nfeed", "日本語"] {
-            assert!(validate_run_id(invalid).is_err(), "accepted {invalid:?}");
-        }
-        assert!(validate_run_id(&too_long).is_err());
-    }
-
-    #[test]
-    fn verdict_exit_codes_are_stable() {
-        assert_eq!(Verdict::Pass.exit_code(), 0);
-        assert_eq!(Verdict::Fail.exit_code(), 1);
-        assert_eq!(Verdict::CannotJudge.exit_code(), 2);
-    }
-
-    #[test]
-    fn progress_interval_validation_rejects_zero_and_clock_overflow() {
-        assert!(validate_progress_interval(0).is_err());
-        assert!(validate_progress_interval(1).is_ok());
-        assert!(validate_progress_interval(u64::MAX).is_err());
-    }
-
     fn outcome(stop_reason: StopReason, uart: &[u8]) -> RunOutcome {
         RunOutcome {
             stop_reason,
@@ -6157,7 +2614,6 @@ mod tests {
             exception: None,
             error: None,
             uart_bytes: uart.to_vec(),
-            watchdog_resets: Vec::new(),
         }
     }
 
@@ -6297,152 +2753,12 @@ mod tests {
 
     #[test]
     fn only_nmi_and_hardfault_are_fatal() {
-        assert_eq!(fatal_exception_name(0, 0), None); // thread mode
-        assert_eq!(fatal_exception_name(0, 2), Some("NMI"));
-        assert_eq!(fatal_exception_name(0, 3), Some("HardFault"));
-        assert_eq!(fatal_exception_name(1, 2), Some("core1 NMI"));
-        assert_eq!(fatal_exception_name(1, 3), Some("core1 HardFault"));
-        assert_eq!(fatal_exception_name(0, 11), None); // SVCall
-        assert_eq!(fatal_exception_name(0, 15), None); // SysTick
-        assert_eq!(fatal_exception_name(0, 16), None); // IRQ0
-    }
-
-    #[test]
-    fn a_core1_hardfault_stops_the_run_fail_closed() {
-        let mut emu = EmulatorBuilder::new(Config::default())
-            .build()
-            .expect("serial emulator build");
-        emu.cores[1].regs.xpsr = (emu.cores[1].regs.xpsr & !0x1ff) | 3;
-
-        let mut machine = MachineSession::new(emu, BoardHandles::default());
-        let run = run_loop(&mut machine, 100, None, None, None);
-
-        assert!(run.stop_reason == StopReason::Exception);
-        assert_eq!(run.exception, Some("core1 HardFault"));
-        let verdict = judge_run(
-            &run,
-            0,
-            false,
-            0,
-            0,
-            None,
-            false,
-            Some(StopReason::CycleLimit),
-            &[],
-        );
-        assert!(verdict.status == Verdict::Fail);
-        assert_eq!(verdict.reasons, ["exception", "stop_reason_mismatch"]);
-    }
-
-    #[test]
-    fn machine_api_rejects_unknown_fields_before_advancing() {
-        let emu = EmulatorBuilder::new(Config::default())
-            .build()
-            .expect("serial emulator build");
-        let mut machine = MachineSession::new(emu, BoardHandles::default());
-        let request = serde_json::json!({
-            "schema": 1,
-            "id": "r1",
-            "op": "run",
-            "max_cycles": 100,
-            "max_cylces": 100
-        });
-        let header = super::machine_protocol::parse_request_header(&request).unwrap();
-        let mut state = MachineApiState::default();
-        let before = machine.cycles();
-        let error =
-            dispatch_machine_request(&mut machine, &mut state, &request, &header, Path::new("."))
-                .expect_err("unknown field must fail closed");
-        assert_eq!(
-            error.code,
-            super::machine_protocol::ErrorCode::InvalidRequest
-        );
-        assert_eq!(machine.cycles(), before);
-    }
-
-    #[test]
-    fn machine_api_run_is_bounded_and_reports_actual_cycles() {
-        let emu = EmulatorBuilder::new(Config::default())
-            .step_quantum(1)
-            .build()
-            .expect("serial emulator build");
-        let mut machine = MachineSession::new(emu, BoardHandles::default());
-        let request = serde_json::json!({
-            "schema": 1,
-            "id": "bounded",
-            "op": "run",
-            "max_cycles": 1
-        });
-        let header = super::machine_protocol::parse_request_header(&request).unwrap();
-        let (result, changed) = dispatch_machine_request(
-            &mut machine,
-            &mut MachineApiState::default(),
-            &request,
-            &header,
-            Path::new("."),
-        )
-        .expect("bounded run must execute");
-        assert!(changed);
-        assert_eq!(result["reason"], "cycle_budget");
-        assert!(result["advanced_cycles"].as_u64().unwrap() >= 1);
-    }
-
-    #[test]
-    fn machine_api_input_makes_fifo_drop_explicit() {
-        let keyboard = Arc::new(Mutex::new(Keyboard::picocalc()));
-        let emu = EmulatorBuilder::new(Config::default())
-            .build()
-            .expect("serial emulator build");
-        let mut machine = MachineSession::new(
-            emu,
-            BoardHandles {
-                keyboard: Some(keyboard),
-                ..BoardHandles::default()
-            },
-        );
-        let request = serde_json::json!({
-            "schema": 1,
-            "id": 2,
-            "op": "input",
-            "text": "abcdefghijklmnop"
-        });
-        let header = super::machine_protocol::parse_request_header(&request).unwrap();
-        let (result, changed) = dispatch_machine_request(
-            &mut machine,
-            &mut MachineApiState::default(),
-            &request,
-            &header,
-            Path::new("."),
-        )
-        .expect("valid input command");
-        assert!(changed);
-        assert_eq!(result["status"], "dropped");
-        assert_eq!(result["dropped"], 1);
-        assert_eq!(result["queued"], 31);
-    }
-
-    #[test]
-    fn machine_api_snapshot_cannot_escape_its_output_directory() {
-        let lcd = Arc::new(Mutex::new(St7365p::new()));
-        let emu = EmulatorBuilder::new(Config::default())
-            .build()
-            .expect("serial emulator build");
-        let machine = MachineSession::new(
-            emu,
-            BoardHandles {
-                lcd: Some(lcd),
-                ..BoardHandles::default()
-            },
-        );
-        for name in ["../escape.png", "/tmp/escape.png", "nested/escape.png"] {
-            let request = serde_json::json!({"png": name});
-            let error = snapshot_machine(&machine, &request, Path::new("safe"))
-                .expect_err("path escape must be rejected");
-            assert_eq!(
-                error.code,
-                super::machine_protocol::ErrorCode::InvalidRequest
-            );
-        }
+        assert_eq!(fatal_exception_name(0), None); // thread mode
+        assert_eq!(fatal_exception_name(2), Some("NMI"));
+        assert_eq!(fatal_exception_name(3), Some("HardFault"));
+        assert_eq!(fatal_exception_name(11), None); // SVCall
+        assert_eq!(fatal_exception_name(15), None); // SysTick
+        assert_eq!(fatal_exception_name(16), None); // IRQ0
     }
 
     #[test]
@@ -6455,19 +2771,12 @@ mod tests {
 
     #[test]
     fn an_explicit_sd_format_requires_an_attached_card() {
-        assert_eq!(validate_sd_selection(true, None, None, None, true), Ok(()));
-        assert_eq!(validate_sd_selection(true, None, None, None, false), Ok(()));
+        assert_eq!(validate_sd_selection(true, true), Ok(()));
+        assert_eq!(validate_sd_selection(true, false), Ok(()));
+        assert_eq!(validate_sd_selection(false, false), Ok(()));
         assert_eq!(
-            validate_sd_selection(false, None, None, None, false),
-            Ok(())
-        );
-        assert_eq!(
-            validate_sd_selection(false, None, None, None, true),
+            validate_sd_selection(false, true),
             Err("--sd-format requires --sd".to_string())
-        );
-        assert_eq!(
-            validate_sd_selection(false, None, None, Some(Path::new("trace.json")), false),
-            Err("--sd-trace requires --sd or --sd-image".to_string())
         );
     }
 
@@ -6480,299 +2789,11 @@ mod tests {
             blocks_read: 2,
             blocks_written: 1,
             unknown_commands: Vec::new(),
-            #[cfg(feature = "sd-gen1-multiblock")]
-            protocol_errors: Vec::new(),
-            raw: None,
         }
         .to_json();
         assert!(report.contains("\"format\": \"fat32\""));
         assert!(report.contains("\"block_size\": 512"));
         assert!(report.contains("\"blocks_written\": 1"));
-    }
-
-    #[cfg(feature = "sd-gen1-multiblock")]
-    #[test]
-    fn sd_protocol_error_forces_a_judged_failure() {
-        let mut verdict = VerdictReport {
-            status: Verdict::Pass,
-            reasons: Vec::new(),
-            expected_stop: None,
-            required_uart_markers: Vec::new(),
-            missing_uart_markers: Vec::new(),
-        };
-        let report = SdReport {
-            format: SdFormat::Fat32,
-            block_count: 128,
-            commands_seen: 1,
-            blocks_read: 0,
-            blocks_written: 0,
-            unknown_commands: Vec::new(),
-            protocol_errors: vec!["wrong_token".to_string()],
-            raw: None,
-        };
-        apply_sd_protocol_errors(&mut verdict, Some(&report));
-        assert!(matches!(verdict.status, Verdict::Fail));
-        assert_eq!(verdict.reasons, vec!["sd_protocol_error"]);
-    }
-
-    #[test]
-    fn sd_trace_json_is_a_separate_structured_artifact() {
-        let snapshot = picocalc_board::SdTraceSnapshot {
-            schema_version: 1,
-            event_count: 2,
-            digest_sha256: "ab".repeat(32),
-            preview_truncated: false,
-            preview: vec![picocalc_board::SdTraceEvent::Command {
-                sequence: 0,
-                cs_epoch: 1,
-                transfers: 6,
-                index: 17,
-                argument: 4,
-                crc: 1,
-                crc_valid: true,
-                response: vec![0],
-                data: Some(picocalc_board::SdTraceData {
-                    direction: picocalc_board::SdTraceDirection::Read,
-                    block: 4,
-                    token: 0xFE,
-                    length: 512,
-                    crc: [0xFF, 0xFF],
-                }),
-            }],
-        };
-        let json = sd_trace_json(&snapshot);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 1);
-        assert_eq!(parsed["trace_kind"], "sd-spi-structured-v1");
-        assert_eq!(parsed["preview"][0]["kind"], "command");
-        assert_eq!(parsed["preview"][0]["data"]["length"], 512);
-    }
-
-    #[test]
-    fn audio_sink_report_matches_only_on_exact_count_and_sha() {
-        let mut snapshot = AudioSinkSnapshot {
-            status: "pass",
-            dma_write_count: 3,
-            target_write_attempt_count: 3,
-            other_pwm_cc_write_count: 0,
-            wrong_width_count: 0,
-            wrong_treq_count: 0,
-            missing_due_cycle_count: 0,
-            pcm_sha256: "aabbccdd".repeat(8),
-            first_words: Vec::new(),
-            last_words: Vec::new(),
-            timer_index: 0,
-            treq: 59,
-            timer_fraction_x: 3,
-            timer_fraction_y: 15625,
-            timer_event_count: 0,
-            timer_miss_count: 0,
-            timer_miss_audio_not_busy: 0,
-            timer_miss_other_dma_selected: 0,
-            timer_miss_no_dma_selected: 0,
-            timer_miss_multiple_due_in_window: 0,
-            timer_due_cycle_sha256: String::new(),
-            block_start_count: 1,
-            block_frame_min: Some(3),
-            block_frame_max: Some(3),
-            malformed_block_count: 0,
-            block_boundary_gap_count: 0,
-            block_boundary_gap_min_cycles: None,
-            block_boundary_gap_max_cycles: None,
-            block_boundary_gap_sha256: String::new(),
-            gap_5208_count: 0,
-            gap_5209_count: 0,
-            unexpected_gap_count: 0,
-            service_latency_min_cycles: None,
-            service_latency_max_cycles: None,
-            service_latency_sha256: String::new(),
-            analysis_frame_count: 3,
-            sample_rate_hz: 48_000,
-            channel_count: 2,
-            reconstructed_pcm_format: "stereo_s16le_from_pwm8_duty",
-            analysis_window_frames: 1024,
-            active_abs_threshold: 512,
-            peak_abs_left: 32_768,
-            peak_abs_right: 32_767,
-            stream_rms: 12_000,
-            max_window_rms: 16_000,
-            dc_offset_left: 0,
-            dc_offset_right: 0,
-            active_frame_count: 3,
-            active_frame_ratio_ppm: 1_000_000,
-            rail_sample_count: 1,
-            rail_sample_ratio_ppm: 166_666,
-            max_consecutive_rail_frames: 1,
-            out_of_range_duty_sample_count: 0,
-        };
-
-        assert_eq!(
-            AudioSinkReport::status_for_expected(
-                &snapshot,
-                Some(3),
-                Some("aabbccdd".repeat(8).as_str())
-            ),
-            "pass"
-        );
-
-        snapshot.dma_write_count = 2;
-        assert_eq!(
-            AudioSinkReport::status_for_expected(
-                &snapshot,
-                Some(3),
-                Some("aabbccdd".repeat(8).as_str())
-            ),
-            "fail"
-        );
-
-        snapshot.dma_write_count = 3;
-        assert_eq!(
-            AudioSinkReport::status_for_expected(
-                &snapshot,
-                Some(3),
-                Some("00112233".repeat(8).as_str())
-            ),
-            "fail"
-        );
-
-        assert_eq!(
-            AudioSinkReport::status_for_expected(&snapshot, None, None),
-            "pass"
-        );
-
-        let report = AudioSinkReport {
-            snapshot: snapshot.clone(),
-            expected_count: None,
-            expected_sha256: None,
-            status: "pass",
-        };
-        let frozen_analysis =
-            report.analysis_json("a".repeat(40).as_str(), false, "app.bin", &"b".repeat(64));
-        assert!(frozen_analysis.contains("\"schema_version\": 1"));
-        assert!(frozen_analysis.contains("\"sample_rate_hz\": 48000"));
-
-        let mut parameterized = snapshot.clone();
-        parameterized.sample_rate_hz = 22_050;
-        let report = AudioSinkReport {
-            snapshot: parameterized,
-            expected_count: None,
-            expected_sha256: None,
-            status: "pass",
-        };
-        let parameterized_analysis =
-            report.analysis_json("a".repeat(40).as_str(), false, "app.bin", &"b".repeat(64));
-        assert!(parameterized_analysis.contains("\"schema_version\": 2"));
-        assert!(parameterized_analysis.contains("\"sample_rate_hz\": 22050"));
-
-        assert_eq!(
-            AudioSinkReport::status_for_expected(&snapshot, Some(3), None),
-            "fail"
-        );
-    }
-
-    #[test]
-    fn audio_wav_header_uses_the_observed_sample_rate() {
-        let path = std::env::temp_dir().join(format!(
-            "picocalc-audio-wav-rate-{}-{}.wav",
-            std::process::id(),
-            22_050
-        ));
-        write_audio_wav(&path, &[0, 0, 1, -1], 22_050).expect("WAV write");
-        let bytes = std::fs::read(&path).expect("WAV read");
-        assert_eq!(
-            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
-            22_050
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
-            22_050 * 4
-        );
-        std::fs::remove_file(path).expect("WAV cleanup");
-    }
-
-    #[test]
-    fn audio_sink_expectation_failure_forces_verdict_fail() {
-        let mut verdict = super::VerdictReport {
-            status: Verdict::Pass,
-            reasons: Vec::new(),
-            expected_stop: Some(StopReason::CycleLimit),
-            required_uart_markers: Vec::new(),
-            missing_uart_markers: Vec::new(),
-        };
-
-        let report = AudioSinkReport {
-            snapshot: AudioSinkSnapshot {
-                status: "pass",
-                dma_write_count: 3,
-                target_write_attempt_count: 3,
-                other_pwm_cc_write_count: 0,
-                wrong_width_count: 0,
-                wrong_treq_count: 0,
-                missing_due_cycle_count: 0,
-                pcm_sha256: "aabbccdd".repeat(8),
-                first_words: Vec::new(),
-                last_words: Vec::new(),
-                timer_index: 0,
-                treq: 59,
-                timer_fraction_x: 3,
-                timer_fraction_y: 15625,
-                timer_event_count: 0,
-                timer_miss_count: 0,
-                timer_miss_audio_not_busy: 0,
-                timer_miss_other_dma_selected: 0,
-                timer_miss_no_dma_selected: 0,
-                timer_miss_multiple_due_in_window: 0,
-                timer_due_cycle_sha256: String::new(),
-                block_start_count: 1,
-                block_frame_min: Some(3),
-                block_frame_max: Some(3),
-                malformed_block_count: 0,
-                block_boundary_gap_count: 0,
-                block_boundary_gap_min_cycles: None,
-                block_boundary_gap_max_cycles: None,
-                block_boundary_gap_sha256: String::new(),
-                gap_5208_count: 0,
-                gap_5209_count: 0,
-                unexpected_gap_count: 0,
-                service_latency_min_cycles: None,
-                service_latency_max_cycles: None,
-                service_latency_sha256: String::new(),
-                analysis_frame_count: 3,
-                sample_rate_hz: 48_000,
-                channel_count: 2,
-                reconstructed_pcm_format: "stereo_s16le_from_pwm8_duty",
-                analysis_window_frames: 1024,
-                active_abs_threshold: 512,
-                peak_abs_left: 32_768,
-                peak_abs_right: 32_767,
-                stream_rms: 12_000,
-                max_window_rms: 16_000,
-                dc_offset_left: 0,
-                dc_offset_right: 0,
-                active_frame_count: 3,
-                active_frame_ratio_ppm: 1_000_000,
-                rail_sample_count: 1,
-                rail_sample_ratio_ppm: 166_666,
-                max_consecutive_rail_frames: 1,
-                out_of_range_duty_sample_count: 0,
-            },
-            expected_count: Some(3),
-            expected_sha256: Some("aabbccdd".repeat(8)),
-            status: "fail",
-        };
-
-        apply_audio_sink_expectation(&mut verdict, Some(&report));
-        assert!(verdict.status == Verdict::Fail);
-        assert_eq!(verdict.reasons, ["audio_sink_mismatch"]);
-
-        let mut pass_verdict = verdict;
-        let pass_report = AudioSinkReport {
-            status: "pass",
-            ..report
-        };
-        apply_audio_sink_expectation(&mut pass_verdict, Some(&pass_report));
-        assert!(pass_verdict.status == Verdict::Fail);
-        assert_eq!(pass_verdict.reasons, ["audio_sink_mismatch"]);
     }
 
     #[test]
@@ -6788,54 +2809,6 @@ mod tests {
             validate_backend_identity(expected, expected, true)
                 .unwrap_err()
                 .contains("dirty")
-        );
-    }
-
-    #[cfg(feature = "cpu-application-profiler")]
-    #[test]
-    fn cpu_application_profile_report_is_deterministic_and_conservative() {
-        let mut profiler = CpuApplicationProfiler::default();
-        profiler.record_decode_lookup(0x1000_0000, true, true);
-        profiler.record_retirement(0x1000_0000, 0x0000, false);
-        profiler.record_cycles(2);
-        let cores = [profiler.snapshot(), Default::default()];
-        let run = outcome(StopReason::ScenarioDone, b"");
-        let report = build_cpu_application_profile_report(
-            "0123456789012345678901234567890123456789",
-            false,
-            "firmware.bin",
-            &"ab".repeat(32),
-            64,
-            &run,
-            &cores,
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
-        assert_eq!(parsed["schema_id"], "picocalc.rp2040-cpu-profile");
-        assert_eq!(parsed["schema_version"], 1);
-        assert_eq!(parsed["valid_for_wall_time"], false);
-        assert_eq!(parsed["profile_valid"], true);
-        assert_eq!(parsed["counters"]["retired_instructions"], 1);
-        assert_eq!(parsed["counters"]["pc_region"]["immutable_xip"], 1);
-        assert_eq!(parsed["counters"]["decode"]["hits"], 1);
-        assert_eq!(
-            parsed["counters"]["decode"]["by_region"]["immutable_xip"]["hits"],
-            1
-        );
-        assert_eq!(parsed["cores"][1]["active"], false);
-        assert_eq!(parsed["cores"][1]["retired_instructions"], 0);
-        assert_eq!(
-            report,
-            build_cpu_application_profile_report(
-                "0123456789012345678901234567890123456789",
-                false,
-                "firmware.bin",
-                &"ab".repeat(32),
-                64,
-                &run,
-                &cores,
-            )
-            .unwrap()
         );
     }
 
@@ -6902,292 +2875,5 @@ mod tests {
                 &profile,
             )
         );
-    }
-
-    #[cfg(feature = "event-horizon-profiler")]
-    #[test]
-    fn running_event_profile_report_is_deterministic_valid_json() {
-        let mut profile = RunningEventProfileSnapshot::default();
-        profile.boundary.running_steps = 7;
-        profile.boundary.total_running_cycles = 12;
-        profile.boundary.boundary_steps = 3;
-        profile.boundary.candidate_dispatches = 5;
-        profile.boundary.candidate_cycles = 9;
-        profile.boundary.boundary_events.cpu_mmio = 2;
-        profile.boundary.one_cycle_fallback_cycles.pio = 8;
-        profile.boundary.one_cycle_fallback_signatures.steps[1] = 4;
-        profile.boundary.one_cycle_fallback_signatures.cycle_mass[1] = 8;
-        profile.boundary.observed_candidate_dispatches.episodes_ge[1] = 1;
-        profile.boundary.observed_candidate_dispatches.cycle_mass_ge[1] = 5;
-        profile.decode_by_core[0].cacheable_hits = 11;
-        profile.decode_by_core[0].cacheable_misses = 2;
-        profile.decode_by_core[0].noncacheable_fetches = 3;
-        profile.decode_by_core[0].cacheable_hits_narrow = 4;
-        profile.decode_by_core[0].cacheable_hits_wide = 5;
-        profile.decode_by_core[0].lookup_hits_by_region.rom = 6;
-        profile.decode_by_core[0]
-            .lookup_hits_by_region
-            .immutable_xip_flash_aliases = 7;
-        profile.decode_by_core[0].lookup_hits_by_region.xip_sram = 8;
-        profile.decode_by_core[0].lookup_hits_by_region.sram = 9;
-        profile.decode_by_core[0].lookup_hits_by_region.other = 10;
-        profile.decode_by_core[0].lookup_misses_by_region.rom = 1;
-        profile.decode_by_core[0]
-            .lookup_misses_by_region
-            .immutable_xip_flash_aliases = 2;
-        profile.decode_by_core[0].lookup_misses_by_region.xip_sram = 3;
-        profile.decode_by_core[0].lookup_misses_by_region.sram = 4;
-        profile.decode_by_core[0].lookup_misses_by_region.other = 5;
-        profile.decode_by_core[0]
-            .sequential_cache_hit_runs
-            .episodes_ge[2] = 3;
-        profile.decode_by_core[0].immutable_xip_hit_runs.episodes_ge[1] = 2;
-        profile.decode_by_core[0]
-            .immutable_xip_hit_run_termination_counters
-            .post_execute_next_pc_redirect = 11;
-        profile.decode_by_core[0]
-            .immutable_xip_hit_run_termination_counters
-            .xip_miss = 12;
-        profile.decode_by_core[0]
-            .immutable_xip_hit_run_termination_counters
-            .region_exit = 13;
-        profile.decode_by_core[0]
-            .immutable_xip_hit_run_termination_counters
-            .prefetch_exception = 14;
-        profile.decode_by_core[0]
-            .immutable_xip_hit_run_termination_counters
-            .fault = 15;
-        profile.decode_by_core[0]
-            .decode_cache_invalidation_observations
-            .entry_address_count = 16;
-        profile.decode_by_core[0]
-            .decode_cache_invalidation_observations
-            .rom = 17;
-        profile.decode_by_core[0]
-            .decode_cache_invalidation_observations
-            .xip = 18;
-        profile.decode_by_core[0]
-            .decode_cache_invalidation_observations
-            .sram = 19;
-        profile.decode_by_core[0]
-            .decode_cache_invalidation_observations
-            .bulk = 20;
-        profile.decode_by_core[0]
-            .decode_cache_invalidation_observations
-            .all = 21;
-        let run = outcome(StopReason::ScenarioDone, b"");
-        let report = build_running_event_profile_report(
-            "0123456789012345678901234567890123456789",
-            false,
-            "firmware.bin",
-            "abcdef",
-            1,
-            &run,
-            &profile,
-        );
-        let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
-        assert_eq!(
-            parsed["kind"],
-            "rp2040_serial_running_event_horizon_profile"
-        );
-        assert_eq!(parsed["schema_version"], 3);
-        assert_eq!(parsed["observed_gaps_are_safe_windows"], false);
-        assert_eq!(parsed["fallback_occupancy_is_safe_window"], false);
-        assert_eq!(parsed["decode_hit_runs_are_speedup_prediction"], false);
-        assert_eq!(
-            parsed["immutable_xip_hit_runs_are_speedup_prediction"],
-            false
-        );
-        assert_eq!(parsed["counters"]["running_steps"], 7);
-        assert_eq!(parsed["counters"]["candidate_dispatches"], 5);
-        assert_eq!(parsed["counters"]["candidate_cycles"], 9);
-        assert_eq!(parsed["boundary_events"]["cpu_mmio"], 2);
-        assert_eq!(parsed["one_cycle_fallback_cycles"]["pio"], 8);
-        assert_eq!(parsed["one_cycle_fallback_signatures"]["steps"][1], 4);
-        assert_eq!(parsed["one_cycle_fallback_signatures"]["cycle_mass"][1], 8);
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["cacheable_hits"],
-            11
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["cacheable_misses"],
-            2
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["noncacheable_fetches"],
-            3
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["cacheable_hits_narrow"],
-            4
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["cacheable_hits_wide"],
-            5
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["rom"],
-            6
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["immutable_xip_flash_aliases"],
-            7
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["xip_sram"],
-            8
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["sram"],
-            9
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_hits_by_region"]["other"],
-            10
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["rom"],
-            1
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["immutable_xip_flash_aliases"],
-            2
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["xip_sram"],
-            3
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["sram"],
-            4
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["lookup_misses_by_region"]["other"],
-            5
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["sequential_cache_hit_runs"]["episodes_ge"][2],
-            3
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_runs"]["episodes_ge"][1],
-            2
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["post_execute_next_pc_redirect"],
-            11
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["xip_miss"],
-            12
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["region_exit"],
-            13
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["prefetch_exception"],
-            14
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["immutable_xip_hit_run_termination_counters"]["fault"],
-            15
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["entry_address_count"],
-            16
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["rom"],
-            17
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["xip"],
-            18
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["sram"],
-            19
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["bulk"],
-            20
-        );
-        assert_eq!(
-            parsed["decode_opportunity_by_core"][0]["decode_cache_invalidation_observations"]["all"],
-            21
-        );
-        assert_eq!(
-            parsed["observed_candidate_dispatches"]["cycle_mass_ge"][1],
-            5
-        );
-        assert_eq!(
-            report,
-            build_running_event_profile_report(
-                "0123456789012345678901234567890123456789",
-                false,
-                "firmware.bin",
-                "abcdef",
-                1,
-                &run,
-                &profile,
-            )
-        );
-        let report2 = build_running_event_profile_report(
-            "0123456789012345678901234567890123456789",
-            false,
-            "firmware.bin",
-            "abcdef",
-            1,
-            &run,
-            &profile,
-        );
-        assert_eq!(report.as_bytes(), report2.as_bytes());
-    }
-
-    #[cfg(feature = "event-horizon-profiler")]
-    #[test]
-    fn deferred_event_marker_is_recognised_across_uart_drains() {
-        let emu = EmulatorBuilder::new(Config::default())
-            .build()
-            .expect("serial emulator build");
-        let mut machine = MachineSession::new(emu, BoardHandles::default());
-        machine.arm_event_profile_after_uart("READY".to_string());
-        // The UART log is drained by the same method used by the run loop.
-        // Write the marker in two separate batches so no single drain sees
-        // the complete marker; the persistent accumulation must still match.
-        machine.emu.bus.write32(0x4000_f000, 1 << 22); // release UART0
-        machine.emu.bus.write32(UART0_BASE + 0x30, 0x101); // UARTEN | TXE
-        for byte in b"REA" {
-            machine.emu.bus.write8(UART0_BASE, *byte);
-        }
-        machine.drain_uart();
-        assert!(machine.event_profile_after_uart.is_some());
-        assert!(machine.event_profile_start_cycle.is_none());
-
-        for byte in b"DY" {
-            machine.emu.bus.write8(UART0_BASE, *byte);
-        }
-        let drain_cycle = machine.cycles();
-        machine.drain_uart();
-        assert!(machine.event_profile_after_uart.is_none());
-        assert_eq!(machine.event_profile_start_cycle, Some(drain_cycle));
-        assert!(machine.emu.running_event_profile_snapshot().is_some());
-    }
-
-    #[cfg(feature = "event-horizon-profiler")]
-    #[test]
-    fn deferred_event_marker_remains_unactivated_at_run_boundary() {
-        for stop_reason in [StopReason::ScenarioDone, StopReason::CycleLimit] {
-            let emu = EmulatorBuilder::new(Config::default())
-                .build()
-                .expect("serial emulator build");
-            let mut machine = MachineSession::new(emu, BoardHandles::default());
-            machine.arm_event_profile_after_uart("NEVER".to_string());
-            let _outcome = machine.finish(stop_reason, None, None);
-            assert!(machine.event_profile_after_uart.is_some());
-            assert!(machine.event_profile_start_cycle.is_none());
-            assert!(machine.emu.running_event_profile_snapshot().is_none());
-        }
     }
 }

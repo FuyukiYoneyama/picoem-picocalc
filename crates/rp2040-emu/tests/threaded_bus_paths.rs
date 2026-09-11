@@ -72,20 +72,20 @@ const RESET_UART0: u32 = 22;
 // APB peripheral bases (datasheet §2.2). All reset-gated; tests that
 // drive these MUST release the corresponding RESETS bit pre-run.
 const UART0_BASE: u32 = 0x4003_4000;
-const UART0_DR: u32 = UART0_BASE;
+const UART0_DR: u32 = UART0_BASE + 0x000;
 const UART0_IBRD: u32 = UART0_BASE + 0x024;
 
 const SPI0_BASE: u32 = 0x4003_C000;
-const SPI0_CR0: u32 = SPI0_BASE;
+const SPI0_CR0: u32 = SPI0_BASE + 0x000;
 
 const I2C0_BASE: u32 = 0x4004_4000;
-const I2C0_CON: u32 = I2C0_BASE;
+const I2C0_CON: u32 = I2C0_BASE + 0x000;
 
 const ADC_BASE: u32 = 0x4004_C000;
-const ADC_CS: u32 = ADC_BASE;
+const ADC_CS: u32 = ADC_BASE + 0x000;
 
 const PWM_BASE: u32 = 0x4005_0000;
-const PWM_CH0_CSR: u32 = PWM_BASE;
+const PWM_CH0_CSR: u32 = PWM_BASE + 0x000;
 
 const TIMER_BASE: u32 = 0x4005_4000;
 const TIMER_ALARM0: u32 = TIMER_BASE + 0x010;
@@ -267,7 +267,10 @@ fn threaded_adc_cs_loop() {
 #[test]
 fn threaded_pad_control_loop() {
     let mut emu = build_threaded();
-    release_resets(&mut emu, (1 << RESET_IO_BANK0) | (1 << RESET_PADS_BANK0));
+    release_resets(
+        &mut emu,
+        (1 << RESET_IO_BANK0) | (1 << RESET_PADS_BANK0),
+    );
     // Two pointers: R2 = IO_BANK0_GPIO0_CTRL, R3 = PADS_BANK0_GPIO0.
     //   LDR R2, [PC, #0x10]   -> 0x4A04
     //   LDR R3, [PC, #0x10]   -> 0x4B04

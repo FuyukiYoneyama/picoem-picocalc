@@ -27,8 +27,6 @@
 //! ```
 
 pub mod framebuffer;
-pub mod i2c_devices;
-pub mod i2c_external;
 pub mod keyboard;
 pub mod lcd_pio_wire;
 pub mod pins;
@@ -39,19 +37,9 @@ pub mod st7365p;
 pub mod wire;
 
 pub use framebuffer::{Framebuffer, PngError};
-pub use i2c_devices::{
-    AHT20_ADDRESS, AT24C32_ADDRESS, AT24C32_SIZE, Aht20, At24c32, BMP280_ADDRESS, Bmp280,
-    DS3231_ADDRESS, Ds3231, RtcDateTime,
-};
-pub use i2c_external::{
-    I2cBusMux, I2cBusMuxError, I2cBusObservation, I2cChildObservation, I2cExternalDeviceStub,
-};
 pub use keyboard::{KeyEvent, KeyState, Keyboard, KeyboardWire};
 pub use lcd_pio_wire::LcdPioWire;
 pub use sd_wire::SdCardWire;
-pub use sdcard::{
-    RawMetadata, SD_TRACE_SCHEMA_VERSION, SdCard, SdFormat, SdTraceData, SdTraceDirection,
-    SdTraceEvent, SdTraceSnapshot,
-};
+pub use sdcard::{SdCard, SdFormat};
 pub use st7365p::{Colmod, St7365p};
 pub use wire::St7365pWire;

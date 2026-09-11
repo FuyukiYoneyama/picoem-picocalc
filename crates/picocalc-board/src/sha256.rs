@@ -10,81 +10,6 @@
 //! `rp2040-emu` is not worth it. Validated against `sha256sum` in the
 //! unit tests below.
 
-use std::io::{self, Read};
-
-/// Incremental SHA-256 state for diagnostic streams whose complete input
-/// must not be retained in memory.  `finalize_hex` does not consume the
-/// state, so callers may take a snapshot more than once.
-#[derive(Clone)]
-pub struct StreamingSha256 {
-    h: [u32; 8],
-    block: [u8; 64],
-    buffered: usize,
-    total: u64,
-}
-
-impl StreamingSha256 {
-    pub fn new() -> Self {
-        Self {
-            h: H0,
-            block: [0; 64],
-            buffered: 0,
-            total: 0,
-        }
-    }
-
-    pub fn update(&mut self, mut input: &[u8]) {
-        self.total = self.total.wrapping_add(input.len() as u64);
-
-        if self.buffered != 0 {
-            let take = (64 - self.buffered).min(input.len());
-            self.block[self.buffered..self.buffered + take].copy_from_slice(&input[..take]);
-            self.buffered += take;
-            input = &input[take..];
-            if self.buffered == 64 {
-                compress(&mut self.h, &self.block);
-                self.buffered = 0;
-            }
-        }
-
-        while input.len() >= 64 {
-            compress(
-                &mut self.h,
-                input[..64].try_into().expect("64-byte SHA-256 block"),
-            );
-            input = &input[64..];
-        }
-        if !input.is_empty() {
-            self.block[..input.len()].copy_from_slice(input);
-            self.buffered = input.len();
-        }
-    }
-
-    pub fn finalize_hex(&self) -> String {
-        let mut state = self.clone();
-        state.block[state.buffered] = 0x80;
-        state.block[state.buffered + 1..].fill(0);
-        if state.buffered >= 56 {
-            compress(&mut state.h, &state.block);
-            state.block = [0; 64];
-        }
-        state.block[56..].copy_from_slice(&state.total.wrapping_mul(8).to_be_bytes());
-        compress(&mut state.h, &state.block);
-
-        let mut out = String::with_capacity(64);
-        for word in state.h {
-            out.push_str(&format!("{word:08x}"));
-        }
-        out
-    }
-}
-
-impl Default for StreamingSha256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -129,63 +54,6 @@ pub fn sha256_hex(data: &[u8]) -> String {
         out.push_str(&format!("{word:08x}"));
     }
     out
-}
-
-/// SHA-256 of a reader, consumed in bounded chunks.  This is used for
-/// RAW SD provenance so a 32 GB image is never materialised in memory.
-pub fn sha256_reader_hex<R: Read>(mut reader: R) -> io::Result<String> {
-    let mut h = H0;
-    let mut block = [0u8; 64];
-    let mut buffered = 0usize;
-    let mut total = 0u64;
-    let mut input = [0u8; 64 * 1024];
-
-    loop {
-        let read = reader.read(&mut input)?;
-        if read == 0 {
-            break;
-        }
-        total = total.wrapping_add(read as u64);
-        let mut cursor = 0usize;
-        if buffered != 0 {
-            let take = (64 - buffered).min(read);
-            block[buffered..buffered + take].copy_from_slice(&input[..take]);
-            buffered += take;
-            cursor += take;
-            if buffered == 64 {
-                compress(&mut h, &block);
-                buffered = 0;
-            }
-        }
-        while cursor + 64 <= read {
-            compress(
-                &mut h,
-                input[cursor..cursor + 64]
-                    .try_into()
-                    .expect("64-byte block"),
-            );
-            cursor += 64;
-        }
-        if cursor < read {
-            buffered = read - cursor;
-            block[..buffered].copy_from_slice(&input[cursor..read]);
-        }
-    }
-
-    block[buffered..].fill(0);
-    block[buffered] = 0x80;
-    if buffered >= 56 {
-        compress(&mut h, &block);
-        block = [0u8; 64];
-    }
-    block[56..64].copy_from_slice(&total.wrapping_mul(8).to_be_bytes());
-    compress(&mut h, &block);
-
-    let mut out = String::with_capacity(64);
-    for word in h {
-        out.push_str(&format!("{word:08x}"));
-    }
-    Ok(out)
 }
 
 fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
@@ -242,8 +110,7 @@ fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamingSha256, sha256_hex, sha256_reader_hex};
-    use std::io::Cursor;
+    use super::sha256_hex;
 
     #[test]
     fn known_vectors() {
@@ -270,25 +137,5 @@ mod tests {
             sha256_hex(&data),
             "4e4c294b331f7a2099a379bec34b9f9fc03dc46ab465d998f4d683da53487e6d"
         );
-    }
-
-    #[test]
-    fn reader_matches_slice() {
-        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
-        assert_eq!(
-            sha256_reader_hex(Cursor::new(&data)).unwrap(),
-            sha256_hex(&data)
-        );
-    }
-
-    #[test]
-    fn streaming_matches_slice_for_split_updates() {
-        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
-        let mut stream = StreamingSha256::new();
-        for chunk in data.chunks(37) {
-            stream.update(chunk);
-        }
-        assert_eq!(stream.finalize_hex(), sha256_hex(&data));
-        assert_eq!(stream.finalize_hex(), sha256_hex(&data));
     }
 }

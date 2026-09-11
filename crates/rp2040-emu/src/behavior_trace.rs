@@ -337,7 +337,7 @@ impl BehaviorTracer {
     }
 }
 
-pub(crate) fn pwm_boundary(previous: &[PwmObservation; 8], current: &[PwmObservation; 8]) -> bool {
+fn pwm_boundary(previous: &[PwmObservation; 8], current: &[PwmObservation; 8]) -> bool {
     previous.iter().zip(current).any(|(before, after)| {
         before.enabled != after.enabled
             || before.top != after.top

@@ -29,116 +29,12 @@ use crate::bus::{DECODE_CACHE_SIZE, DecodedOp, is_cacheable_pc};
 /// crossing `pub(crate)` visibility boundaries for a one-liner.
 const CACHE_INDEX_MASK: u32 = (DECODE_CACHE_SIZE as u32) - 1;
 
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_NARROW_DATA_PROCESSING: u8 = 8;
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_NARROW_SPECIAL_DATA: u8 = 9;
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_NARROW_LDR_LITERAL: u8 = 10;
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_NARROW_LOAD_STORE_REG: u8 = 11;
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_NARROW_MISC: u8 = 22;
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_NARROW_COND_BRANCH: u8 = 26;
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_NARROW_BRANCH: u8 = 28;
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_WIDE_BL: u8 = 32;
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_WIDE_MISC: u8 = 33;
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-const DISPATCH_KEY_WIDE_UNDEFINED: u8 = 34;
-
 /// Returns true iff the first halfword is the Thumb-32 prefix defined
 /// for ARMv6-M (`0b11110xxx xxxxxxxx`). M0+ supports exactly one wide
 /// prefix — unlike M33 which also accepts `0b11101` and `0b11111`.
 #[inline(always)]
 pub(crate) fn is_wide(hw0: u16) -> bool {
     (hw0 >> 11) == 0b11110
-}
-
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-#[inline(always)]
-fn compact_dispatch_key_narrow(opcode: u16) -> u8 {
-    match opcode >> 11 {
-        0b00000 => 0,
-        0b00001 => 1,
-        0b00010 => 2,
-        0b00011 => 3,
-        0b00100 => 4,
-        0b00101 => 5,
-        0b00110 => 6,
-        0b00111 => 7,
-        0b01000 if opcode & (1 << 10) == 0 => DISPATCH_KEY_NARROW_DATA_PROCESSING,
-        0b01000 => DISPATCH_KEY_NARROW_SPECIAL_DATA,
-        0b01001 => DISPATCH_KEY_NARROW_LDR_LITERAL,
-        0b01010 | 0b01011 => DISPATCH_KEY_NARROW_LOAD_STORE_REG,
-        0b01100 => 12,
-        0b01101 => 13,
-        0b01110 => 14,
-        0b01111 => 15,
-        0b10000 => 16,
-        0b10001 => 17,
-        0b10010 => 18,
-        0b10011 => 19,
-        0b10100 => 20,
-        0b10101 => 21,
-        0b10110 | 0b10111 => DISPATCH_KEY_NARROW_MISC,
-        0b11000 => 24,
-        0b11001 => 25,
-        0b11010 | 0b11011 => DISPATCH_KEY_NARROW_COND_BRANCH,
-        0b11100 => DISPATCH_KEY_NARROW_BRANCH,
-        _ => 31,
-    }
-}
-
-#[cfg(all(
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-#[inline(always)]
-fn compact_dispatch_key_wide(_hw0: u16, hw1: u16) -> u8 {
-    if (hw1 & 0xD000) == 0xD000 {
-        DISPATCH_KEY_WIDE_BL
-    } else if (hw1 & 0xD000) == 0x8000 {
-        DISPATCH_KEY_WIDE_MISC
-    } else {
-        DISPATCH_KEY_WIDE_UNDEFINED
-    }
 }
 
 /// Conservative purity classifier. Returns `true` only for
@@ -272,134 +168,33 @@ impl CortexM0Plus {
         // (HLD V7 §4.3) can report it for every access this instruction
         // performs. Set before the fetch so the I-fetch itself is tagged
         // with its own PC.
-        bus.set_active_pc_for_instruction(pc);
+        bus.set_active_pc(pc);
 
         // Cache lookup — `DecodedOp: Copy`, so no borrow on `bus`
-        // survives into dispatch. Every cache write is guarded by
-        // `is_cacheable_pc` in `populate_decode_cache`, and invalidation
-        // only clears entries; therefore the experimental OPT4-A path can
-        // omit the repeated region predicate and rely on the full tag
-        // comparison. A non-cacheable PC can share a slot with a cached
-        // entry, but it cannot share its full tag. The entry helper also
-        // excludes the representation-specific empty/fault sentinel: an
-        // invalid/faulting PC must not skip its bus access during delivery.
-        #[cfg(feature = "unconditional-cache-lookup-prototype")]
-        let entry = {
-            let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
-            let e = self.decode_cache[slot];
-            if e.matches_pc(pc, slot) {
-                Some(e)
-            } else {
-                None
-            }
-        };
-        #[cfg(not(feature = "unconditional-cache-lookup-prototype"))]
+        // survives into dispatch.
         let entry = if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
             let e = self.decode_cache[slot];
-            if e.matches_pc(pc, slot) {
-                Some(e)
-            } else {
-                None
-            }
+            if e.tag == pc { Some(e) } else { None }
         } else {
             None
         };
-        #[cfg(any(
-            feature = "event-horizon-profiler",
-            feature = "cpu-application-profiler"
-        ))]
-        let hit = entry.is_some();
 
         let entry = match entry {
             Some(e) => e,
             None => self.populate_decode_cache(bus, pc),
         };
-        #[cfg(feature = "event-horizon-profiler")]
-        {
-            let cacheable = is_cacheable_pc(pc);
-            let entry_width_bytes = if entry.is_wide() { 4 } else { 2 };
-            self.decode_profile
-                .record_decode_lookup(pc, entry_width_bytes, cacheable, hit);
-        }
-        #[cfg(feature = "cpu-application-profiler")]
-        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
-            profiler.record_decode_lookup(pc, is_cacheable_pc(pc), hit);
-        }
 
         let hw0 = entry.hw0;
         let hw1 = entry.hw1;
 
-        #[cfg(feature = "event-horizon-profiler")]
-        let expected_next_pc = pc.wrapping_add(if entry.is_wide() { 4 } else { 2 });
-        #[cfg(all(
-            feature = "compact-dispatch-key-prototype",
-            not(feature = "decoded-op-8byte-prototype")
-        ))]
-        let cycles = if entry.is_wide() {
-            self.regs.set_pc(pc.wrapping_add(4));
-            match entry.dispatch_key() {
-                DISPATCH_KEY_WIDE_BL => self.thumb32_bl(hw0, hw1),
-                DISPATCH_KEY_WIDE_MISC => self.thumb32_misc_control(hw0, hw1),
-                _ => self.thumb32_undefined(hw0, hw1),
-            }
-        } else {
-            self.regs.set_pc(pc.wrapping_add(2));
-            match entry.dispatch_key() {
-                0 => self.thumb16_lsl_imm(hw0),
-                1 => self.thumb16_lsr_imm(hw0),
-                2 => self.thumb16_asr_imm(hw0),
-                3 => self.thumb16_add_sub(hw0),
-                4 => self.thumb16_mov_imm(hw0),
-                5 => self.thumb16_cmp_imm(hw0),
-                6 => self.thumb16_add_imm8(hw0),
-                7 => self.thumb16_sub_imm8(hw0),
-                DISPATCH_KEY_NARROW_DATA_PROCESSING => self.thumb16_data_processing(hw0),
-                DISPATCH_KEY_NARROW_SPECIAL_DATA => self.thumb16_special_data_bx(hw0, bus),
-                DISPATCH_KEY_NARROW_LDR_LITERAL => self.thumb16_ldr_literal(hw0, bus),
-                DISPATCH_KEY_NARROW_LOAD_STORE_REG => self.thumb16_load_store_reg(hw0, bus),
-                12 => self.thumb16_str_imm(hw0, bus),
-                13 => self.thumb16_ldr_imm(hw0, bus),
-                14 => self.thumb16_strb_imm(hw0, bus),
-                15 => self.thumb16_ldrb_imm(hw0, bus),
-                16 => self.thumb16_strh_imm(hw0, bus),
-                17 => self.thumb16_ldrh_imm(hw0, bus),
-                18 => self.thumb16_str_sp(hw0, bus),
-                19 => self.thumb16_ldr_sp(hw0, bus),
-                20 => self.thumb16_adr(hw0),
-                21 => self.thumb16_add_sp_imm(hw0),
-                DISPATCH_KEY_NARROW_MISC => self.thumb16_misc(hw0, bus),
-                24 => self.thumb16_stm(hw0, bus),
-                25 => self.thumb16_ldm(hw0, bus),
-                DISPATCH_KEY_NARROW_COND_BRANCH => self.thumb16_cond_branch_svc(hw0),
-                DISPATCH_KEY_NARROW_BRANCH => self.thumb16_branch(hw0),
-                _ => self.thumb16_undefined(hw0),
-            }
-        };
-        #[cfg(not(all(
-            feature = "compact-dispatch-key-prototype",
-            not(feature = "decoded-op-8byte-prototype")
-        )))]
-        let cycles = if entry.is_wide() {
+        if entry.is_wide() {
             self.regs.set_pc(pc.wrapping_add(4));
             self.execute_thumb32(hw0, hw1, bus)
         } else {
             self.regs.set_pc(pc.wrapping_add(2));
             self.execute_thumb16(hw0, bus)
-        };
-
-        #[cfg(feature = "event-horizon-profiler")]
-        if self.regs.pc() != expected_next_pc {
-            self.decode_profile
-                .record_immutable_xip_hit_run_termination(
-                    crate::running_profile::ImmutableXipHitRunTerminationReason::PostExecuteNextPcRedirect,
-                );
         }
-        #[cfg(feature = "cpu-application-profiler")]
-        if let Some(profiler) = self.cpu_application_profiler.as_mut() {
-            profiler.record_retirement(pc, hw0, entry.is_wide());
-        }
-        cycles
     }
 
     /// Populate path — runs on a cache miss. Fetches `hw0` (and `hw1`
@@ -418,19 +213,12 @@ impl CortexM0Plus {
             // Fetch fault — return a non-cacheable sentinel entry so
             // the caller can dispatch and the post-step fault delivery
             // runs.
-            #[cfg(all(
-                feature = "compact-dispatch-key-prototype",
-                not(feature = "decoded-op-8byte-prototype")
-            ))]
-            {
-                return DecodedOp::fault_result(hw0, 0, false)
-                    .with_dispatch_key(false, compact_dispatch_key_narrow(hw0));
-            }
-            #[cfg(not(all(
-                feature = "compact-dispatch-key-prototype",
-                not(feature = "decoded-op-8byte-prototype")
-            )))]
-            return DecodedOp::fault_result(hw0, 0, false);
+            return DecodedOp {
+                tag: u32::MAX,
+                hw0,
+                hw1: 0,
+                flags: 0,
+            };
         }
 
         let wide = is_wide(hw0);
@@ -440,38 +228,25 @@ impl CortexM0Plus {
             0
         };
         if wide && bus.bus_fault() {
-            #[cfg(all(
-                feature = "compact-dispatch-key-prototype",
-                not(feature = "decoded-op-8byte-prototype")
-            ))]
-            {
-                return DecodedOp::fault_result(hw0, hw1, true)
-                    .with_dispatch_key(true, compact_dispatch_key_wide(hw0, hw1));
-            }
-            #[cfg(not(all(
-                feature = "compact-dispatch-key-prototype",
-                not(feature = "decoded-op-8byte-prototype")
-            )))]
-            return DecodedOp::fault_result(hw0, hw1, true);
+            return DecodedOp {
+                tag: u32::MAX,
+                hw0,
+                hw1,
+                flags: DecodedOp::FLAG_WIDE,
+            };
         }
 
-        #[cfg(all(
-            feature = "compact-dispatch-key-prototype",
-            not(feature = "decoded-op-8byte-prototype")
-        ))]
-        let entry = DecodedOp::from_parts(pc, hw0, hw1, wide).with_dispatch_key(
-            wide,
-            if wide {
-                compact_dispatch_key_wide(hw0, hw1)
-            } else {
-                compact_dispatch_key_narrow(hw0)
-            },
-        );
-        #[cfg(not(all(
-            feature = "compact-dispatch-key-prototype",
-            not(feature = "decoded-op-8byte-prototype")
-        )))]
-        let entry = DecodedOp::from_parts(pc, hw0, hw1, wide);
+        let mut flags = 0u8;
+        if wide {
+            flags |= DecodedOp::FLAG_WIDE;
+        }
+
+        let entry = DecodedOp {
+            tag: pc,
+            hw0,
+            hw1,
+            flags,
+        };
 
         if is_cacheable_pc(pc) {
             let slot = ((pc >> 1) & CACHE_INDEX_MASK) as usize;
@@ -924,287 +699,4 @@ mod classifier_tests {
     /// FNV-1a 64-bit hash of `classify_thumb16_misc_pure` over the
     /// 16 misc sub-ops (canonical prefix 1011_0).
     const MISC_PURE_FINGERPRINT: u64 = 0x08fb8e07b596aaac;
-}
-
-#[cfg(all(
-    test,
-    feature = "compact-dispatch-key-prototype",
-    not(feature = "decoded-op-8byte-prototype")
-))]
-mod compact_dispatch_key_tests {
-    use std::mem::size_of;
-
-    use crate::bus::DecodedOp;
-
-    use super::{
-        DISPATCH_KEY_NARROW_COND_BRANCH, DISPATCH_KEY_NARROW_DATA_PROCESSING,
-        DISPATCH_KEY_NARROW_LDR_LITERAL, DISPATCH_KEY_NARROW_LOAD_STORE_REG,
-        DISPATCH_KEY_NARROW_MISC, DISPATCH_KEY_NARROW_SPECIAL_DATA, DISPATCH_KEY_WIDE_BL,
-        DISPATCH_KEY_WIDE_MISC, DISPATCH_KEY_WIDE_UNDEFINED, compact_dispatch_key_narrow,
-        compact_dispatch_key_wide,
-    };
-
-    #[test]
-    fn uses_default_entry_size_and_preserves_flag_boundaries() {
-        assert_eq!(size_of::<DecodedOp>(), 12);
-
-        let narrow = DecodedOp::from_parts(0x2000_0000, 0x4710, 0, false)
-            .with_dispatch_key(false, DISPATCH_KEY_NARROW_SPECIAL_DATA);
-        assert!(!narrow.is_wide());
-        assert_eq!(narrow.dispatch_key(), DISPATCH_KEY_NARROW_SPECIAL_DATA);
-
-        let wide = DecodedOp::from_parts(0x2000_0000, 0xF000, 0xF800, true)
-            .with_dispatch_key(true, DISPATCH_KEY_WIDE_BL);
-        assert!(wide.is_wide());
-        assert_eq!(wide.dispatch_key(), DISPATCH_KEY_WIDE_BL);
-
-        let empty = DecodedOp::empty();
-        assert!(empty.is_empty());
-        assert_eq!(empty.dispatch_key(), 0);
-        let fault = DecodedOp::fault_result(0xF000, 0xF800, true)
-            .with_dispatch_key(true, DISPATCH_KEY_WIDE_UNDEFINED);
-        assert!(fault.is_empty());
-        assert!(fault.is_wide());
-        assert_eq!(fault.dispatch_key(), DISPATCH_KEY_WIDE_UNDEFINED);
-    }
-
-    #[test]
-    fn narrow_key_keeps_group_boundaries_and_special_subgroups() {
-        let groups = [
-            0b00000, 0b00001, 0b00010, 0b00011, 0b00100, 0b00101, 0b00110, 0b00111, 0b01001,
-            0b01010, 0b01011, 0b01100, 0b01101, 0b01110, 0b01111, 0b10000, 0b10001, 0b10010,
-            0b10011, 0b10100, 0b10101, 0b10110, 0b10111, 0b11000, 0b11001, 0b11010, 0b11011,
-            0b11100,
-        ];
-        for group in groups {
-            let key = compact_dispatch_key_narrow((group as u16) << 11);
-            assert!(key <= 31, "group {group:05b} produced {key}");
-        }
-
-        let data = 0b01000u16 << 11;
-        let special = data | 1 << 10;
-        assert_eq!(
-            compact_dispatch_key_narrow(data),
-            DISPATCH_KEY_NARROW_DATA_PROCESSING
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(special),
-            DISPATCH_KEY_NARROW_SPECIAL_DATA
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b01010 << 11),
-            DISPATCH_KEY_NARROW_LOAD_STORE_REG
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b01001 << 11),
-            DISPATCH_KEY_NARROW_LDR_LITERAL
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b10110 << 11),
-            DISPATCH_KEY_NARROW_MISC
-        );
-        assert_eq!(
-            compact_dispatch_key_narrow(0b11010 << 11),
-            DISPATCH_KEY_NARROW_COND_BRANCH
-        );
-        assert_eq!(compact_dispatch_key_narrow(0b11101 << 11), 31);
-    }
-
-    #[test]
-    fn wide_key_has_explicit_bl_misc_and_undefined_boundaries() {
-        assert_eq!(
-            compact_dispatch_key_wide(0xF000, 0xF800),
-            DISPATCH_KEY_WIDE_BL
-        );
-        assert_eq!(
-            compact_dispatch_key_wide(0xF3BF, 0x8F50),
-            DISPATCH_KEY_WIDE_MISC
-        );
-        assert_eq!(
-            compact_dispatch_key_wide(0xF000, 0xE000),
-            DISPATCH_KEY_WIDE_UNDEFINED
-        );
-    }
-}
-
-#[cfg(all(test, feature = "event-horizon-profiler"))]
-mod decode_profile_tests {
-    use super::*;
-    use crate::bus::Bus;
-
-    fn run_decode_at(core: &mut CortexM0Plus, bus: &mut Bus, pc: u32) {
-        core.regs.set_pc(pc);
-        core.decode_execute(bus);
-    }
-
-    #[test]
-    fn decode_profile_records_first_miss_then_hit() {
-        let mut core = CortexM0Plus::new();
-        let mut bus = Bus::default();
-        const PC: u32 = 0x2000_0000;
-
-        bus.write16(PC, 0xBF00); // NOP
-        run_decode_at(&mut core, &mut bus, PC);
-        run_decode_at(&mut core, &mut bus, PC);
-
-        let profile = core.decode_profile_snapshot();
-        assert_eq!(profile.cacheable_hits, 1);
-        assert_eq!(profile.cacheable_misses, 1);
-        assert_eq!(profile.noncacheable_fetches, 0);
-        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[0], 1);
-        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[0], 1);
-    }
-
-    #[test]
-    fn decode_profile_sequential_cache_hit_runs_are_cumulative() {
-        let mut core = CortexM0Plus::new();
-        let mut bus = Bus::default();
-        const PC0: u32 = 0x2000_0000;
-
-        bus.write16(PC0, 0xBF00);
-        bus.write16(PC0 + 2, 0xBF00);
-        bus.write16(PC0 + 4, 0xBF00);
-
-        // Prime cache: first pass misses.
-        run_decode_at(&mut core, &mut bus, PC0);
-        run_decode_at(&mut core, &mut bus, PC0 + 2);
-        run_decode_at(&mut core, &mut bus, PC0 + 4);
-        // Second pass: a three-instruction sequential hit run.
-        run_decode_at(&mut core, &mut bus, PC0);
-        run_decode_at(&mut core, &mut bus, PC0 + 2);
-        run_decode_at(&mut core, &mut bus, PC0 + 4);
-
-        let profile = core.decode_profile_snapshot();
-        assert_eq!(profile.cacheable_hits, 3);
-        assert_eq!(profile.cacheable_misses, 3);
-        assert_eq!(profile.noncacheable_fetches, 0);
-        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[0], 1);
-        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[1], 1);
-        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[0], 3);
-        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[1], 3);
-    }
-
-    #[test]
-    fn decode_profile_closes_hit_run_on_nonsequential_pc() {
-        let mut core = CortexM0Plus::new();
-        let mut bus = Bus::default();
-        const PC0: u32 = 0x2000_0010;
-        const PC1: u32 = PC0 + 2;
-        const PC2: u32 = PC0 + 8;
-
-        bus.write16(PC0, 0xBF00);
-        bus.write16(PC1, 0xBF00);
-        bus.write16(PC2, 0xBF00);
-
-        // Prime cache.
-        run_decode_at(&mut core, &mut bus, PC0);
-        run_decode_at(&mut core, &mut bus, PC1);
-        run_decode_at(&mut core, &mut bus, PC2);
-        // Hit run of length 2 then non-sequential hit of length 1.
-        run_decode_at(&mut core, &mut bus, PC0);
-        run_decode_at(&mut core, &mut bus, PC1);
-        run_decode_at(&mut core, &mut bus, PC2);
-
-        let profile = core.decode_profile_snapshot();
-        assert_eq!(profile.cacheable_hits, 3);
-        assert_eq!(profile.cacheable_misses, 3);
-        assert_eq!(profile.noncacheable_fetches, 0);
-        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[0], 2);
-        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[1], 1);
-        assert_eq!(profile.sequential_cache_hit_runs.episodes_ge[2], 0);
-        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[0], 3);
-        assert_eq!(profile.sequential_cache_hit_runs.cycle_mass_ge[1], 2);
-    }
-
-    #[test]
-    fn immutable_xip_hit_run_closes_on_post_execute_branch() {
-        let mut core = CortexM0Plus::new();
-        let mut bus = Bus::default();
-        const PC: u32 = 0x1000_0000;
-
-        // `B +0` targets PC+4, rather than the sequential PC+2.
-        bus.load_flash(&0xE000u16.to_le_bytes());
-        core.populate_decode_cache(&mut bus, PC);
-        core.regs.set_pc(PC);
-        core.decode_execute(&mut bus);
-
-        let profile = core.decode_profile_snapshot();
-        assert_eq!(profile.cacheable_hits, 1);
-        assert_eq!(profile.immutable_xip_hit_runs.episodes_ge[0], 1);
-        assert_eq!(
-            profile
-                .immutable_xip_hit_run_termination_counters
-                .post_execute_next_pc_redirect,
-            1
-        );
-    }
-
-    #[test]
-    fn immutable_xip_hit_run_closes_before_pending_exception_fetch() {
-        let mut core = CortexM0Plus::new();
-        let mut bus = Bus::default();
-
-        core.decode_profile
-            .record_decode_lookup(0x1000_0000, 2, true, true);
-        core.regs.msp = 0x2000_8000;
-        core.regs.set_sp(0x2000_8000);
-        bus.ppb[0].vtor = 0x2000_0000;
-        bus.write32(0x2000_0000 + 14 * 4, 0x2000_1001);
-        bus.ppb[0].icsr |= 1 << 28;
-
-        assert!(core.step(&mut bus) > 0);
-
-        let profile = core.decode_profile_snapshot();
-        assert_eq!(
-            profile
-                .immutable_xip_hit_run_termination_counters
-                .prefetch_exception,
-            1
-        );
-    }
-
-    #[test]
-    fn immutable_xip_hit_run_closes_once_on_instruction_fault() {
-        let mut core = CortexM0Plus::new();
-        let mut bus = Bus::default();
-        const PC: u32 = 0x1000_0000;
-
-        // BKPT raises the synchronous HardFault used by the RP2040 model.
-        bus.load_flash(&0xBE00u16.to_le_bytes());
-        core.populate_decode_cache(&mut bus, PC);
-        core.regs.msp = 0x2000_8000;
-        core.regs.set_sp(0x2000_8000);
-        bus.ppb[0].vtor = 0x2000_0000;
-        bus.write32(0x2000_0000 + 3 * 4, 0x2000_1001);
-        core.regs.set_pc(PC);
-
-        assert!(core.step(&mut bus) > 0);
-
-        let profile = core.decode_profile_snapshot();
-        assert_eq!(profile.immutable_xip_hit_run_termination_counters.fault, 1);
-        assert_eq!(profile.immutable_xip_hit_runs.episodes_ge[0], 1);
-    }
-
-    #[test]
-    fn decode_profile_observes_entry_region_and_all_invalidations() {
-        let mut core = CortexM0Plus::new();
-        core.invalidate_decode_cache_entries(&[0x0000_1000, 0x1000_0000, 0x1500_0000, 0x2000_0000]);
-        core.invalidate_decode_cache_regions(
-            crate::bus::invalidation_regions::ROM
-                | crate::bus::invalidation_regions::XIP
-                | crate::bus::invalidation_regions::SRAM,
-        );
-        core.invalidate_decode_cache_regions(crate::bus::invalidation_regions::BULK);
-        core.invalidate_decode_cache_all();
-
-        let observed = core
-            .decode_profile_snapshot()
-            .decode_cache_invalidation_observations;
-        assert_eq!(observed.entry_address_count, 4);
-        assert_eq!(observed.rom, 2);
-        assert_eq!(observed.xip, 3);
-        assert_eq!(observed.sram, 2);
-        assert_eq!(observed.bulk, 1);
-        assert_eq!(observed.all, 1);
-    }
 }

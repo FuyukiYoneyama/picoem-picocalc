@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Cycle-accurate emulator for the Raspberry Pi RP2040 (dual Cortex-M0+ + PIO)."
-repository = "https://github.com/FuyukiYoneyama/picoem-picocalc"
-homepage = "https://github.com/FuyukiYoneyama/picoem-picocalc"
+repository = "https://github.com/0x4D44/picoem"
+homepage = "https://github.com/0x4D44/picoem"
 documentation = "https://docs.rs/rp2040-emu"
 readme = "README.md"
 keywords = ["emulator", "rp2040", "cortex-m0", "embedded", "pico"]
@@ -24,7 +24,7 @@ workspace = true
 # working cross-platform out of the box. Windows / Linux users who
 # want the threaded runtime should opt in: `cargo add rp2040-emu
 # --features threading`.
-default = ["decode-invalidation-tag-guard"]
+default = []
 # Forward the PIO `test-hooks` feature to `picoem-common`. Enables
 # cross-crate unit tests to pop TX FIFO words via `PioBlock::pop_tx`
 # and push RX FIFO words via `PioBlock::push_rx`.
@@ -41,49 +41,16 @@ testing = []
 # OPT0-A execution profiler. Kept out of default builds so the
 # performance/reference path does not pay even a disabled runtime branch.
 idle-profiler = []
-# Diagnostic-only OPT2-B profiler.  It reuses the OPT0-A conservative
-# horizon and OPT0-B observable-state snapshots, but normal execution does
-# not compile any of its counters or MMIO classification hooks.
-event-horizon-profiler = ["idle-profiler", "behavior-trace"]
 # OPT0-B deterministic streaming event contract. Kept out of default
 # builds so the performance path contains neither a disabled branch nor a
 # hash state. The optional dependency exists only in diagnostic binaries.
-behavior-trace = []
-# OPT4-A experimental decode-cache lookup. The cache only accepts entries
-# from cacheable executable regions, so production lookup can compare the
-# full tag without repeating that region predicate. Kept opt-in until the
-# current promoted baseline has a fresh exactness/performance record.
-unconditional-cache-lookup-prototype = []
-# OPT4-B experimental NVIC pending bitmap scan.  Kept opt-in until the
-# promoted baseline has an exactness and performance record for the set-bit
-# traversal; the default priority scan remains unchanged.
-nvic-bitmap-scan-prototype = []
-# OPT4-C experimental 8-byte decoded-op representation. The packed tag
-# retains the full PC when combined with the direct-mapped slot; default
-# layout remains the reference path until exactness/performance evidence is
-# accepted.
-decoded-op-8byte-prototype = []
-# OPT4-D experimental compile-out of the ordinary instruction-boundary
-# active-PC diagnostic store. Explicit diagnostic/exception paths retain
-# `set_active_pc`; this feature is for trace/proof-off performance screening.
-diagnostic-pc-compile-out-prototype = []
-# OPT4-E experimental compact dispatch key in the default decoded-op flags.
-# This cannot be combined with the OPT4-C packed 8-byte layout.
-compact-dispatch-key-prototype = []
-# P0-B application profiler. Diagnostic-only counters are compiled into the
-# CPU core only when explicitly requested; normal builds have no hooks.
-cpu-application-profiler = []
-# P1-A full-tag guard for per-address decode-cache invalidation. It is part
-# of the normal build after the positive application-level A/B result. Use
-# `--no-default-features` when the historical index-only reference path is
-# needed for comparison; the feature remains explicit for feature-matrix
-# builds.
-decode-invalidation-tag-guard = []
+behavior-trace = ["dep:sha2"]
+
 [dependencies]
 picoem-common = { version = "0.2", path = "../picoem-common" }
 picoem-devices = { version = "0.1", path = "../picoem-devices" }
 tracing = { workspace = true }
-sha2 = "0.10"
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 picoem-common = { path = "../picoem-common", features = ["test-hooks"] }

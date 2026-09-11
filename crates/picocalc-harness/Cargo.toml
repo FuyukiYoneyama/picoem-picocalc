@@ -11,42 +11,13 @@ publish = false
 build = "build.rs"
 
 [features]
-# The production runner includes the SD-GEN-1 multi-block model.  Use
-# `--no-default-features` only for the legacy single-block differential
-# boundary; normal builds must exercise the promoted runtime.
-# P1-A is promoted in the normal runner; keep the feature explicit so
-# provenance reports the adopted CPU path and reference builds can disable it.
-default = ["sd-gen1-multiblock", "decode-invalidation-tag-guard"]
+default = []
 # Diagnostic-only OPT0-A build. The normal conformance runner remains
 # byte-for-byte schema compatible and carries no profiler hot-path branch.
 idle-profiler = ["rp2040-emu/idle-profiler"]
-# Diagnostic-only OPT2-B running event-horizon opportunity profiler.
-# This deliberately includes the existing behavior observation machinery;
-# its output is not valid for wall-time measurement.
-event-horizon-profiler = ["idle-profiler", "behavior-trace", "rp2040-emu/event-horizon-profiler"]
 # Diagnostic-only OPT0-B correctness build. Normal conformance and
 # performance runners do not compile the streaming hash path.
 behavior-trace = ["rp2040-emu/behavior-trace"]
-# OPT4-A experimental decode-cache lookup. Not part of the default runner.
-unconditional-cache-lookup-prototype = ["rp2040-emu/unconditional-cache-lookup-prototype"]
-# OPT4-B experimental NVIC pending bitmap scan. Not part of the default
-# conformance runner until its exactness/performance evidence is recorded.
-nvic-bitmap-scan-prototype = ["rp2040-emu/nvic-bitmap-scan-prototype"]
-# OPT4-C experimental packed 8-byte decode-cache entries.
-decoded-op-8byte-prototype = ["rp2040-emu/decoded-op-8byte-prototype"]
-# OPT4-D experimental compile-out of ordinary instruction PC attribution.
-diagnostic-pc-compile-out-prototype = ["rp2040-emu/diagnostic-pc-compile-out-prototype"]
-# OPT4-E experimental compact dispatch key in the default decoded-op flags.
-compact-dispatch-key-prototype = ["rp2040-emu/compact-dispatch-key-prototype"]
-# P0-B diagnostic CPU application profiler. Not part of wall-time runners.
-cpu-application-profiler = ["rp2040-emu/cpu-application-profiler"]
-# P1-A promoted full-tag guard for decode-cache invalidation. It is enabled
-# by the normal runner default and remains opt-in when defaults are disabled.
-decode-invalidation-tag-guard = ["rp2040-emu/decode-invalidation-tag-guard"]
-# P3/P4 SD-GEN-1 multi-block model and protocol-error propagation. Existing
-# versioned target records remain immutable; a new runtime commit/record is
-# required when a target is revalidated.
-sd-gen1-multiblock = ["picocalc-board/sd-gen1-multiblock"]
 
 [lints]
 workspace = true
@@ -56,20 +27,13 @@ workspace = true
 # Serial as the correctness reference (see picocalc_emu
 # docs/IMPLEMENTATION_PLAN.md §3.1). No `threading` feature.
 rp2040-emu = { path = "../rp2040-emu" }
-# The realtime preview reuses the workspace pacer; it does not own an
-# emulator clock or add pacing semantics to the authoritative runner.
-picoem-common = { path = "../picoem-common" }
 # Board models (ST7365P display, pin map, framebuffer/PNG, shared sha256).
-picocalc-board = { path = "../picocalc-board", default-features = false }
+picocalc-board = { path = "../picocalc-board" }
 # Scenario files are JSON *input*. Reports stay hand-written so field
 # order — and therefore the report bytes — is fixed by this crate rather
 # than by a serialiser's map ordering. Parsed through `Value` rather than
 # `derive`, so every error can name the JSON path that is wrong.
 serde_json = { version = "1", default-features = false, features = ["std"] }
-# Linux/WSL diagnostic sidecar: process CPU time around the in-process
-# emulation loop. This is optional at the CLI boundary and never enters the
-# deterministic schema-8 report.
-libc = "0.2"
 
 [[bin]]
 name = "picocalc-run"

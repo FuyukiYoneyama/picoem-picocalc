@@ -54,27 +54,27 @@ const SIO_GPIO_OE_SET: u32 = SIO_BASE + 0x038;
 // dispatches them into typed peripheral storage rather than short-
 // circuiting via the held-in-reset guard.
 const UART0_BASE: u32 = 0x4007_0000;
-const UART0_DR: u32 = UART0_BASE; // UARTDR — TX FIFO push
+const UART0_DR: u32 = UART0_BASE + 0x000; // UARTDR — TX FIFO push
 const UART0_IBRD: u32 = UART0_BASE + 0x024; // baud divisor (integer)
 
 const SPI0_BASE: u32 = 0x4008_0000;
-const SPI0_CR0: u32 = SPI0_BASE; // SSPCR0
+const SPI0_CR0: u32 = SPI0_BASE + 0x000; // SSPCR0
 
 const I2C0_BASE: u32 = 0x4009_0000;
-const I2C0_CON: u32 = I2C0_BASE; // IC_CON
+const I2C0_CON: u32 = I2C0_BASE + 0x000; // IC_CON
 
 const PWM_BASE: u32 = 0x400A_8000;
-const PWM_CH0_CSR: u32 = PWM_BASE;
+const PWM_CH0_CSR: u32 = PWM_BASE + 0x000;
 
 const TIMER0_BASE: u32 = 0x400B_0000;
 const TIMER0_ALARM0: u32 = TIMER0_BASE + 0x010;
 const TIMER0_INTE: u32 = TIMER0_BASE + 0x040;
 
 const ADC_BASE: u32 = 0x400A_0000;
-const ADC_CS: u32 = ADC_BASE;
+const ADC_CS: u32 = ADC_BASE + 0x000;
 
 const DMA_BASE: u32 = 0x5000_0000;
-const DMA_CH0_READ_ADDR: u32 = DMA_BASE;
+const DMA_CH0_READ_ADDR: u32 = DMA_BASE + 0x000;
 const DMA_CH0_WRITE_ADDR: u32 = DMA_BASE + 0x004;
 const DMA_CH0_TRANS_COUNT: u32 = DMA_BASE + 0x008;
 const DMA_CH0_CTRL_TRIG: u32 = DMA_BASE + 0x00C;
@@ -301,12 +301,7 @@ fn threaded_dma_channel_program() {
     emu.core_mut(1).halt();
     // Suppress unused constant warnings for the blob parameters that the
     // simpler version doesn't reference.
-    let _ = (
-        DMA_DST,
-        DMA_CH0_WRITE_ADDR,
-        DMA_CH0_TRANS_COUNT,
-        DMA_CH0_CTRL_TRIG,
-    );
+    let _ = (DMA_DST, DMA_CH0_WRITE_ADDR, DMA_CH0_TRANS_COUNT, DMA_CH0_CTRL_TRIG);
 
     let (c0, _c1) = run_n_quanta(&mut emu, QUANTA_PER_TEST);
     assert!(c0 > 0, "DMA program loop must advance core 0");
