@@ -1,0 +1,71 @@
+{
+  "sdk_commit": "a1438dff1d38bd9c65dbd693f0e5db4b9ae91779",
+  "sdk_input_sha256": {
+    "src/rp2_common/pico_divider/divider_hardware.S": "a358fbb27fa953a7ff6da8d953651b2e046eec9a830da52a2d09f2044a25e9e0",
+    "src/rp2_common/hardware_divider/include/hardware/divider_helper.S": "297d41ce0f7cae3812bcd87ad24d179aafb2c48e2dcfca77c684e065972037ed",
+    "src/rp2040/pico_platform/include/pico/asm_helper.S": "9697f96b7f0eaa16c15a249d853733ed2fc2a197288a3a6699c01765acd8b453",
+    "src/rp2040/hardware_regs/include/hardware/platform_defs.h": "acfa7710e0e92b5046bd50c0d4714230bfae5fa8f4e727b369ceb9f648b7a475",
+    "src/rp2040/hardware_regs/include/hardware/regs/addressmap.h": "12c15a5e0f82e4091c5c89d4779a07ae2ab5a78b12eba4e1c2af175722d9f042",
+    "src/rp2040/hardware_regs/include/hardware/regs/sio.h": "362bab775397e8c886a33adc010f76bec24701bf753d17dab1d95accc5a259e5"
+  },
+  "local_input_sha256": {
+    "harness.S": "ca97fb4c5e8fabc94cdc6922a67befca53fd8cca650a49125c93cce9a4548e03",
+    "pico.h": "777fa6a77b884de29cf1b5a896cdce417a0728fb15be7f9a9c6a84e87dc84e54",
+    "link.ld": "a215177ac66baf1ab136862235d871da6ad92c3b2597c7f00c56a0d77f94d776",
+    "build.py": "76d141ea29cae820548ac66d09f201d24cffb14672e2f833041eb25a7f270940"
+  },
+  "compiler": "arm-none-eabi-gcc (15:13.2.rel1-2) 13.2.1 20231009",
+  "load_address": "0x20000000",
+  "fixture_sha256": "241613056b71658b264adffaa87764aace17b628b0cf04aa61fe336de51bcbac",
+  "elf_sha256": "526dbbacef9c874d163c8389bb51e0df4a59972f3d67d272264b715f82700403",
+  "commands": [
+    [
+      "arm-none-eabi-gcc",
+      "-mcpu=cortex-m0plus",
+      "-mthumb",
+      "-c",
+      "-x",
+      "assembler-with-cpp",
+      "-I",
+      "<fixture>",
+      "-I",
+      "<sdk>/src/rp2040/pico_platform/include",
+      "-I",
+      "<sdk>/src/rp2040/hardware_regs/include",
+      "-I",
+      "<sdk>/src/rp2_common/hardware_divider/include",
+      "<sdk>/src/rp2_common/pico_divider/divider_hardware.S",
+      "-o",
+      "<temporary>/divider.o"
+    ],
+    [
+      "arm-none-eabi-gcc",
+      "-mcpu=cortex-m0plus",
+      "-mthumb",
+      "-c",
+      "<fixture>/harness.S",
+      "-o",
+      "<temporary>/harness.o"
+    ],
+    [
+      "arm-none-eabi-gcc",
+      "-mcpu=cortex-m0plus",
+      "-mthumb",
+      "-nostdlib",
+      "-Wl,--build-id=none",
+      "-T",
+      "<fixture>/link.ld",
+      "<temporary>/harness.o",
+      "<temporary>/divider.o",
+      "-o",
+      "<temporary>/fixture.elf"
+    ],
+    [
+      "arm-none-eabi-objcopy",
+      "-O",
+      "binary",
+      "<temporary>/fixture.elf",
+      "<fixture>/fixture.bin"
+    ]
+  ]
+}

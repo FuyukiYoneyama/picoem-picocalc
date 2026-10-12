@@ -18,6 +18,7 @@
 //! accesses (the supported path in the datasheet) is unaffected.
 
 pub mod clocks;
+pub(crate) mod divider;
 pub mod io_bank0;
 pub mod pads_bank0;
 pub mod peripheral_dispatch;
@@ -1840,6 +1841,9 @@ impl Bus {
             0x004 => self.gpio_in,
             _ => {
                 let core = self.active_core;
+                if (0x060..=0x078).contains(&offset) {
+                    self.sio.sync_divider_cycle(core, self.master_cycle);
+                }
                 self.sio.read32(offset, core)
             }
         }
@@ -1848,6 +1852,9 @@ impl Bus {
     fn sio_write32(&mut self, addr: u32, val: u32) {
         let offset = addr & 0xFFF;
         let core = self.active_core;
+        if (0x060..=0x078).contains(&offset) {
+            self.sio.sync_divider_cycle(core, self.master_cycle);
+        }
         self.sio.write32(offset, val, core);
         if let Some(receiver) = self.sio.pending_fifo_event.take() {
             self.event_flag[receiver] = true;
@@ -2274,6 +2281,12 @@ impl Default for Bus {
 use crate::core::CoreBus;
 
 impl CoreBus for Bus {
+    #[inline(always)]
+    fn advance_core_cycles(&mut self, cycles: u32) {
+        self.sio
+            .advance_divider_cycles(self.active_core, cycles as u64);
+    }
+
     #[inline(always)]
     fn read8(&mut self, addr: u32) -> u8 {
         Bus::read8(self, addr)

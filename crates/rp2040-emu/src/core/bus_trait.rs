@@ -37,6 +37,10 @@ use crate::bus::ppb::Ppb;
 use crate::core::Nvic;
 
 pub trait CoreBus {
+    /// Advance peripherals local to the executing core after an instruction
+    /// or exception entry. A default preserves compatibility for custom buses.
+    fn advance_core_cycles(&mut self, _cycles: u32) {}
+
     // --- Memory access ------------------------------------------------
     //
     // Address-only (no `core` argument) — matches the existing RP2040

@@ -1,0 +1,16 @@
+   Compiling rp2040-emu v0.1.5 (/home/fuyuki/pico_dvl/codex/picoem-picocalc/crates/rp2040-emu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.37s
+     Running tests/sio_divider.rs (/tmp/sio-divider-fix-20261012/target/debug/deps/sio_divider-22069d58b6e0aeb0)
+
+running 8 tests
+test direct_sio_operand_orders_status_and_context ... ok
+test serial_exception_cycles_advance_divider ... ok
+test parked_serial_core_finishes_on_system_clock ... ok
+test serial_bus_operand_orders_status_and_context ... ok
+test threaded::worker_exception_cycles_advance_divider ... ok
+test threaded::worker_cpu_clock_and_parked_clock_do_not_double_count ... ok
+test serial_cpu_cycles_advance_divider ... ok
+test threaded::worker_bus_operand_orders_status_and_context ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

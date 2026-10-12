@@ -1,0 +1,1753 @@
+diff --git a/crates/rp2040-emu/src/bus/mod.rs b/crates/rp2040-emu/src/bus/mod.rs
+index 156890c..6e83808 100644
+--- a/crates/rp2040-emu/src/bus/mod.rs
++++ b/crates/rp2040-emu/src/bus/mod.rs
+@@ -18,6 +18,7 @@
+ //! accesses (the supported path in the datasheet) is unaffected.
+ 
+ pub mod clocks;
++pub(crate) mod divider;
+ pub mod io_bank0;
+ pub mod pads_bank0;
+ pub mod peripheral_dispatch;
+@@ -1840,6 +1841,9 @@ impl Bus {
+             0x004 => self.gpio_in,
+             _ => {
+                 let core = self.active_core;
++                if (0x060..=0x078).contains(&offset) {
++                    self.sio.sync_divider_cycle(core, self.master_cycle);
++                }
+                 self.sio.read32(offset, core)
+             }
+         }
+@@ -1848,6 +1852,9 @@ impl Bus {
+     fn sio_write32(&mut self, addr: u32, val: u32) {
+         let offset = addr & 0xFFF;
+         let core = self.active_core;
++        if (0x060..=0x078).contains(&offset) {
++            self.sio.sync_divider_cycle(core, self.master_cycle);
++        }
+         self.sio.write32(offset, val, core);
+         if let Some(receiver) = self.sio.pending_fifo_event.take() {
+             self.event_flag[receiver] = true;
+@@ -2274,6 +2281,12 @@ impl Default for Bus {
+ use crate::core::CoreBus;
+ 
+ impl CoreBus for Bus {
++    #[inline(always)]
++    fn advance_core_cycles(&mut self, cycles: u32) {
++        self.sio
++            .advance_divider_cycles(self.active_core, cycles as u64);
++    }
++
+     #[inline(always)]
+     fn read8(&mut self, addr: u32) -> u8 {
+         Bus::read8(self, addr)
+diff --git a/crates/rp2040-emu/src/bus/sio.rs b/crates/rp2040-emu/src/bus/sio.rs
+index 16b4d9b..1a5d8e3 100644
+--- a/crates/rp2040-emu/src/bus/sio.rs
++++ b/crates/rp2040-emu/src/bus/sio.rs
+@@ -22,7 +22,9 @@
+ 
+ use tracing::trace;
+ 
+-use picoem_common::{Divider, Fifo};
++use picoem_common::Fifo;
++
++use super::divider::Divider;
+ 
+ /// RP2040 GPIO pin mask — 30 valid GPIOs (bits [29:0]).
+ pub(crate) const PIN_MASK: u32 = 0x3FFF_FFFF;
+@@ -220,14 +222,7 @@ impl Sio {
+             0x050 => self.fifo_st_read(core),
+             0x058 => self.fifo_rd(core),
+             // Integer divider (0x060-0x078).
+-            0x060 | 0x068 => self.divider[core].dividend,
+-            0x064 | 0x06C => self.divider[core].divisor,
+-            0x070 | 0x074 => self.divider_result_read(offset, core),
+-            0x078 => {
+-                let ready = 1u32;
+-                let dirty = if self.divider[core].dirty { 2 } else { 0 };
+-                ready | dirty
+-            }
++            0x060..=0x078 => self.divider[core].read32(offset),
+             // Interpolators (0x080-0x0FC). Each interpolator (INTERP0 at
+             // 0x080, INTERP1 at 0x0C0) has its own register block. ACCUM
+             // and BASE reads return the backing store; PEEK_LANE0/1,
+@@ -277,7 +272,7 @@ impl Sio {
+             0x050 => self.fifo_st_write(val, core),
+             0x054 => self.fifo_wr(val, core),
+             // Divider.
+-            0x060..=0x078 => self.divider_write(offset, val, core),
++            0x060..=0x078 => self.divider[core].write32(offset, val),
+             // Interpolators.
+             0x080..=0x0FC => {
+                 let idx = ((offset - 0x080) >> 2) as usize;
+@@ -589,80 +584,24 @@ impl Sio {
+         trace!(lock_id = n, "spinlock released");
+     }
+ 
+-    // --- Divider helpers ---------------------------------------------------
+-
+-    fn divider_result_read(&mut self, offset: u32, core: usize) -> u32 {
+-        let d = &mut self.divider[core];
+-        let val = match offset {
+-            0x070 => d.quotient,
+-            0x074 => d.remainder,
+-            _ => return 0,
+-        };
+-        if d.dirty {
+-            d.reads_pending += 1;
+-            if d.reads_pending >= 2 {
+-                d.dirty = false;
+-                d.reads_pending = 0;
+-            }
+-        }
+-        val
++    /// Advance the divider for one core by elapsed sysclk cycles.
++    /// Direct SIO users must call this before reading completed results.
++    /// CPU stepping does this automatically for instruction/exception cycles.
++    pub fn advance_divider_cycles(&mut self, core: usize, cycles: u64) {
++        self.divider[core].advance_cycles(cycles);
+     }
+ 
+-    fn divider_write(&mut self, offset: u32, val: u32, core: usize) {
+-        let d = &mut self.divider[core];
+-        match offset {
+-            0x060 => {
+-                d.dividend = val;
+-                d.signed = false;
+-            }
+-            0x064 => {
+-                d.divisor = val;
+-                d.signed = false;
+-                Self::compute_division(d);
+-            }
+-            0x068 => {
+-                d.dividend = val;
+-                d.signed = true;
+-            }
+-            0x06C => {
+-                d.divisor = val;
+-                d.signed = true;
+-                Self::compute_division(d);
+-            }
+-            0x070 => {
+-                d.quotient = val;
+-                d.dirty = true;
+-                d.reads_pending = 0;
+-            }
+-            0x074 => {
+-                d.remainder = val;
+-                d.dirty = true;
+-                d.reads_pending = 0;
+-            }
+-            _ => {}
+-        }
++    pub(crate) fn sync_divider_cycle(&mut self, core: usize, cycle: u64) {
++        self.divider[core].sync_cycle(cycle);
+     }
+ 
+-    fn compute_division(d: &mut Divider) {
+-        if d.divisor == 0 {
+-            if d.signed {
+-                let a = d.dividend as i32;
+-                d.quotient = if a < 0 { 1u32 } else { (-1i32) as u32 };
+-            } else {
+-                d.quotient = 0xFFFF_FFFF;
+-            }
+-            d.remainder = d.dividend;
+-        } else if d.signed {
+-            let a = d.dividend as i32;
+-            let b = d.divisor as i32;
+-            d.quotient = a.wrapping_div(b) as u32;
+-            d.remainder = a.wrapping_rem(b) as u32;
+-        } else {
+-            d.quotient = d.dividend.wrapping_div(d.divisor);
+-            d.remainder = d.dividend.wrapping_rem(d.divisor);
+-        }
+-        d.dirty = true;
+-        d.reads_pending = 0;
++    #[cfg(all(
++        feature = "threading",
++        target_arch = "x86_64",
++        any(target_os = "windows", target_os = "linux")
++    ))]
++    pub(crate) fn divider_snapshot(&self, core: usize) -> Divider {
++        self.divider[core]
+     }
+ }
+ 
+@@ -800,6 +739,7 @@ mod tests {
+         let mut sio = Sio::new();
+         sio.write32(0x060, 100, 0);
+         sio.write32(0x064, 7, 0);
++        sio.advance_divider_cycles(0, 8);
+         assert_eq!(sio.read32(0x070, 0), 14);
+         assert_eq!(sio.read32(0x074, 0), 2);
+     }
+@@ -809,6 +749,7 @@ mod tests {
+         let mut sio = Sio::new();
+         sio.write32(0x068, (-42i32) as u32, 0);
+         sio.write32(0x06C, 0, 0);
++        sio.advance_divider_cycles(0, 8);
+         assert_eq!(sio.read32(0x070, 0), 1);
+         assert_eq!(sio.read32(0x074, 0), (-42i32) as u32);
+     }
+diff --git a/crates/rp2040-emu/src/core/bus_trait.rs b/crates/rp2040-emu/src/core/bus_trait.rs
+index 87f3b14..ed5b363 100644
+--- a/crates/rp2040-emu/src/core/bus_trait.rs
++++ b/crates/rp2040-emu/src/core/bus_trait.rs
+@@ -37,6 +37,10 @@ use crate::bus::ppb::Ppb;
+ use crate::core::Nvic;
+ 
+ pub trait CoreBus {
++    /// Advance peripherals local to the executing core after an instruction
++    /// or exception entry. A default preserves compatibility for custom buses.
++    fn advance_core_cycles(&mut self, _cycles: u32) {}
++
+     // --- Memory access ------------------------------------------------
+     //
+     // Address-only (no `core` argument) — matches the existing RP2040
+diff --git a/crates/rp2040-emu/src/core/mod.rs b/crates/rp2040-emu/src/core/mod.rs
+index a82f78b..0ed078c 100644
+--- a/crates/rp2040-emu/src/core/mod.rs
++++ b/crates/rp2040-emu/src/core/mod.rs
+@@ -274,6 +274,7 @@ impl CortexM0Plus {
+         // exception entry if one was taken; `0` otherwise.
+         let exc_cycles = self.try_take_any_pending_exception(bus);
+         if exc_cycles != 0 {
++            bus.advance_core_cycles(exc_cycles);
+             self.cycles = self.cycles.wrapping_add(exc_cycles as u64);
+             return exc_cycles;
+         }
+@@ -300,6 +301,7 @@ impl CortexM0Plus {
+             cycles = cycles.wrapping_add(self.deliver_fault(fault, bus));
+         }
+ 
++        bus.advance_core_cycles(cycles);
+         self.cycles = self.cycles.wrapping_add(cycles as u64);
+         cycles
+     }
+diff --git a/crates/rp2040-emu/src/lib.rs b/crates/rp2040-emu/src/lib.rs
+index 33effe0..37bebed 100644
+--- a/crates/rp2040-emu/src/lib.rs
++++ b/crates/rp2040-emu/src/lib.rs
+@@ -186,6 +186,9 @@ impl std::error::Error for EmulatorError {}
+ #[cfg(test)]
+ mod tests;
+ 
++#[cfg(test)]
++mod divider_tests;
++
+ #[cfg(test)]
+ mod pio_tests;
+ 
+@@ -791,6 +794,7 @@ impl Emulator {
+         {
+             let c0 = if !self.cores[0].is_halted() && !self.bus.wfe_waiting[0] {
+                 self.bus.set_active_core(0);
++                self.bus.sio.sync_divider_cycle(0, self.clock.cycles);
+                 let c = self.cores[0].step(&mut self.bus) as u64;
+                 // Drain decode-cache invalidations recorded by writes
+                 // during this step into the core that just ran.
+@@ -807,6 +811,7 @@ impl Emulator {
+ 
+             let c1 = if !self.cores[1].is_halted() && !self.bus.wfe_waiting[1] {
+                 self.bus.set_active_core(1);
++                self.bus.sio.sync_divider_cycle(1, self.clock.cycles);
+                 self.bus.begin_core1_step();
+                 let c = self.cores[1].step(&mut self.bus) as u64;
+                 Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);
+diff --git a/crates/rp2040-emu/src/tests.rs b/crates/rp2040-emu/src/tests.rs
+index 8cf3533..bcc3964 100644
+--- a/crates/rp2040-emu/src/tests.rs
++++ b/crates/rp2040-emu/src/tests.rs
+@@ -7170,24 +7170,22 @@ mod stage7_sio_coverage {
+ 
+     // --- Divider result-read dirty transitions ----------------------------
+ 
+-    /// `divider_result_read` must clear the `dirty` flag only after two
+-    /// reads (lines 559-564 drain branches). Exercises both the "first
+-    /// read leaves dirty" and "second read clears dirty" arms, plus the
+-    /// not-dirty path on a third read.
++    /// Only QUOTIENT reads clear DIRTY; repeated REMAINDER reads preserve it.
+     #[test]
+-    fn divider_dirty_flag_clears_after_two_reads() {
++    fn divider_dirty_flag_clears_on_quotient_read() {
+         let mut sio = Sio::new();
+         sio.write32(0x060, 100, 0);
+         sio.write32(0x064, 7, 0);
+-        // CSR (0x078): ready|dirty → 3.
+-        assert_eq!(sio.read32(0x078, 0) & 0x3, 0x3);
+-        let _ = sio.read32(0x070, 0); // first quotient read → reads_pending=1
+-        let _ = sio.read32(0x074, 0); // second result read → clears dirty
+-        // CSR: ready only.
+-        assert_eq!(sio.read32(0x078, 0) & 0x3, 0x1);
+-        // Third read now hits the `!dirty` branch (line 565 false arm).
++        assert_eq!(sio.read32(0x078, 0), 2); // busy + dirty
++        sio.advance_divider_cycles(0, 8);
++        assert_eq!(sio.read32(0x078, 0), 3);
++        assert_eq!(sio.read32(0x074, 0), 2);
++        assert_eq!(sio.read32(0x074, 0), 2);
++        assert_eq!(sio.read32(0x078, 0), 3);
++        assert_eq!(sio.read32(0x070, 0), 14);
++        assert_eq!(sio.read32(0x078, 0), 1);
+         let _ = sio.read32(0x070, 0);
+-        assert_eq!(sio.read32(0x078, 0) & 0x3, 0x1);
++        assert_eq!(sio.read32(0x078, 0), 1);
+     }
+ 
+     /// Direct write to result register (0x070/0x074) sets dirty (lines
+@@ -7204,12 +7202,13 @@ mod stage7_sio_coverage {
+     }
+ 
+     /// Unsigned divide-by-zero produces 0xFFFFFFFF / dividend
+-    /// (compute_division `d.signed == false` branch at line 596).
++    /// after the eight-cycle calculation.
+     #[test]
+     fn divider_unsigned_divide_by_zero() {
+         let mut sio = Sio::new();
+         sio.write32(0x060, 42, 0);
+         sio.write32(0x064, 0, 0);
++        sio.advance_divider_cycles(0, 8);
+         assert_eq!(sio.read32(0x070, 0), 0xFFFF_FFFF);
+         assert_eq!(sio.read32(0x074, 0), 42);
+     }
+@@ -7221,6 +7220,7 @@ mod stage7_sio_coverage {
+         let mut sio = Sio::new();
+         sio.write32(0x068, 42, 0);
+         sio.write32(0x06C, 0, 0);
++        sio.advance_divider_cycles(0, 8);
+         assert_eq!(sio.read32(0x070, 0), (-1i32) as u32);
+         assert_eq!(sio.read32(0x074, 0), 42);
+     }
+@@ -7231,16 +7231,11 @@ mod stage7_sio_coverage {
+         let mut sio = Sio::new();
+         sio.write32(0x068, (-20i32) as u32, 0);
+         sio.write32(0x06C, 3, 0);
++        sio.advance_divider_cycles(0, 8);
+         assert_eq!(sio.read32(0x070, 0) as i32, -6);
+         assert_eq!(sio.read32(0x074, 0) as i32, -2);
+     }
+ 
+-    // `divider_result_read` default arm for an offset that isn't 0x070 or
+-    // 0x074 (unreachable via public read32 dispatch, but the `_ => return
+-    // 0` arm is kept as a defensive fallback).
+-    // unreachable: inner match at line 554 cannot be reached — public
+-    // `read32` dispatcher only routes 0x070/0x074 here. Not tested.
+-
+     // --- Interp compute (INTERP0 path — covers BLEND-disabled default) ----
+ 
+     /// INTERP0 lane 0 unsigned SHIFT=0, BASE add, sets `which == 0` and
+@@ -7613,6 +7608,8 @@ mod stage7_sio_coverage {
+         sio.write32(0x064, 10, 0);
+         sio.write32(0x060, 50, 1);
+         sio.write32(0x064, 5, 1);
++        sio.advance_divider_cycles(0, 8);
++        sio.advance_divider_cycles(1, 8);
+         assert_eq!(sio.read32(0x070, 0), 10);
+         assert_eq!(sio.read32(0x070, 1), 10);
+         assert_eq!(sio.read32(0x074, 0), 0);
+@@ -10448,19 +10445,19 @@ mod stage3_bus_residue {
+         assert_eq!(st_after & 0x8, 0, "ROE cleared");
+     }
+ 
+-    /// DIV_CSR (0x078) ready/dirty after a write — combination check.
++    /// DIV_CSR tracks eight-cycle completion and QUOTIENT consumption.
+     #[test]
+-    fn div_csr_dirty_after_unsigned_write_clears_after_two_reads() {
++    fn div_csr_tracks_completion_and_quotient_consumption() {
+         let mut bus = Bus::new();
+         bus.write32(SIO_BASE + 0x060, 100);
+         bus.write32(SIO_BASE + 0x064, 7);
+-        let csr = bus.read32(SIO_BASE + 0x078);
+-        assert_eq!(csr & 0x3, 0x3, "ready|dirty after divisor write");
+-        // First and second result reads.
+-        let _ = bus.read32(SIO_BASE + 0x070);
+-        let _ = bus.read32(SIO_BASE + 0x074);
+-        let csr2 = bus.read32(SIO_BASE + 0x078);
+-        assert_eq!(csr2 & 0x3, 0x1, "dirty cleared after pair of reads");
++        assert_eq!(bus.read32(SIO_BASE + 0x078), 2, "busy|dirty after write");
++        bus.sio.advance_divider_cycles(0, 8);
++        assert_eq!(bus.read32(SIO_BASE + 0x078), 3);
++        assert_eq!(bus.read32(SIO_BASE + 0x074), 2);
++        assert_eq!(bus.read32(SIO_BASE + 0x078), 3, "remainder keeps dirty");
++        assert_eq!(bus.read32(SIO_BASE + 0x070), 14);
++        assert_eq!(bus.read32(SIO_BASE + 0x078), 1, "quotient clears dirty");
+     }
+ 
+     /// INTERP base/peek/pop register access via Bus.
+@@ -11836,15 +11833,21 @@ mod stage4_core_residue_v2 {
+     #[test]
+     fn is_wide_rejects_m33_only_prefixes() {
+         // 0b11101 (0xE800..0xEFFF) — Thumb-32 on M33 only.
+-        for hw0 in [0xE800u16, 0xE900, 0xEA00, 0xEB00, 0xEC00, 0xED00, 0xEE00, 0xEF00] {
++        for hw0 in [
++            0xE800u16, 0xE900, 0xEA00, 0xEB00, 0xEC00, 0xED00, 0xEE00, 0xEF00,
++        ] {
+             assert!(!is_wide(hw0), "{hw0:#06x} is M33-only wide");
+         }
+         // 0b11111 (0xF800..0xFFFF) — Thumb-32 on M33 only.
+-        for hw0 in [0xF800u16, 0xF900, 0xFA00, 0xFB00, 0xFC00, 0xFD00, 0xFE00, 0xFF00] {
++        for hw0 in [
++            0xF800u16, 0xF900, 0xFA00, 0xFB00, 0xFC00, 0xFD00, 0xFE00, 0xFF00,
++        ] {
+             assert!(!is_wide(hw0), "{hw0:#06x} is M33-only wide");
+         }
+         // 0b11110 IS the M0+ wide prefix.
+-        for hw0 in [0xF000u16, 0xF100, 0xF200, 0xF300, 0xF400, 0xF500, 0xF600, 0xF700] {
++        for hw0 in [
++            0xF000u16, 0xF100, 0xF200, 0xF300, 0xF400, 0xF500, 0xF600, 0xF700,
++        ] {
+             assert!(is_wide(hw0), "{hw0:#06x} is the M0+ wide prefix");
+         }
+     }
+@@ -11940,8 +11943,7 @@ mod stage4_core_residue_v2 {
+         cpu.decode_cache[11].tag = 0x2000_0016; // SRAM
+         // BULK alongside other region bits — the BULK guard must win.
+         cpu.invalidate_decode_cache_regions(
+-            crate::bus::invalidation_regions::BULK
+-                | crate::bus::invalidation_regions::ROM,
++            crate::bus::invalidation_regions::BULK | crate::bus::invalidation_regions::ROM,
+         );
+         for slot in cpu.decode_cache.iter() {
+             assert_eq!(slot.tag, u32::MAX, "BULK clears every slot");
+@@ -11977,8 +11979,7 @@ mod stage4_core_residue_v2 {
+         cpu.decode_cache[2].tag = 0x0000_1004; // ROM
+         cpu.decode_cache[4].tag = 0x1000_2008; // XIP
+         cpu.decode_cache[6].tag = 0x2000_300C; // SRAM
+-        let regions = crate::bus::invalidation_regions::ROM
+-            | crate::bus::invalidation_regions::XIP;
++        let regions = crate::bus::invalidation_regions::ROM | crate::bus::invalidation_regions::XIP;
+         cpu.invalidate_decode_cache_regions(regions);
+         assert_eq!(cpu.decode_cache[2].tag, u32::MAX);
+         assert_eq!(cpu.decode_cache[4].tag, u32::MAX);
+@@ -12632,7 +12633,9 @@ mod stage4_lib_residue_v2 {
+     fn load_image_unknown_top_nibble_drops_silently() {
+         let mut emu = Emulator::new(Config::default());
+         let data = [0xDEu8, 0xAD, 0xBE, 0xEF];
+-        for top in [0x3u32, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF] {
++        for top in [
++            0x3u32, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF,
++        ] {
+             emu.load_image(top << 28, &data);
+         }
+         // ROM bytes untouched.
+@@ -13091,8 +13094,7 @@ mod stage6_periph_long_tail {
+     mod uart {
+         use super::tree;
+         use crate::peripherals::uart::{
+-            UART_INT_TX, UARTCR, UARTDR, UARTIBRD, UARTIFLS, UARTIMSC, UARTLCR_H, UARTRIS,
+-            UartRegs,
++            UART_INT_TX, UARTCR, UARTDR, UARTIBRD, UARTIFLS, UARTIMSC, UARTLCR_H, UARTRIS, UartRegs,
+         };
+ 
+         const IRQ: u32 = 20;
+@@ -13147,7 +13149,11 @@ mod stage6_periph_long_tail {
+             }
+             // Drain everything. lvl=0 <= thresh=2 → TXIS latches.
+             u.tick(100, &tree(), &mut irqs);
+-            assert_ne!(u.read32(UARTRIS) & UART_INT_TX, 0, "TXIS must latch on drain");
++            assert_ne!(
++                u.read32(UARTRIS) & UART_INT_TX,
++                0,
++                "TXIS must latch on drain"
++            );
+             assert_ne!(irqs & (1u32 << IRQ), 0, "NVIC fire on TXIS");
+         }
+ 
+@@ -13379,9 +13385,7 @@ mod stage6_periph_long_tail {
+ 
+     mod pwm {
+         use super::tree;
+-        use crate::peripherals::pwm::{
+-            CSR_EN, EN, INTR, PWM_SLICE_COUNT, PwmRegs, SLICE_STRIDE,
+-        };
++        use crate::peripherals::pwm::{CSR_EN, EN, INTR, PWM_SLICE_COUNT, PwmRegs, SLICE_STRIDE};
+ 
+         const IRQ: u32 = 4;
+ 
+@@ -13848,13 +13852,13 @@ mod stage8_lib_residue {
+ 
+ #[cfg(test)]
+ mod stage9_residue {
+-    use crate::{Config, Emulator};
+     #[cfg(all(
+         feature = "threading",
+         target_arch = "x86_64",
+         any(target_os = "windows", target_os = "linux")
+     ))]
+     use crate::EmulatorBuilder;
++    use crate::{Config, Emulator};
+ 
+     // ============================================================
+     // lib.rs §1
+@@ -14621,7 +14625,10 @@ mod stage10_lib_precision {
+             || emu.bus.nvics[0].is_pending(8)
+             || emu.bus.nvics[0].is_pending(9)
+             || emu.bus.nvics[0].is_pending(10);
+-        assert!(routed, "PIO INT0/INT1 INTF should route to NVIC IRQ pending");
++        assert!(
++            routed,
++            "PIO INT0/INT1 INTF should route to NVIC IRQ pending"
++        );
+     }
+ 
+     // ------------------- line 886: PIO0 SM0 max-PC tracker advance -------------------
+diff --git a/crates/rp2040-emu/src/threaded/bus.rs b/crates/rp2040-emu/src/threaded/bus.rs
+index 341f8bc..fb5658f 100644
+--- a/crates/rp2040-emu/src/threaded/bus.rs
++++ b/crates/rp2040-emu/src/threaded/bus.rs
+@@ -43,6 +43,7 @@
+ 
+ use std::sync::Arc;
+ 
++use crate::bus::divider::Divider;
+ use crate::bus::ppb::Ppb;
+ use crate::bus::systick::SysTick;
+ use crate::core::Nvic;
+@@ -109,7 +110,7 @@ pub struct WorkerBus {
+     active_pc: u32,
+     /// Per-worker integer divider snapshot (HLD §6.4 point 4 — divider
+     /// is per-core-local; no cross-core coherency).
+-    divider: DividerLocal,
++    divider: Divider,
+     /// Per-worker interpolator snapshot (HLD §6.4 point 5 — interp
+     /// cross-core coherency is dropped).
+     interp: [u32; 32],
+@@ -130,6 +131,9 @@ impl WorkerBus {
+         debug_assert!(core_id < 2, "core_id must be 0 or 1");
+         let mut ppb = [Ppb::new(), Ppb::new()];
+         ppb[core_id] = shared.take_initial_ppb(core_id);
++        let divider = *shared.dividers[core_id]
++            .lock()
++            .expect("divider snapshot poisoned");
+         Self {
+             core_id,
+             shared,
+@@ -139,11 +143,18 @@ impl WorkerBus {
+             bus_fault: false,
+             bus_fault_addr: 0,
+             active_pc: 0,
+-            divider: DividerLocal::default(),
++            divider,
+             interp: [0u32; 32],
+         }
+     }
+ 
++    /// Preserve operands, status and a pending calculation across worker runs.
++    pub(crate) fn save_divider_state(&self) {
++        *self.shared.dividers[self.core_id]
++            .lock()
++            .expect("divider snapshot poisoned") = self.divider;
++    }
++
+     /// Drain the cross-core IRQ pending mask published by the
+     /// coordinator / peer worker and merge it into this core's local
+     /// NVIC.
+@@ -290,17 +301,10 @@ impl WorkerBus {
+                     }
+                 }
+             }
+-            // Integer divider reads (per-core local).
+-            0x060 | 0x068 => self.divider.dividend,
+-            0x064 | 0x06C => self.divider.divisor,
+-            0x070 => self.divider.quotient,
+-            0x074 => self.divider.remainder,
+-            0x078 => {
+-                // CSR: bit 0 READY always 1; bit 1 DIRTY if results
+-                // are unread. Same shape as serial `Sio::read32`.
+-                let ready = 1u32;
+-                let dirty = if self.divider.dirty { 2 } else { 0 };
+-                ready | dirty
++            // Both models use the same per-core divider semantics.
++            0x060..=0x078 => {
++                self.divider.sync_cycle(self.master_cycle());
++                self.divider.read32(offset)
+             }
+             // Interpolators 0x080..0x0FC — per-worker local.
+             0x080..=0x0FC => {
+@@ -417,31 +421,9 @@ impl WorkerBus {
+                 }
+             }
+             // Divider writes — per-core local.
+-            0x060 => {
+-                self.divider.dividend = val;
+-                self.divider.signed = false;
+-            }
+-            0x064 => {
+-                self.divider.divisor = val;
+-                self.divider.signed = false;
+-                self.divider.compute();
+-            }
+-            0x068 => {
+-                self.divider.dividend = val;
+-                self.divider.signed = true;
+-            }
+-            0x06C => {
+-                self.divider.divisor = val;
+-                self.divider.signed = true;
+-                self.divider.compute();
+-            }
+-            0x070 => {
+-                self.divider.quotient = val;
+-                self.divider.dirty = true;
+-            }
+-            0x074 => {
+-                self.divider.remainder = val;
+-                self.divider.dirty = true;
++            0x060..=0x078 => {
++                self.divider.sync_cycle(self.master_cycle());
++                self.divider.write32(offset, val);
+             }
+             // Interpolators — plain storage per-worker.
+             0x080..=0x0FC => {
+@@ -982,52 +964,6 @@ impl WorkerBus {
+     }
+ }
+ 
+-// =======================================================================
+-// DividerLocal — per-worker snapshot of the SIO integer divider.
+-// =======================================================================
+-//
+-// HLD §6.4 point 4: divider is per-core-local, no cross-core coherency.
+-// The SIO divider on real silicon is per-core hardware; matching that
+-// shape in the threaded path avoids serializing divider writes on a
+-// shared mutex. Encoded inline here because `picoem_common::Divider`
+-// is carried on the serial `Sio` type along with its own accounting
+-// that only the serial path needs.
+-
+-#[derive(Debug, Clone, Copy, Default)]
+-struct DividerLocal {
+-    dividend: u32,
+-    divisor: u32,
+-    quotient: u32,
+-    remainder: u32,
+-    signed: bool,
+-    dirty: bool,
+-}
+-
+-impl DividerLocal {
+-    fn compute(&mut self) {
+-        if self.divisor == 0 {
+-            // Match serial divide-by-zero semantics in
+-            // `bus::sio::Sio::compute_division`.
+-            if self.signed {
+-                let a = self.dividend as i32;
+-                self.quotient = if a < 0 { 1u32 } else { (-1i32) as u32 };
+-            } else {
+-                self.quotient = 0xFFFF_FFFF;
+-            }
+-            self.remainder = self.dividend;
+-        } else if self.signed {
+-            let a = self.dividend as i32;
+-            let b = self.divisor as i32;
+-            self.quotient = a.wrapping_div(b) as u32;
+-            self.remainder = a.wrapping_rem(b) as u32;
+-        } else {
+-            self.quotient = self.dividend.wrapping_div(self.divisor);
+-            self.remainder = self.dividend.wrapping_rem(self.divisor);
+-        }
+-        self.dirty = true;
+-    }
+-}
+-
+ // =======================================================================
+ // SYSINFO stub — matches serial `Bus::sysinfo_read`.
+ // =======================================================================
+@@ -1045,6 +981,11 @@ fn sysinfo_read(offset: u32) -> u32 {
+ // =======================================================================
+ 
+ impl CoreBus for WorkerBus {
++    #[inline(always)]
++    fn advance_core_cycles(&mut self, cycles: u32) {
++        self.divider.advance_cycles(cycles as u64);
++    }
++
+     // --- Memory access ------------------------------------------------
+     //
+     // Byte / halfword accesses go through `SharedMemory`'s atomic CAS
+@@ -1401,6 +1342,7 @@ mod tests {
+         // Unsigned 100 / 7 = 14 rem 2.
+         b0.write32(0xD000_0060, 100); // DIV_UDIVIDEND
+         b0.write32(0xD000_0064, 7); // DIV_UDIVISOR
++        b0.advance_core_cycles(8);
+         assert_eq!(b0.read32(0xD000_0070), 14); // QUOTIENT
+         assert_eq!(b0.read32(0xD000_0074), 2); // REMAINDER
+     }
+@@ -1421,6 +1363,7 @@ mod tests {
+         let (_shared, mut b0) = fresh_worker(0);
+         b0.write32(0xD000_0068, (-42i32) as u32); // SDIVIDEND
+         b0.write32(0xD000_006C, 0); // SDIVISOR
++        b0.advance_core_cycles(8);
+         assert_eq!(b0.read32(0xD000_0070), 1); // quotient = 1 (matches serial)
+         assert_eq!(b0.read32(0xD000_0074), (-42i32) as u32);
+     }
+@@ -1912,19 +1855,25 @@ mod tests {
+         assert_eq!(b0.read32(0xD000_005C), 1 << 7);
+     }
+ 
+-    /// DIV_CSR at 0x078: bit 0 (READY) is always 1; bit 1 (DIRTY) tracks
+-    /// whether results are unread/clean.
++    /// DIV_CSR tracks calculation progress and QUOTIENT consumption.
+     #[test]
+     fn div_csr_reports_ready_and_dirty_flags() {
+         let (_shared, mut b0) = fresh_worker(0);
+         // Fresh divider — not dirty, only READY set.
+         assert_eq!(b0.read32(0xD000_0078), 0x1);
+-        // Trigger a divide: divisor write computes and sets dirty.
++        // Trigger a divide: busy and dirty until eight cycles elapse.
+         b0.write32(0xD000_0060, 10);
+         b0.write32(0xD000_0064, 3);
+         let csr = b0.read32(0xD000_0078);
+-        assert_eq!(csr & 0x1, 0x1, "READY must remain 1");
+-        assert_eq!(csr & 0x2, 0x2, "DIRTY must be set after compute");
++        assert_eq!(csr, 2, "busy and dirty after operand write");
++        b0.advance_core_cycles(7);
++        assert_eq!(b0.read32(0xD000_0078), 2);
++        b0.advance_core_cycles(1);
++        assert_eq!(b0.read32(0xD000_0078), 3);
++        assert_eq!(b0.read32(0xD000_0074), 1);
++        assert_eq!(b0.read32(0xD000_0078), 3);
++        assert_eq!(b0.read32(0xD000_0070), 3);
++        assert_eq!(b0.read32(0xD000_0078), 1);
+     }
+ 
+     /// DIV_UDIVIDEND/DIVISOR alias reads (0x068/0x06C signed pair) read
+@@ -1947,6 +1896,7 @@ mod tests {
+         let (_shared, mut b0) = fresh_worker(0);
+         b0.write32(0xD000_0060, 12345); // UDIVIDEND
+         b0.write32(0xD000_0064, 0); // UDIVISOR — triggers div-by-zero
++        b0.advance_core_cycles(8);
+         assert_eq!(b0.read32(0xD000_0070), 0xFFFF_FFFF);
+         assert_eq!(b0.read32(0xD000_0074), 12345);
+     }
+@@ -1958,6 +1908,7 @@ mod tests {
+         let (_shared, mut b0) = fresh_worker(0);
+         b0.write32(0xD000_0068, 99); // SDIVIDEND positive
+         b0.write32(0xD000_006C, 0); // SDIVISOR
++        b0.advance_core_cycles(8);
+         assert_eq!(b0.read32(0xD000_0070), (-1i32) as u32);
+         assert_eq!(b0.read32(0xD000_0074), 99);
+     }
+@@ -1969,9 +1920,11 @@ mod tests {
+         let (_shared, mut b0) = fresh_worker(0);
+         b0.write32(0xD000_0070, 0xCAFE);
+         b0.write32(0xD000_0074, 0xBABE);
+-        assert_eq!(b0.read32(0xD000_0070), 0xCAFE);
++        assert_eq!(b0.read32(0xD000_0078), 3);
+         assert_eq!(b0.read32(0xD000_0074), 0xBABE);
+-        assert_eq!(b0.read32(0xD000_0078) & 0x2, 0x2);
++        assert_eq!(b0.read32(0xD000_0078), 3);
++        assert_eq!(b0.read32(0xD000_0070), 0xCAFE);
++        assert_eq!(b0.read32(0xD000_0078), 1);
+     }
+ 
+     /// SIO unmapped offset reads return zero (the wildcard arm).
+diff --git a/crates/rp2040-emu/src/threaded/emulator.rs b/crates/rp2040-emu/src/threaded/emulator.rs
+index d7f7b04..63cccb3 100644
+--- a/crates/rp2040-emu/src/threaded/emulator.rs
++++ b/crates/rp2040-emu/src/threaded/emulator.rs
+@@ -288,6 +288,9 @@ impl ThreadedEmulator {
+             poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+             panic_info: Arc::new(std::sync::Mutex::new(None)),
+             initial_ppb,
++            dividers: std::array::from_fn(|core| {
++                Arc::new(std::sync::Mutex::new(bus.sio.divider_snapshot(core)))
++            }),
+         });
+ 
+         Self {
+@@ -583,6 +586,7 @@ fn core_worker_body(
+             return core;
+         }
+     }
++    bus.save_divider_state();
+     core
+ }
+ 
+@@ -757,6 +761,37 @@ mod tests {
+     use super::*;
+     use crate::{Config, EmulatorBuilder};
+ 
++    #[test]
++    fn sdk_64_bit_division_threaded_both_cores_and_quantum_sizes() {
++        use crate::core::bus_trait::CoreBus;
++        use crate::divider_tests::{CASES, OUTPUT, check, seed};
++        use crate::threaded::WorkerBus;
++
++        for quantum in [1, 128] {
++            for core in 0..2 {
++                for &case in CASES {
++                    let mut threaded = ThreadedEmulator::from_emulator(seed(core, case, quantum));
++                    // Multiple worker invocations must retain divider state.
++                    // Stop after at most 8192 scheduler cycles.
++                    for _ in 0..32 {
++                        threaded
++                            .run_quanta_checked(256 / u64::from(quantum))
++                            .unwrap();
++                        if threaded.shared.memory.read32(OUTPUT + 16) == 1 {
++                            break;
++                        }
++                    }
++                    check(|addr| threaded.shared.memory.read32(addr), case);
++                    let mut bus = WorkerBus::new(threaded.shared.clone(), core);
++                    assert_eq!(bus.read32(0xd000_0060), 77);
++                    assert_eq!(bus.read32(0xd000_0064), 11);
++                    assert_eq!(bus.read32(0xd000_0074), 0);
++                    assert_eq!(bus.read32(0xd000_0070), 7);
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn from_emulator_builds_threaded() {
+         let emu = EmulatorBuilder::new(Config::default())
+@@ -1485,10 +1520,7 @@ mod tests {
+         assert_eq!(r0, 1u32 << 0);
+         assert_eq!(r5, 1u32 << 5);
+         assert_eq!(r31, 1u32 << 31);
+-        assert_eq!(
+-            emu.bus.sio.spinlock_bits(),
+-            (1 << 0) | (1 << 5) | (1 << 31)
+-        );
++        assert_eq!(emu.bus.sio.spinlock_bits(), (1 << 0) | (1 << 5) | (1 << 31));
+         emu.cores[0].halt();
+         emu.cores[1].halt();
+ 
+diff --git a/crates/rp2040-emu/src/threaded/shared.rs b/crates/rp2040-emu/src/threaded/shared.rs
+index ceeb196..7a50fe9 100644
+--- a/crates/rp2040-emu/src/threaded/shared.rs
++++ b/crates/rp2040-emu/src/threaded/shared.rs
+@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
+ use picoem_common::threaded::SpscQueue;
+ 
+ use crate::WorkerName;
++use crate::bus::divider::Divider;
+ use crate::bus::ppb::Ppb;
+ use crate::threaded::{CoreAtomics, Peripherals, SharedMemory, ThreadedPio};
+ 
+@@ -91,6 +92,9 @@ pub struct SharedState {
+     /// `spawn_worker` signature while still preserving pre-run pokes
+     /// (VTOR, NVIC pending/enable via ICSR, SHPR priorities).
+     pub initial_ppb: Arc<Mutex<Option<[Ppb; 2]>>>,
++    /// Per-core divider snapshots at promotion and between worker runs.
++    /// Locked only at worker construction/exit, never on an MMIO access.
++    pub(crate) dividers: [Arc<Mutex<Divider>>; 2],
+ }
+ 
+ impl SharedState {
+@@ -120,6 +124,7 @@ impl SharedState {
+             poisoned: Arc::new(AtomicBool::new(false)),
+             panic_info: Arc::new(Mutex::new(None)),
+             initial_ppb: Arc::new(Mutex::new(None)),
++            dividers: std::array::from_fn(|_| Arc::new(Mutex::new(Divider::default()))),
+         }
+     }
+ 
+diff --git a/crates/rp2040-emu/src/bus/divider.rs b/crates/rp2040-emu/src/bus/divider.rs
+new file mode 100644
+index 0000000..6c97d17
+--- /dev/null
++++ b/crates/rp2040-emu/src/bus/divider.rs
+@@ -0,0 +1,123 @@
++//! RP2040 per-core SIO divider, used by both execution models.
++//!
++//! Every operand write restarts an eight-sysclk calculation. Result writes
++//! cancel it; only QUOTIENT reads clear DIRTY. Results while READY=0 are
++//! architecturally undefined; this model retains the preceding result.
++
++#[derive(Debug, Default, Clone, Copy)]
++pub(crate) struct Divider {
++    dividend: u32,
++    divisor: u32,
++    quotient: u32,
++    remainder: u32,
++    dirty: bool,
++    cycle: u64,
++    remaining: u8,
++    pending: (u32, u32),
++}
++
++impl Divider {
++    pub(crate) fn read32(&mut self, offset: u32) -> u32 {
++        match offset {
++            0x060 | 0x068 => self.dividend,
++            0x064 | 0x06c => self.divisor,
++            0x070 => {
++                self.dirty = false;
++                self.quotient
++            }
++            0x074 => self.remainder,
++            0x078 => u32::from(self.remaining == 0) | (u32::from(self.dirty) << 1),
++            _ => 0,
++        }
++    }
++
++    pub(crate) fn write32(&mut self, offset: u32, value: u32) {
++        match offset {
++            0x060 | 0x064 | 0x068 | 0x06c => {
++                if offset == 0x060 || offset == 0x068 {
++                    self.dividend = value;
++                } else {
++                    self.divisor = value;
++                }
++                let signed = offset == 0x068 || offset == 0x06c;
++                self.pending = Self::calculate(self.dividend, self.divisor, signed);
++                self.remaining = 8;
++                self.dirty = true;
++            }
++            0x070 | 0x074 => {
++                if offset == 0x070 {
++                    self.quotient = value;
++                } else {
++                    self.remainder = value;
++                }
++                self.remaining = 0;
++                self.dirty = true;
++            }
++            _ => {}
++        }
++    }
++
++    /// Advance this core's clock, including instruction/exception cycles.
++    pub(crate) fn advance_cycles(&mut self, cycles: u64) {
++        self.cycle = self.cycle.wrapping_add(cycles);
++        if self.remaining == 0 {
++            return;
++        }
++        if cycles >= u64::from(self.remaining) {
++            (self.quotient, self.remainder) = self.pending;
++            self.remaining = 0;
++        } else {
++            self.remaining -= cycles as u8;
++        }
++    }
++
++    /// Catch up to elapsed system time after a parked core or quantum.
++    /// The local clock may already lead the scheduler by an instruction;
++    /// never count those cycles a second time or move the clock backwards.
++    pub(crate) fn sync_cycle(&mut self, cycle: u64) {
++        let elapsed = cycle.wrapping_sub(self.cycle);
++        if elapsed < (1u64 << 63) {
++            self.advance_cycles(elapsed);
++        }
++    }
++
++    fn calculate(dividend: u32, divisor: u32, signed: bool) -> (u32, u32) {
++        if divisor == 0 {
++            let quotient = if signed && (dividend as i32) < 0 {
++                1
++            } else {
++                u32::MAX
++            };
++            (quotient, dividend)
++        } else if signed {
++            let a = dividend as i32;
++            let b = divisor as i32;
++            (a.wrapping_div(b) as u32, a.wrapping_rem(b) as u32)
++        } else {
++            (dividend / divisor, dividend % divisor)
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::Divider;
++
++    #[test]
++    fn clock_wrap_and_scheduler_catchup_preserve_eight_cycles() {
++        let mut divider = Divider {
++            cycle: u64::MAX - 3,
++            ..Divider::default()
++        };
++        divider.write32(0x064, 3);
++        divider.write32(0x060, 10);
++        divider.advance_cycles(7);
++        assert_eq!(divider.read32(0x078), 2);
++        divider.sync_cycle(2); // Scheduler lags the local clock (now 3).
++        assert_eq!(divider.read32(0x078), 2);
++        divider.sync_cycle(4);
++        assert_eq!(divider.read32(0x078), 3);
++        assert_eq!(divider.read32(0x074), 1);
++        assert_eq!(divider.read32(0x070), 3);
++    }
++}
+diff --git a/crates/rp2040-emu/src/divider_tests.rs b/crates/rp2040-emu/src/divider_tests.rs
+new file mode 100644
+index 0000000..eb6652d
+--- /dev/null
++++ b/crates/rp2040-emu/src/divider_tests.rs
+@@ -0,0 +1,99 @@
++//! Execute pinned Pico SDK integer division assembly against the actual CPUs.
++
++use crate::{Config, Emulator};
++
++pub(crate) const MAILBOX: u32 = 0x2003_0000;
++pub(crate) const OUTPUT: u32 = MAILBOX + 0x20;
++pub(crate) const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/sio_divider_sdk/fixture.bin");
++pub(crate) const CASES: &[(u64, u64, bool)] = &[
++    (u64::MAX, 3, false),
++    (u64::MAX, 0x1234_5678, false), // y64_x32 reciprocal path
++    (u64::MAX, u32::MAX as u64, false),
++    (u64::MAX, 0x0000_1234_5678_9abc, false), // y64_x48
++    (u64::MAX, 0x1234_5678_9abc_def0, false), // y64_x64
++    (0x1234, 0x1234_5678_9abc_def0, false),
++    (u64::MAX, u64::MAX, false),
++    (i64::MIN as u64, u64::MAX, true), // signed overflow wraps
++    ((-1_234_567_890_123_456i64) as u64, 0x1234_5678, true),
++    (1_234_567_890_123_456, (-0x1234_5678i64) as u64, true),
++    (
++        (-1_234_567_890_123_456i64) as u64,
++        (-0x1234_5678i64) as u64,
++        true,
++    ),
++    (i64::MAX as u64, 0x1234_5678_9abc, true),
++    (i64::MIN as u64, 0x1234_5678_9abc_def0, true),
++];
++
++pub(crate) fn seed(core: usize, case: (u64, u64, bool), quantum: u32) -> Emulator {
++    let mut emu = Emulator::new(Config::default());
++    emu.step_quantum = quantum;
++    emu.load_image(0x2000_0000, FIXTURE);
++    emu.core_mut(1 - core).halt();
++    let cpu = emu.core_mut(core);
++    cpu.wake();
++    cpu.regs.set_pc(0x2000_0000);
++    cpu.regs.msp = 0x2004_0000;
++    cpu.regs.r[13] = 0x2004_0000;
++    let (a, b, signed) = case;
++    for (i, word) in [
++        a as u32,
++        (a >> 32) as u32,
++        b as u32,
++        (b >> 32) as u32,
++        u32::from(signed),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        emu.poke(MAILBOX + i as u32 * 4, word);
++    }
++    // A dirty, still-running divider must survive promotion and the SDK's
++    // save/restore path. The saved 77/11 result is ready by the function call.
++    emu.bus.sio.write32(0x060, 77, core);
++    emu.bus.sio.write32(0x064, 11, core);
++    emu.bus.sio.advance_divider_cycles(core, 2);
++    emu
++}
++
++pub(crate) fn check(mut read: impl FnMut(u32) -> u32, case: (u64, u64, bool)) {
++    assert_eq!(
++        read(OUTPUT + 16),
++        1,
++        "SDK completion marker missing for {case:?}"
++    );
++    let quotient = u64::from(read(OUTPUT)) | (u64::from(read(OUTPUT + 4)) << 32);
++    let remainder = u64::from(read(OUTPUT + 8)) | (u64::from(read(OUTPUT + 12)) << 32);
++    let (a, b, signed) = case;
++    let expected = if signed {
++        let (a, b) = (a as i64 as i128, b as i64 as i128);
++        ((a / b) as u64, (a % b) as u64)
++    } else {
++        let (a, b) = (a as u128, b as u128);
++        ((a / b) as u64, (a % b) as u64)
++    };
++    assert_eq!((quotient, remainder), expected, "SDK case {case:?}");
++}
++
++#[test]
++fn sdk_64_bit_division_both_cores_and_quantum_sizes() {
++    for quantum in [1, 128] {
++        for core in 0..2 {
++            for &case in CASES {
++                let mut emu = seed(core, case, quantum);
++                // Budget fails promptly if a stale reciprocal traps correction.
++                for _ in 0..512 {
++                    emu.run(128).unwrap();
++                    if emu.peek(OUTPUT + 16) == 1 {
++                        break;
++                    }
++                }
++                check(|addr| emu.peek(addr), case);
++                assert_eq!(emu.bus.sio.read32(0x060, core), 77);
++                assert_eq!(emu.bus.sio.read32(0x064, core), 11);
++                assert_eq!(emu.bus.sio.read32(0x074, core), 0);
++                assert_eq!(emu.bus.sio.read32(0x070, core), 7);
++            }
++        }
++    }
++}
+diff --git a/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/README.md b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/README.md
+new file mode 100644
+index 0000000..04b7fdb
+--- /dev/null
++++ b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/README.md
+@@ -0,0 +1,35 @@
++# Pico SDK hardware divider regression fixture
++
++`fixture.bin` is linked at SRAM `0x20000000`. The Rust regression tests execute
++the actual Cortex-M0+ instructions from the unmodified Pico SDK
++`divider_hardware.S` at commit `a1438dff1d38bd9c65dbd693f0e5db4b9ae91779`.
++SDK source and helpers are BSD-3-Clause, copyright Raspberry Pi; their source
++identities are recorded in `provenance.json`.
++
++`harness.S` loads two 64-bit inputs and a signedness selector from `0x20030000`,
++calls `__aeabi_uldivmod` or `__aeabi_ldivmod`, and writes quotient, remainder
++and a completion marker at `0x20030020`. The fixture has no app, board, display
++or bootrom dependency. Both cores and Serial/Threaded execution are tested
++with quanta 1 and 128, exact host integer references and finite budgets.
++The tests seed a dirty pending divider before the call and check its restored
++operands/results. Threaded tests split execution across worker invocations.
++
++`pico.h` supplies only assembly configuration: ordinary symbol names, one
++text section, SDK state save/restore enabled, and zero-divisor callback hooks
++disabled. No SDK arithmetic instructions are replaced. Zero-divisor register
++behavior is checked separately in `tests/sio_divider.rs`; these SDK tests use
++nonzero divisors and include signed overflow.
++
++Rebuild with an existing checkout of the pinned SDK and the Arm GNU toolchain:
++
++```sh
++python3 crates/rp2040-emu/tests/fixtures/sio_divider_sdk/build.py --sdk /path/to/pico-sdk
++```
++
++The builder checks the SDK revision and the six included source/header files
++against that revision, builds in a temporary directory, and updates the BIN,
++symbol list and provenance. `provenance.json` records input/BIN/ELF hashes,
++compiler version and commands. The temporary ELF is not retained; its recorded
++hash identifies the linker output, and the source/commands reproduce it using
++the recorded toolchain. Normal Rust tests use the checked-in BIN and do not
++require the SDK checkout or Arm compiler.
+diff --git a/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/build.py b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/build.py
+new file mode 100644
+index 0000000..a49cb7f
+--- /dev/null
++++ b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/build.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""Rebuild the RP2040 SDK divider test fixture using the pinned SDK checkout."""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import subprocess
++import tempfile
++
++SDK_COMMIT = "a1438dff1d38bd9c65dbd693f0e5db4b9ae91779"
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--sdk", required=True, type=Path)
++    args = parser.parse_args()
++    sdk = args.sdk.resolve()
++    here = Path(__file__).resolve().parent
++    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=sdk, text=True).strip()
++    if commit != SDK_COMMIT:
++        raise SystemExit(f"Expected SDK {SDK_COMMIT}, got {commit}")
++    inputs = [
++        "src/rp2_common/pico_divider/divider_hardware.S",
++        "src/rp2_common/hardware_divider/include/hardware/divider_helper.S",
++        "src/rp2040/pico_platform/include/pico/asm_helper.S",
++        "src/rp2040/hardware_regs/include/hardware/platform_defs.h",
++        "src/rp2040/hardware_regs/include/hardware/regs/addressmap.h",
++        "src/rp2040/hardware_regs/include/hardware/regs/sio.h",
++    ]
++    hashes = {}
++    for name in inputs:
++        data = (sdk / name).read_bytes()
++        pinned = subprocess.check_output(["git", "show", f"{SDK_COMMIT}:{name}"], cwd=sdk)
++        if data != pinned:
++            raise SystemExit(f"SDK input differs from pinned revision: {name}")
++        hashes[name] = hashlib.sha256(data).hexdigest()
++    with tempfile.TemporaryDirectory(prefix="sio-divider-sdk-") as temporary:
++        work = Path(temporary)
++        common = ["arm-none-eabi-gcc", "-mcpu=cortex-m0plus", "-mthumb"]
++        includes = [
++            here,
++            sdk / "src/rp2040/pico_platform/include",
++            sdk / "src/rp2040/hardware_regs/include",
++            sdk / "src/rp2_common/hardware_divider/include",
++        ]
++        commands = [
++            common + ["-c", "-x", "assembler-with-cpp"]
++            + [flag for path in includes for flag in ["-I", str(path)]]
++            + [str(sdk / inputs[0]), "-o", str(work / "divider.o")],
++            common + ["-c", str(here / "harness.S"), "-o", str(work / "harness.o")],
++            common + ["-nostdlib", "-Wl,--build-id=none", "-T", str(here / "link.ld"),
++                      str(work / "harness.o"), str(work / "divider.o"), "-o", str(work / "fixture.elf")],
++            ["arm-none-eabi-objcopy", "-O", "binary", str(work / "fixture.elf"), str(here / "fixture.bin")],
++        ]
++        for command in commands:
++            subprocess.run(command, check=True)
++        (here / "fixture.bin").chmod(0o644)
++        symbols = subprocess.check_output(["arm-none-eabi-nm", "-n", str(work / "fixture.elf")], text=True)
++        (here / "symbols.txt").write_text(symbols)
++        metadata = {
++            "sdk_commit": SDK_COMMIT,
++            "sdk_input_sha256": hashes,
++            "local_input_sha256": {name: hashlib.sha256((here / name).read_bytes()).hexdigest()
++                                   for name in ["harness.S", "pico.h", "link.ld", "build.py"]},
++            "compiler": subprocess.check_output(["arm-none-eabi-gcc", "--version"], text=True).splitlines()[0],
++            "load_address": "0x20000000",
++            "fixture_sha256": hashlib.sha256((here / "fixture.bin").read_bytes()).hexdigest(),
++            "elf_sha256": hashlib.sha256((work / "fixture.elf").read_bytes()).hexdigest(),
++            "commands": [[item.replace(str(work), "<temporary>").replace(str(sdk), "<sdk>")
++                          .replace(str(here), "<fixture>") for item in command] for command in commands],
++        }
++        (here / "provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/fixture.bin b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/fixture.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..30d218a432d8b0686062184e220360df8c0f5ba0
+GIT binary patch
+literal 1264
+zcmZvaZ)h839LIl8dQH>ZW78%vYja_}Gz&JX!Hy<f>#};6D^EwsEG>*7MUYXiiqI=7
+z64}&+A-;9A(NQ)O`fB2fX=nz6o;_qQ42ayNd!rGTHxfjI^AENYw)i}WX*=|eyXW`&
+zJ>Td1JkRHOIx?PbqOU<5na;CNb)LO7<;-~QAyIrq+<sI8`m~8UfcPu@L>j*_y{6r8
+z`O4Q+ONCgwS+B8oR_oT5r?_G+-0A%4$gBi|V1BJYnA7c|f9c%Pc`cyTcYmt;)pP3k
+z#lWJiztr&QDR-;0|KkIL$OO@7I2h!xN9~YDo}8Ip)mB{>2r3U&nQrpM#L}BfS#4AU
+zTinYNX}UGz1!C)YlG@kLHS}YL^wU(IctQ_D1C<^VVyW+;SW=`kSm*@UqkFBmqRg?{
+z2<UM97mKdhVnjeJc}g9~G8EYbMHqkx?Jq*iUD?;${(TS7|Kn!2@9isfh=nZ}3RrL)
+zn_C3WjH#DY2t%aF{gO7OEt2Ia#>;sIL2Et-@btVOOnU&#I(=XW%<ZZV4^pR}&D>_s
+z%s6#oF2kD~zO0RF0vAzE{adTo4Dw##vUd83szD&~EEmUYR_J?O{(P(HZx{0fqW&&q
+zc^$5#-$Pr(CG)gh1xNBeZRY?b@AD`Toq1c0W>RVwUMn<rkkV9T6ldGMBrD1Tex5Ue
+zcV!=5Q7XNq;I}T;cV}{~u%h&P1k~#5=Y@6_zyH(+jtPZnI^)MGbMA{uE|_g2ZdM6I
+z=7k@n2hw)m0#TK#!ZP8K&JhIPNw*}U4|dRrjkL225u0A_79+2KhX2_4t=9R>72&b8
+zKsE}@5z1(M0AEym*vnlFuFE_yFW*T752;tK;RQnuYa{J0+d3L%-d^GFGCH+KYjCKx
+zTeFKH3}&v1Hz68wbC%!;bd4yCT8O6^3V3Kn+1;es4fu#=jNlKv!&>c~mr*hV*LxRa
+zl*mwynFhxuMS~o0yk5vEhQL<c{C`68l28(k;H>g4SLbuWUAajX$44r6CcS)r`}2yx
+zAB<~`VEPH}1<dp<(y;~^d^$^RQ?kQb8->p(qZLYNU2ZXAF}r{0BnY3%56f>Ig|MyT
+z#>gzW!rzwaebpKqdpXo$24~(;#~Zhh?IWdqSopZ`Dm_t2_(FafAH^&l<(|V6N}OZ0
+v^)y#z-XbthWL-<|?y&h#Vm<x)&R@0eVtx0|M~<8LUboI-=i_F4aK`@tl19xd
+
+literal 0
+HcmV?d00001
+
+diff --git a/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/harness.S b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/harness.S
+new file mode 100644
+index 0000000..220529d
+--- /dev/null
++++ b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/harness.S
+@@ -0,0 +1,29 @@
++.syntax unified
++.cpu cortex-m0plus
++.thumb
++.section .entry,"ax"
++.global _start
++.type _start,%function
++.thumb_func
++_start:
++    // Mailbox: numerator[2], denominator[2], signed selector.
++    ldr r4, =0x20030000
++    ldmia r4!, {r0-r3}
++    ldr r5, [r4]
++    cmp r5, #0
++    beq 1f
++    ldr r5, =__aeabi_ldivmod
++    b 2f
++1:
++    ldr r5, =__aeabi_uldivmod
++2:
++    blx r5
++    // Quotient[2], remainder[2], completion marker.
++    ldr r4, =0x20030020
++    stmia r4!, {r0-r3}
++    movs r0, #1
++    str r0, [r4]
++3:
++    wfe
++    b 3b
++.ltorg
+diff --git a/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/link.ld b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/link.ld
+new file mode 100644
+index 0000000..90d8dd4
+--- /dev/null
++++ b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/link.ld
+@@ -0,0 +1,5 @@
++ENTRY(_start)
++SECTIONS {
++    . = 0x20000000;
++    .text : { *(.entry) *(.text*) }
++}
+diff --git a/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/pico.h b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/pico.h
+new file mode 100644
+index 0000000..218a1d5
+--- /dev/null
++++ b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/pico.h
+@@ -0,0 +1,8 @@
++// Assembly-only SDK configuration. Arithmetic and register definitions come
++// from the pinned Pico SDK, without changes to its divider code or helpers.
++#define WRAPPER_FUNC_NAME(x) x
++#define SECTION_NAME(x) .text
++#define RAM_SECTION_NAME(x) .text
++#define PICO_DIVIDER_DISABLE_INTERRUPTS 0
++#define PICO_DIVIDER_CALL_IDIV0 0
++#define PICO_DIVIDER_CALL_LDIV0 0
+diff --git a/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/provenance.json b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/provenance.json
+new file mode 100644
+index 0000000..40da77b
+--- /dev/null
++++ b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/provenance.json
+@@ -0,0 +1,71 @@
++{
++  "sdk_commit": "a1438dff1d38bd9c65dbd693f0e5db4b9ae91779",
++  "sdk_input_sha256": {
++    "src/rp2_common/pico_divider/divider_hardware.S": "a358fbb27fa953a7ff6da8d953651b2e046eec9a830da52a2d09f2044a25e9e0",
++    "src/rp2_common/hardware_divider/include/hardware/divider_helper.S": "297d41ce0f7cae3812bcd87ad24d179aafb2c48e2dcfca77c684e065972037ed",
++    "src/rp2040/pico_platform/include/pico/asm_helper.S": "9697f96b7f0eaa16c15a249d853733ed2fc2a197288a3a6699c01765acd8b453",
++    "src/rp2040/hardware_regs/include/hardware/platform_defs.h": "acfa7710e0e92b5046bd50c0d4714230bfae5fa8f4e727b369ceb9f648b7a475",
++    "src/rp2040/hardware_regs/include/hardware/regs/addressmap.h": "12c15a5e0f82e4091c5c89d4779a07ae2ab5a78b12eba4e1c2af175722d9f042",
++    "src/rp2040/hardware_regs/include/hardware/regs/sio.h": "362bab775397e8c886a33adc010f76bec24701bf753d17dab1d95accc5a259e5"
++  },
++  "local_input_sha256": {
++    "harness.S": "ca97fb4c5e8fabc94cdc6922a67befca53fd8cca650a49125c93cce9a4548e03",
++    "pico.h": "777fa6a77b884de29cf1b5a896cdce417a0728fb15be7f9a9c6a84e87dc84e54",
++    "link.ld": "a215177ac66baf1ab136862235d871da6ad92c3b2597c7f00c56a0d77f94d776",
++    "build.py": "76d141ea29cae820548ac66d09f201d24cffb14672e2f833041eb25a7f270940"
++  },
++  "compiler": "arm-none-eabi-gcc (15:13.2.rel1-2) 13.2.1 20231009",
++  "load_address": "0x20000000",
++  "fixture_sha256": "241613056b71658b264adffaa87764aace17b628b0cf04aa61fe336de51bcbac",
++  "elf_sha256": "526dbbacef9c874d163c8389bb51e0df4a59972f3d67d272264b715f82700403",
++  "commands": [
++    [
++      "arm-none-eabi-gcc",
++      "-mcpu=cortex-m0plus",
++      "-mthumb",
++      "-c",
++      "-x",
++      "assembler-with-cpp",
++      "-I",
++      "<fixture>",
++      "-I",
++      "<sdk>/src/rp2040/pico_platform/include",
++      "-I",
++      "<sdk>/src/rp2040/hardware_regs/include",
++      "-I",
++      "<sdk>/src/rp2_common/hardware_divider/include",
++      "<sdk>/src/rp2_common/pico_divider/divider_hardware.S",
++      "-o",
++      "<temporary>/divider.o"
++    ],
++    [
++      "arm-none-eabi-gcc",
++      "-mcpu=cortex-m0plus",
++      "-mthumb",
++      "-c",
++      "<fixture>/harness.S",
++      "-o",
++      "<temporary>/harness.o"
++    ],
++    [
++      "arm-none-eabi-gcc",
++      "-mcpu=cortex-m0plus",
++      "-mthumb",
++      "-nostdlib",
++      "-Wl,--build-id=none",
++      "-T",
++      "<fixture>/link.ld",
++      "<temporary>/harness.o",
++      "<temporary>/divider.o",
++      "-o",
++      "<temporary>/fixture.elf"
++    ],
++    [
++      "arm-none-eabi-objcopy",
++      "-O",
++      "binary",
++      "<temporary>/fixture.elf",
++      "<fixture>/fixture.bin"
++    ]
++  ]
++}
+diff --git a/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/symbols.txt b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/symbols.txt
+new file mode 100644
+index 0000000..014bab7
+--- /dev/null
++++ b/crates/rp2040-emu/tests/fixtures/sio_divider_sdk/symbols.txt
+@@ -0,0 +1,42 @@
++00000001 a SIO_DIV_CSR_READY_SHIFT_FOR_CARRY
++00000002 a SIO_DIV_CSR_DIRTY_SHIFT_FOR_CARRY
++20000000 T _start
++20000030 T __aeabi_idiv
++20000030 T __aeabi_idivmod
++20000030 T div_s32s32
++20000030 T divmod_s32s32
++20000038 T divmod_s32s32_unsafe
++20000060 T divmod_s32s32_savestate
++20000078 T __aeabi_uidiv
++20000078 T __aeabi_uidivmod
++20000078 T div_u32u32
++20000078 T divmod_u32u32
++20000080 T divmod_u32u32_unsafe
++200000a4 T divmod_u32u32_savestate
++200000bc T __aeabi_ldivmod
++200000bc T div_s64s64
++200000bc T divmod_s64s64
++200000cc t divmod_s64s64_savestate
++200000ec T __aeabi_uldivmod
++200000ec T div_u64u64
++200000ec T divmod_u64u64
++200000fc T divmod_u64u64_savestate
++2000011c T divmod_s64s64_unsafe
++20000130 t l40_1
++2000013c t l41_1
++20000144 t l42_1
++20000174 t l43_1
++20000180 t l44_1
++2000018a t l45_1
++20000192 t l46_1
++2000019e t l47_1
++200001a0 T divmod_u64u64_unsafe
++200001ca t udiv0
++200001e8 t y64
++20000244 t y64_x32
++20000314 t last0
++2000036e t y64_x48
++20000468 t last1
++20000478 t y64_x64
++200004ce T divmod_s64s64_rem
++200004da T divmod_u64u64_rem
+diff --git a/crates/rp2040-emu/tests/sio_divider.rs b/crates/rp2040-emu/tests/sio_divider.rs
+new file mode 100644
+index 0000000..520101c
+--- /dev/null
++++ b/crates/rp2040-emu/tests/sio_divider.rs
+@@ -0,0 +1,329 @@
++//! Specification-based RP2040 divider regression checks, independent of apps.
++
++use rp2040_emu::bus::sio::Sio;
++use rp2040_emu::core::bus_trait::CoreBus;
++use rp2040_emu::{Bus, Config, CortexM0Plus, Emulator};
++
++const SIO: u32 = 0xd000_0000;
++
++trait Registers {
++    fn read(&mut self, core: usize, offset: u32) -> u32;
++    fn write(&mut self, core: usize, offset: u32, value: u32);
++    fn advance(&mut self, core: usize, cycles: u32);
++}
++
++impl Registers for Sio {
++    fn read(&mut self, core: usize, offset: u32) -> u32 {
++        self.read32(offset, core)
++    }
++    fn write(&mut self, core: usize, offset: u32, value: u32) {
++        self.write32(offset, value, core);
++    }
++    fn advance(&mut self, core: usize, cycles: u32) {
++        self.advance_divider_cycles(core, cycles as u64);
++    }
++}
++
++impl Registers for Bus {
++    fn read(&mut self, core: usize, offset: u32) -> u32 {
++        self.set_active_core(core);
++        self.read32(SIO + offset)
++    }
++    fn write(&mut self, core: usize, offset: u32, value: u32) {
++        self.set_active_core(core);
++        self.write32(SIO + offset, value);
++    }
++    fn advance(&mut self, core: usize, cycles: u32) {
++        self.set_active_core(core);
++        self.advance_core_cycles(cycles);
++    }
++}
++
++fn result(r: &mut impl Registers, core: usize) -> (u32, u32) {
++    let remainder = r.read(core, 0x074);
++    let quotient = r.read(core, 0x070);
++    (quotient, remainder)
++}
++
++fn arithmetic(r: &mut impl Registers) {
++    // Independent host reference uses wider integers, including i32 MIN/-1.
++    let mut random = 0x4178_9523u32;
++    for core in 0..2 {
++        for signed in [false, true] {
++            let (dividend, divisor) = if signed {
++                (0x068, 0x06c)
++            } else {
++                (0x060, 0x064)
++            };
++            for divisor_first in [false, true] {
++                for i in 0..256 {
++                    random = random.wrapping_mul(1664525).wrapping_add(1013904223);
++                    let a = if i == 0 { 0x8000_0000 } else { random };
++                    random = random.wrapping_mul(1664525).wrapping_add(1013904223);
++                    let b = if i == 0 { u32::MAX } else { random | 1 };
++                    if divisor_first {
++                        r.write(core, divisor, b);
++                        r.write(core, dividend, a);
++                    } else {
++                        r.write(core, dividend, a);
++                        r.write(core, divisor, b);
++                    }
++                    assert_eq!(r.read(core, 0x078), 2);
++                    r.advance(core, 7);
++                    assert_eq!(r.read(core, 0x078), 2);
++                    r.advance(core, 1);
++                    assert_eq!(r.read(core, 0x078), 3);
++                    let expected = if signed {
++                        let (a, b) = (a as i32 as i64, b as i32 as i64);
++                        ((a / b) as u32, (a % b) as u32)
++                    } else {
++                        let (a, b) = (a as u64, b as u64);
++                        ((a / b) as u32, (a % b) as u32)
++                    };
++                    assert_eq!(
++                        result(r, core),
++                        expected,
++                        "core={core} signed={signed} divisor_first={divisor_first}"
++                    );
++                    assert_eq!(r.read(core, 0x078), 1);
++                }
++            }
++        }
++    }
++}
++
++fn status_and_restart(r: &mut impl Registers) {
++    for core in 0..2 {
++        r.write(core, 0x064, 3);
++        r.write(core, 0x060, 10);
++        r.advance(core, 7);
++        r.write(core, 0x060, 20); // Restarts, rather than finishing the old divide.
++        r.advance(core, 1);
++        assert_eq!(r.read(core, 0x078), 2);
++        r.advance(core, 7);
++        assert_eq!(r.read(core, 0x074), 2);
++        assert_eq!(r.read(core, 0x074), 2);
++        assert_eq!(r.read(core, 0x078), 3);
++        assert_eq!(r.read(core, 0x070), 6);
++        assert_eq!(r.read(core, 0x078), 1);
++        // Writing the same divisor still restarts the full calculation.
++        r.write(core, 0x060, 20);
++        r.advance(core, 7);
++        r.write(core, 0x064, 3);
++        r.advance(core, 1);
++        assert_eq!(r.read(core, 0x078), 2);
++        r.advance(core, 7);
++        assert_eq!(result(r, core), (6, 2));
++        r.write(core, 0x068, (-10i32) as u32); // Last alias selects signedness.
++        r.advance(core, 8);
++        assert_eq!(result(r, core), ((-3i32) as u32, u32::MAX));
++        r.write(core, 0x060, u32::MAX); // Switch back to unsigned via dividend.
++        r.write(core, 0x064, 65537); // SDK reciprocal divisor.
++        r.write(core, 0x060, u32::MAX); // SDK's divisor-first sequence.
++        r.advance(core, 8);
++        assert_eq!(result(r, core), (65535, 0));
++
++        for offset in [0x070, 0x074] {
++            r.write(core, 0x060, 100);
++            r.write(core, 0x064, 7);
++            r.advance(core, 4);
++            r.write(core, offset, 0xdead_beef); // Context restore cancels calculation.
++            assert_eq!(r.read(core, 0x078), 3);
++            r.advance(core, 32);
++            assert_eq!(r.read(core, offset), 0xdead_beef);
++        }
++        // Completion does not set DIRTY again if QUOTIENT was read while busy.
++        r.write(core, 0x060, 10);
++        r.write(core, 0x064, 3);
++        let _ = r.read(core, 0x070);
++        assert_eq!(r.read(core, 0x078), 0);
++        r.advance(core, 8);
++        assert_eq!(r.read(core, 0x078), 1);
++        assert_eq!(result(r, core), (3, 1));
++
++        for (dividend, value, quotient) in [
++            (0x060, 42, u32::MAX),
++            (0x068, 42, u32::MAX),
++            (0x068, (-42i32) as u32, 1),
++            (0x068, 0, u32::MAX),
++        ] {
++            r.write(core, 0x064, 0);
++            r.write(core, dividend, value);
++            r.advance(core, 8);
++            assert_eq!(result(r, core), (quotient, value));
++        }
++    }
++    r.write(0, 0x060, 100);
++    r.write(0, 0x064, 7);
++    r.write(1, 0x060, 20);
++    r.write(1, 0x064, 3);
++    r.advance(0, 8);
++    assert_eq!(result(r, 0), (14, 2));
++    assert_eq!(
++        r.read(1, 0x078),
++        2,
++        "core 0's local cycles do not advance core 1"
++    );
++    r.advance(1, 8);
++    assert_eq!(result(r, 1), (6, 2));
++
++    // Operand/result context save and restore, as required by SDK IRQ use.
++    r.write(0, 0x060, 100);
++    r.write(0, 0x064, 7);
++    r.advance(0, 8);
++    let saved = [
++        r.read(0, 0x060),
++        r.read(0, 0x064),
++        r.read(0, 0x074),
++        r.read(0, 0x070),
++    ];
++    r.write(0, 0x060, 999);
++    r.write(0, 0x064, 11);
++    r.advance(0, 8);
++    for (offset, value) in [0x060, 0x064, 0x074, 0x070].into_iter().zip(saved) {
++        r.write(0, offset, value);
++    }
++    assert_eq!(r.read(0, 0x078), 3);
++    r.advance(0, 8);
++    assert_eq!(result(r, 0), (14, 2));
++}
++
++#[test]
++fn direct_sio_operand_orders_status_and_context() {
++    let mut sio = Sio::new();
++    arithmetic(&mut sio);
++    status_and_restart(&mut sio);
++    sio.reset();
++    assert_eq!(sio.read32(0x078, 0), 1);
++    assert_eq!(sio.read32(0x078, 1), 1);
++}
++
++#[test]
++fn serial_bus_operand_orders_status_and_context() {
++    let mut bus = Bus::new();
++    arithmetic(&mut bus);
++    status_and_restart(&mut bus);
++}
++
++#[test]
++fn serial_cpu_cycles_advance_divider() {
++    let mut bus = Bus::new();
++    let mut core = CortexM0Plus::new();
++    core.regs.set_pc(0x2000_0000);
++    for offset in (0..32).step_by(2) {
++        bus.write16(0x2000_0000 + offset, 0xbf00); // NOP
++    }
++    bus.write32(SIO + 0x064, 3);
++    bus.write32(SIO + 0x060, 10);
++    for _ in 0..7 {
++        assert_eq!(core.step(&mut bus), 1);
++        assert_eq!(bus.read32(SIO + 0x078), 2);
++    }
++    assert_eq!(core.step(&mut bus), 1);
++    assert_eq!(bus.read32(SIO + 0x078), 3);
++    assert_eq!(bus.read32(SIO + 0x070), 3);
++}
++
++fn exception_cycles_advance_divider(bus: &mut impl CoreBus) {
++    let mut core = CortexM0Plus::new();
++    core.regs.set_pc(0x2000_0000);
++    core.regs.msp = 0x2000_1000;
++    core.regs.r[13] = 0x2000_1000;
++    bus.ppb_mut(0).vtor = 0x2000_0100;
++    bus.write32(0x2000_0100 + 14 * 4, 0x2000_0201); // PendSV vector
++    bus.write32(SIO + 0x064, 3);
++    bus.write32(SIO + 0x060, 10);
++    bus.ppb_mut(0).icsr |= 1 << 28;
++    assert!(core.step(bus) >= 8, "exception entry must consume cycles");
++    assert_eq!(bus.read32(SIO + 0x078), 3);
++    assert_eq!(bus.read32(SIO + 0x070), 3);
++}
++
++#[test]
++fn serial_exception_cycles_advance_divider() {
++    exception_cycles_advance_divider(&mut Bus::new());
++}
++
++#[test]
++fn parked_serial_core_finishes_on_system_clock() {
++    let mut emu = Emulator::new(Config::default());
++    emu.core_mut(0).halt();
++    emu.core_mut(1).halt();
++    emu.mmio_write32(SIO + 0x064, 3);
++    emu.mmio_write32(SIO + 0x060, 10);
++    emu.step_until(8).unwrap();
++    assert_eq!(emu.mmio_read32(SIO + 0x078), 3);
++    assert_eq!(emu.mmio_read32(SIO + 0x070), 3);
++}
++
++#[cfg(all(
++    feature = "threading",
++    target_arch = "x86_64",
++    any(target_os = "windows", target_os = "linux")
++))]
++mod threaded {
++    use super::*;
++    use rp2040_emu::threaded::{SharedState, WorkerBus};
++    use std::sync::Arc;
++    use std::sync::atomic::Ordering;
++
++    struct Workers([WorkerBus; 2]);
++    impl Registers for Workers {
++        fn read(&mut self, core: usize, offset: u32) -> u32 {
++            self.0[core].read32(SIO + offset)
++        }
++        fn write(&mut self, core: usize, offset: u32, value: u32) {
++            self.0[core].write32(SIO + offset, value);
++        }
++        fn advance(&mut self, core: usize, cycles: u32) {
++            self.0[core].advance_core_cycles(cycles);
++        }
++    }
++
++    #[test]
++    fn worker_bus_operand_orders_status_and_context() {
++        let shared = Arc::new(SharedState::new_default());
++        let mut workers = Workers([WorkerBus::new(shared.clone(), 0), WorkerBus::new(shared, 1)]);
++        arithmetic(&mut workers);
++        status_and_restart(&mut workers);
++    }
++
++    #[test]
++    fn worker_cpu_clock_and_parked_clock_do_not_double_count() {
++        let shared = Arc::new(SharedState::new_default());
++        let mut bus = WorkerBus::new(shared.clone(), 0);
++        let mut core = CortexM0Plus::new();
++        core.regs.set_pc(0x2000_0000);
++        for offset in (0..32).step_by(2) {
++            bus.write16(0x2000_0000 + offset, 0xbf00);
++        }
++        bus.write32(SIO + 0x064, 3);
++        bus.write32(SIO + 0x060, 10);
++        for _ in 0..7 {
++            assert_eq!(core.step(&mut bus), 1);
++        }
++        shared.master_cycle.store(7, Ordering::Release);
++        assert_eq!(
++            bus.read32(SIO + 0x078),
++            2,
++            "scheduler cycles must not be counted twice"
++        );
++        assert_eq!(core.step(&mut bus), 1);
++        assert_eq!(bus.read32(SIO + 0x078), 3);
++        assert_eq!(bus.read32(SIO + 0x070), 3);
++        shared.master_cycle.store(100, Ordering::Release);
++        bus.write32(SIO + 0x060, 20);
++        assert_eq!(bus.read32(SIO + 0x078), 2);
++        shared.master_cycle.store(107, Ordering::Release);
++        assert_eq!(bus.read32(SIO + 0x078), 2);
++        shared.master_cycle.store(108, Ordering::Release);
++        assert_eq!(bus.read32(SIO + 0x078), 3);
++        assert_eq!(bus.read32(SIO + 0x070), 6);
++    }
++
++    #[test]
++    fn worker_exception_cycles_advance_divider() {
++        let shared = Arc::new(SharedState::new_default());
++        exception_cycles_advance_divider(&mut WorkerBus::new(shared, 0));
++    }
++}

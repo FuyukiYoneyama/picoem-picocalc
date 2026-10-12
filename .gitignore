@@ -6,6 +6,9 @@ venv/
 env/
 *.tmp
 *.log
+# Retained divider diagnostics and regression output are review artifacts.
+!docs/evidence/sio-divider-review-20261012/*.log
+!docs/evidence/sio-divider-fix-20261012/*.log
 *.bak
 # Claude Code session runtime state (scheduled_tasks.lock etc.)
 /.claude/

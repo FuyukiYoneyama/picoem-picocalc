@@ -43,6 +43,7 @@
 
 use std::sync::Arc;
 
+use crate::bus::divider::Divider;
 use crate::bus::ppb::Ppb;
 use crate::bus::systick::SysTick;
 use crate::core::Nvic;
@@ -109,7 +110,7 @@ pub struct WorkerBus {
     active_pc: u32,
     /// Per-worker integer divider snapshot (HLD §6.4 point 4 — divider
     /// is per-core-local; no cross-core coherency).
-    divider: DividerLocal,
+    divider: Divider,
     /// Per-worker interpolator snapshot (HLD §6.4 point 5 — interp
     /// cross-core coherency is dropped).
     interp: [u32; 32],
@@ -130,6 +131,9 @@ impl WorkerBus {
         debug_assert!(core_id < 2, "core_id must be 0 or 1");
         let mut ppb = [Ppb::new(), Ppb::new()];
         ppb[core_id] = shared.take_initial_ppb(core_id);
+        let divider = *shared.dividers[core_id]
+            .lock()
+            .expect("divider snapshot poisoned");
         Self {
             core_id,
             shared,
@@ -139,9 +143,16 @@ impl WorkerBus {
             bus_fault: false,
             bus_fault_addr: 0,
             active_pc: 0,
-            divider: DividerLocal::default(),
+            divider,
             interp: [0u32; 32],
         }
+    }
+
+    /// Preserve operands, status and a pending calculation across worker runs.
+    pub(crate) fn save_divider_state(&self) {
+        *self.shared.dividers[self.core_id]
+            .lock()
+            .expect("divider snapshot poisoned") = self.divider;
     }
 
     /// Drain the cross-core IRQ pending mask published by the
@@ -290,17 +301,10 @@ impl WorkerBus {
                     }
                 }
             }
-            // Integer divider reads (per-core local).
-            0x060 | 0x068 => self.divider.dividend,
-            0x064 | 0x06C => self.divider.divisor,
-            0x070 => self.divider.quotient,
-            0x074 => self.divider.remainder,
-            0x078 => {
-                // CSR: bit 0 READY always 1; bit 1 DIRTY if results
-                // are unread. Same shape as serial `Sio::read32`.
-                let ready = 1u32;
-                let dirty = if self.divider.dirty { 2 } else { 0 };
-                ready | dirty
+            // Both models use the same per-core divider semantics.
+            0x060..=0x078 => {
+                self.divider.sync_cycle(self.master_cycle());
+                self.divider.read32(offset)
             }
             // Interpolators 0x080..0x0FC — per-worker local.
             0x080..=0x0FC => {
@@ -417,31 +421,9 @@ impl WorkerBus {
                 }
             }
             // Divider writes — per-core local.
-            0x060 => {
-                self.divider.dividend = val;
-                self.divider.signed = false;
-            }
-            0x064 => {
-                self.divider.divisor = val;
-                self.divider.signed = false;
-                self.divider.compute();
-            }
-            0x068 => {
-                self.divider.dividend = val;
-                self.divider.signed = true;
-            }
-            0x06C => {
-                self.divider.divisor = val;
-                self.divider.signed = true;
-                self.divider.compute();
-            }
-            0x070 => {
-                self.divider.quotient = val;
-                self.divider.dirty = true;
-            }
-            0x074 => {
-                self.divider.remainder = val;
-                self.divider.dirty = true;
+            0x060..=0x078 => {
+                self.divider.sync_cycle(self.master_cycle());
+                self.divider.write32(offset, val);
             }
             // Interpolators — plain storage per-worker.
             0x080..=0x0FC => {
@@ -983,52 +965,6 @@ impl WorkerBus {
 }
 
 // =======================================================================
-// DividerLocal — per-worker snapshot of the SIO integer divider.
-// =======================================================================
-//
-// HLD §6.4 point 4: divider is per-core-local, no cross-core coherency.
-// The SIO divider on real silicon is per-core hardware; matching that
-// shape in the threaded path avoids serializing divider writes on a
-// shared mutex. Encoded inline here because `picoem_common::Divider`
-// is carried on the serial `Sio` type along with its own accounting
-// that only the serial path needs.
-
-#[derive(Debug, Clone, Copy, Default)]
-struct DividerLocal {
-    dividend: u32,
-    divisor: u32,
-    quotient: u32,
-    remainder: u32,
-    signed: bool,
-    dirty: bool,
-}
-
-impl DividerLocal {
-    fn compute(&mut self) {
-        if self.divisor == 0 {
-            // Match serial divide-by-zero semantics in
-            // `bus::sio::Sio::compute_division`.
-            if self.signed {
-                let a = self.dividend as i32;
-                self.quotient = if a < 0 { 1u32 } else { (-1i32) as u32 };
-            } else {
-                self.quotient = 0xFFFF_FFFF;
-            }
-            self.remainder = self.dividend;
-        } else if self.signed {
-            let a = self.dividend as i32;
-            let b = self.divisor as i32;
-            self.quotient = a.wrapping_div(b) as u32;
-            self.remainder = a.wrapping_rem(b) as u32;
-        } else {
-            self.quotient = self.dividend.wrapping_div(self.divisor);
-            self.remainder = self.dividend.wrapping_rem(self.divisor);
-        }
-        self.dirty = true;
-    }
-}
-
-// =======================================================================
 // SYSINFO stub — matches serial `Bus::sysinfo_read`.
 // =======================================================================
 
@@ -1045,6 +981,11 @@ fn sysinfo_read(offset: u32) -> u32 {
 // =======================================================================
 
 impl CoreBus for WorkerBus {
+    #[inline(always)]
+    fn advance_core_cycles(&mut self, cycles: u32) {
+        self.divider.advance_cycles(cycles as u64);
+    }
+
     // --- Memory access ------------------------------------------------
     //
     // Byte / halfword accesses go through `SharedMemory`'s atomic CAS
@@ -1401,6 +1342,7 @@ mod tests {
         // Unsigned 100 / 7 = 14 rem 2.
         b0.write32(0xD000_0060, 100); // DIV_UDIVIDEND
         b0.write32(0xD000_0064, 7); // DIV_UDIVISOR
+        b0.advance_core_cycles(8);
         assert_eq!(b0.read32(0xD000_0070), 14); // QUOTIENT
         assert_eq!(b0.read32(0xD000_0074), 2); // REMAINDER
     }
@@ -1421,6 +1363,7 @@ mod tests {
         let (_shared, mut b0) = fresh_worker(0);
         b0.write32(0xD000_0068, (-42i32) as u32); // SDIVIDEND
         b0.write32(0xD000_006C, 0); // SDIVISOR
+        b0.advance_core_cycles(8);
         assert_eq!(b0.read32(0xD000_0070), 1); // quotient = 1 (matches serial)
         assert_eq!(b0.read32(0xD000_0074), (-42i32) as u32);
     }
@@ -1912,19 +1855,25 @@ mod tests {
         assert_eq!(b0.read32(0xD000_005C), 1 << 7);
     }
 
-    /// DIV_CSR at 0x078: bit 0 (READY) is always 1; bit 1 (DIRTY) tracks
-    /// whether results are unread/clean.
+    /// DIV_CSR tracks calculation progress and QUOTIENT consumption.
     #[test]
     fn div_csr_reports_ready_and_dirty_flags() {
         let (_shared, mut b0) = fresh_worker(0);
         // Fresh divider — not dirty, only READY set.
         assert_eq!(b0.read32(0xD000_0078), 0x1);
-        // Trigger a divide: divisor write computes and sets dirty.
+        // Trigger a divide: busy and dirty until eight cycles elapse.
         b0.write32(0xD000_0060, 10);
         b0.write32(0xD000_0064, 3);
         let csr = b0.read32(0xD000_0078);
-        assert_eq!(csr & 0x1, 0x1, "READY must remain 1");
-        assert_eq!(csr & 0x2, 0x2, "DIRTY must be set after compute");
+        assert_eq!(csr, 2, "busy and dirty after operand write");
+        b0.advance_core_cycles(7);
+        assert_eq!(b0.read32(0xD000_0078), 2);
+        b0.advance_core_cycles(1);
+        assert_eq!(b0.read32(0xD000_0078), 3);
+        assert_eq!(b0.read32(0xD000_0074), 1);
+        assert_eq!(b0.read32(0xD000_0078), 3);
+        assert_eq!(b0.read32(0xD000_0070), 3);
+        assert_eq!(b0.read32(0xD000_0078), 1);
     }
 
     /// DIV_UDIVIDEND/DIVISOR alias reads (0x068/0x06C signed pair) read
@@ -1947,6 +1896,7 @@ mod tests {
         let (_shared, mut b0) = fresh_worker(0);
         b0.write32(0xD000_0060, 12345); // UDIVIDEND
         b0.write32(0xD000_0064, 0); // UDIVISOR — triggers div-by-zero
+        b0.advance_core_cycles(8);
         assert_eq!(b0.read32(0xD000_0070), 0xFFFF_FFFF);
         assert_eq!(b0.read32(0xD000_0074), 12345);
     }
@@ -1958,6 +1908,7 @@ mod tests {
         let (_shared, mut b0) = fresh_worker(0);
         b0.write32(0xD000_0068, 99); // SDIVIDEND positive
         b0.write32(0xD000_006C, 0); // SDIVISOR
+        b0.advance_core_cycles(8);
         assert_eq!(b0.read32(0xD000_0070), (-1i32) as u32);
         assert_eq!(b0.read32(0xD000_0074), 99);
     }
@@ -1969,9 +1920,11 @@ mod tests {
         let (_shared, mut b0) = fresh_worker(0);
         b0.write32(0xD000_0070, 0xCAFE);
         b0.write32(0xD000_0074, 0xBABE);
-        assert_eq!(b0.read32(0xD000_0070), 0xCAFE);
+        assert_eq!(b0.read32(0xD000_0078), 3);
         assert_eq!(b0.read32(0xD000_0074), 0xBABE);
-        assert_eq!(b0.read32(0xD000_0078) & 0x2, 0x2);
+        assert_eq!(b0.read32(0xD000_0078), 3);
+        assert_eq!(b0.read32(0xD000_0070), 0xCAFE);
+        assert_eq!(b0.read32(0xD000_0078), 1);
     }
 
     /// SIO unmapped offset reads return zero (the wildcard arm).

@@ -7170,24 +7170,22 @@ mod stage7_sio_coverage {
 
     // --- Divider result-read dirty transitions ----------------------------
 
-    /// `divider_result_read` must clear the `dirty` flag only after two
-    /// reads (lines 559-564 drain branches). Exercises both the "first
-    /// read leaves dirty" and "second read clears dirty" arms, plus the
-    /// not-dirty path on a third read.
+    /// Only QUOTIENT reads clear DIRTY; repeated REMAINDER reads preserve it.
     #[test]
-    fn divider_dirty_flag_clears_after_two_reads() {
+    fn divider_dirty_flag_clears_on_quotient_read() {
         let mut sio = Sio::new();
         sio.write32(0x060, 100, 0);
         sio.write32(0x064, 7, 0);
-        // CSR (0x078): ready|dirty → 3.
-        assert_eq!(sio.read32(0x078, 0) & 0x3, 0x3);
-        let _ = sio.read32(0x070, 0); // first quotient read → reads_pending=1
-        let _ = sio.read32(0x074, 0); // second result read → clears dirty
-        // CSR: ready only.
-        assert_eq!(sio.read32(0x078, 0) & 0x3, 0x1);
-        // Third read now hits the `!dirty` branch (line 565 false arm).
+        assert_eq!(sio.read32(0x078, 0), 2); // busy + dirty
+        sio.advance_divider_cycles(0, 8);
+        assert_eq!(sio.read32(0x078, 0), 3);
+        assert_eq!(sio.read32(0x074, 0), 2);
+        assert_eq!(sio.read32(0x074, 0), 2);
+        assert_eq!(sio.read32(0x078, 0), 3);
+        assert_eq!(sio.read32(0x070, 0), 14);
+        assert_eq!(sio.read32(0x078, 0), 1);
         let _ = sio.read32(0x070, 0);
-        assert_eq!(sio.read32(0x078, 0) & 0x3, 0x1);
+        assert_eq!(sio.read32(0x078, 0), 1);
     }
 
     /// Direct write to result register (0x070/0x074) sets dirty (lines
@@ -7204,12 +7202,13 @@ mod stage7_sio_coverage {
     }
 
     /// Unsigned divide-by-zero produces 0xFFFFFFFF / dividend
-    /// (compute_division `d.signed == false` branch at line 596).
+    /// after the eight-cycle calculation.
     #[test]
     fn divider_unsigned_divide_by_zero() {
         let mut sio = Sio::new();
         sio.write32(0x060, 42, 0);
         sio.write32(0x064, 0, 0);
+        sio.advance_divider_cycles(0, 8);
         assert_eq!(sio.read32(0x070, 0), 0xFFFF_FFFF);
         assert_eq!(sio.read32(0x074, 0), 42);
     }
@@ -7221,6 +7220,7 @@ mod stage7_sio_coverage {
         let mut sio = Sio::new();
         sio.write32(0x068, 42, 0);
         sio.write32(0x06C, 0, 0);
+        sio.advance_divider_cycles(0, 8);
         assert_eq!(sio.read32(0x070, 0), (-1i32) as u32);
         assert_eq!(sio.read32(0x074, 0), 42);
     }
@@ -7231,15 +7231,10 @@ mod stage7_sio_coverage {
         let mut sio = Sio::new();
         sio.write32(0x068, (-20i32) as u32, 0);
         sio.write32(0x06C, 3, 0);
+        sio.advance_divider_cycles(0, 8);
         assert_eq!(sio.read32(0x070, 0) as i32, -6);
         assert_eq!(sio.read32(0x074, 0) as i32, -2);
     }
-
-    // `divider_result_read` default arm for an offset that isn't 0x070 or
-    // 0x074 (unreachable via public read32 dispatch, but the `_ => return
-    // 0` arm is kept as a defensive fallback).
-    // unreachable: inner match at line 554 cannot be reached — public
-    // `read32` dispatcher only routes 0x070/0x074 here. Not tested.
 
     // --- Interp compute (INTERP0 path — covers BLEND-disabled default) ----
 
@@ -7613,6 +7608,8 @@ mod stage7_sio_coverage {
         sio.write32(0x064, 10, 0);
         sio.write32(0x060, 50, 1);
         sio.write32(0x064, 5, 1);
+        sio.advance_divider_cycles(0, 8);
+        sio.advance_divider_cycles(1, 8);
         assert_eq!(sio.read32(0x070, 0), 10);
         assert_eq!(sio.read32(0x070, 1), 10);
         assert_eq!(sio.read32(0x074, 0), 0);
@@ -10448,19 +10445,19 @@ mod stage3_bus_residue {
         assert_eq!(st_after & 0x8, 0, "ROE cleared");
     }
 
-    /// DIV_CSR (0x078) ready/dirty after a write — combination check.
+    /// DIV_CSR tracks eight-cycle completion and QUOTIENT consumption.
     #[test]
-    fn div_csr_dirty_after_unsigned_write_clears_after_two_reads() {
+    fn div_csr_tracks_completion_and_quotient_consumption() {
         let mut bus = Bus::new();
         bus.write32(SIO_BASE + 0x060, 100);
         bus.write32(SIO_BASE + 0x064, 7);
-        let csr = bus.read32(SIO_BASE + 0x078);
-        assert_eq!(csr & 0x3, 0x3, "ready|dirty after divisor write");
-        // First and second result reads.
-        let _ = bus.read32(SIO_BASE + 0x070);
-        let _ = bus.read32(SIO_BASE + 0x074);
-        let csr2 = bus.read32(SIO_BASE + 0x078);
-        assert_eq!(csr2 & 0x3, 0x1, "dirty cleared after pair of reads");
+        assert_eq!(bus.read32(SIO_BASE + 0x078), 2, "busy|dirty after write");
+        bus.sio.advance_divider_cycles(0, 8);
+        assert_eq!(bus.read32(SIO_BASE + 0x078), 3);
+        assert_eq!(bus.read32(SIO_BASE + 0x074), 2);
+        assert_eq!(bus.read32(SIO_BASE + 0x078), 3, "remainder keeps dirty");
+        assert_eq!(bus.read32(SIO_BASE + 0x070), 14);
+        assert_eq!(bus.read32(SIO_BASE + 0x078), 1, "quotient clears dirty");
     }
 
     /// INTERP base/peek/pop register access via Bus.
@@ -11836,15 +11833,21 @@ mod stage4_core_residue_v2 {
     #[test]
     fn is_wide_rejects_m33_only_prefixes() {
         // 0b11101 (0xE800..0xEFFF) — Thumb-32 on M33 only.
-        for hw0 in [0xE800u16, 0xE900, 0xEA00, 0xEB00, 0xEC00, 0xED00, 0xEE00, 0xEF00] {
+        for hw0 in [
+            0xE800u16, 0xE900, 0xEA00, 0xEB00, 0xEC00, 0xED00, 0xEE00, 0xEF00,
+        ] {
             assert!(!is_wide(hw0), "{hw0:#06x} is M33-only wide");
         }
         // 0b11111 (0xF800..0xFFFF) — Thumb-32 on M33 only.
-        for hw0 in [0xF800u16, 0xF900, 0xFA00, 0xFB00, 0xFC00, 0xFD00, 0xFE00, 0xFF00] {
+        for hw0 in [
+            0xF800u16, 0xF900, 0xFA00, 0xFB00, 0xFC00, 0xFD00, 0xFE00, 0xFF00,
+        ] {
             assert!(!is_wide(hw0), "{hw0:#06x} is M33-only wide");
         }
         // 0b11110 IS the M0+ wide prefix.
-        for hw0 in [0xF000u16, 0xF100, 0xF200, 0xF300, 0xF400, 0xF500, 0xF600, 0xF700] {
+        for hw0 in [
+            0xF000u16, 0xF100, 0xF200, 0xF300, 0xF400, 0xF500, 0xF600, 0xF700,
+        ] {
             assert!(is_wide(hw0), "{hw0:#06x} is the M0+ wide prefix");
         }
     }
@@ -11940,8 +11943,7 @@ mod stage4_core_residue_v2 {
         cpu.decode_cache[11].tag = 0x2000_0016; // SRAM
         // BULK alongside other region bits — the BULK guard must win.
         cpu.invalidate_decode_cache_regions(
-            crate::bus::invalidation_regions::BULK
-                | crate::bus::invalidation_regions::ROM,
+            crate::bus::invalidation_regions::BULK | crate::bus::invalidation_regions::ROM,
         );
         for slot in cpu.decode_cache.iter() {
             assert_eq!(slot.tag, u32::MAX, "BULK clears every slot");
@@ -11977,8 +11979,7 @@ mod stage4_core_residue_v2 {
         cpu.decode_cache[2].tag = 0x0000_1004; // ROM
         cpu.decode_cache[4].tag = 0x1000_2008; // XIP
         cpu.decode_cache[6].tag = 0x2000_300C; // SRAM
-        let regions = crate::bus::invalidation_regions::ROM
-            | crate::bus::invalidation_regions::XIP;
+        let regions = crate::bus::invalidation_regions::ROM | crate::bus::invalidation_regions::XIP;
         cpu.invalidate_decode_cache_regions(regions);
         assert_eq!(cpu.decode_cache[2].tag, u32::MAX);
         assert_eq!(cpu.decode_cache[4].tag, u32::MAX);
@@ -12632,7 +12633,9 @@ mod stage4_lib_residue_v2 {
     fn load_image_unknown_top_nibble_drops_silently() {
         let mut emu = Emulator::new(Config::default());
         let data = [0xDEu8, 0xAD, 0xBE, 0xEF];
-        for top in [0x3u32, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF] {
+        for top in [
+            0x3u32, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF,
+        ] {
             emu.load_image(top << 28, &data);
         }
         // ROM bytes untouched.
@@ -13091,8 +13094,7 @@ mod stage6_periph_long_tail {
     mod uart {
         use super::tree;
         use crate::peripherals::uart::{
-            UART_INT_TX, UARTCR, UARTDR, UARTIBRD, UARTIFLS, UARTIMSC, UARTLCR_H, UARTRIS,
-            UartRegs,
+            UART_INT_TX, UARTCR, UARTDR, UARTIBRD, UARTIFLS, UARTIMSC, UARTLCR_H, UARTRIS, UartRegs,
         };
 
         const IRQ: u32 = 20;
@@ -13147,7 +13149,11 @@ mod stage6_periph_long_tail {
             }
             // Drain everything. lvl=0 <= thresh=2 → TXIS latches.
             u.tick(100, &tree(), &mut irqs);
-            assert_ne!(u.read32(UARTRIS) & UART_INT_TX, 0, "TXIS must latch on drain");
+            assert_ne!(
+                u.read32(UARTRIS) & UART_INT_TX,
+                0,
+                "TXIS must latch on drain"
+            );
             assert_ne!(irqs & (1u32 << IRQ), 0, "NVIC fire on TXIS");
         }
 
@@ -13379,9 +13385,7 @@ mod stage6_periph_long_tail {
 
     mod pwm {
         use super::tree;
-        use crate::peripherals::pwm::{
-            CSR_EN, EN, INTR, PWM_SLICE_COUNT, PwmRegs, SLICE_STRIDE,
-        };
+        use crate::peripherals::pwm::{CSR_EN, EN, INTR, PWM_SLICE_COUNT, PwmRegs, SLICE_STRIDE};
 
         const IRQ: u32 = 4;
 
@@ -13848,13 +13852,13 @@ mod stage8_lib_residue {
 
 #[cfg(test)]
 mod stage9_residue {
-    use crate::{Config, Emulator};
     #[cfg(all(
         feature = "threading",
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
     use crate::EmulatorBuilder;
+    use crate::{Config, Emulator};
 
     // ============================================================
     // lib.rs §1
@@ -14621,7 +14625,10 @@ mod stage10_lib_precision {
             || emu.bus.nvics[0].is_pending(8)
             || emu.bus.nvics[0].is_pending(9)
             || emu.bus.nvics[0].is_pending(10);
-        assert!(routed, "PIO INT0/INT1 INTF should route to NVIC IRQ pending");
+        assert!(
+            routed,
+            "PIO INT0/INT1 INTF should route to NVIC IRQ pending"
+        );
     }
 
     // ------------------- line 886: PIO0 SM0 max-PC tracker advance -------------------

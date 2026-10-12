@@ -187,6 +187,9 @@ impl std::error::Error for EmulatorError {}
 mod tests;
 
 #[cfg(test)]
+mod divider_tests;
+
+#[cfg(test)]
 mod pio_tests;
 
 pub use self::bus::Bus;
@@ -791,6 +794,7 @@ impl Emulator {
         {
             let c0 = if !self.cores[0].is_halted() && !self.bus.wfe_waiting[0] {
                 self.bus.set_active_core(0);
+                self.bus.sio.sync_divider_cycle(0, self.clock.cycles);
                 let c = self.cores[0].step(&mut self.bus) as u64;
                 // Drain decode-cache invalidations recorded by writes
                 // during this step into the core that just ran.
@@ -807,6 +811,7 @@ impl Emulator {
 
             let c1 = if !self.cores[1].is_halted() && !self.bus.wfe_waiting[1] {
                 self.bus.set_active_core(1);
+                self.bus.sio.sync_divider_cycle(1, self.clock.cycles);
                 self.bus.begin_core1_step();
                 let c = self.cores[1].step(&mut self.bus) as u64;
                 Self::drain_cache_invalidations(&mut self.bus, &mut self.cores);

@@ -288,6 +288,9 @@ impl ThreadedEmulator {
             poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panic_info: Arc::new(std::sync::Mutex::new(None)),
             initial_ppb,
+            dividers: std::array::from_fn(|core| {
+                Arc::new(std::sync::Mutex::new(bus.sio.divider_snapshot(core)))
+            }),
         });
 
         Self {
@@ -583,6 +586,7 @@ fn core_worker_body(
             return core;
         }
     }
+    bus.save_divider_state();
     core
 }
 
@@ -756,6 +760,37 @@ fn apply_pio_command(block: &mut PioBlock, cmd: PioCommand) {
 mod tests {
     use super::*;
     use crate::{Config, EmulatorBuilder};
+
+    #[test]
+    fn sdk_64_bit_division_threaded_both_cores_and_quantum_sizes() {
+        use crate::core::bus_trait::CoreBus;
+        use crate::divider_tests::{CASES, OUTPUT, check, seed};
+        use crate::threaded::WorkerBus;
+
+        for quantum in [1, 128] {
+            for core in 0..2 {
+                for &case in CASES {
+                    let mut threaded = ThreadedEmulator::from_emulator(seed(core, case, quantum));
+                    // Multiple worker invocations must retain divider state.
+                    // Stop after at most 8192 scheduler cycles.
+                    for _ in 0..32 {
+                        threaded
+                            .run_quanta_checked(256 / u64::from(quantum))
+                            .unwrap();
+                        if threaded.shared.memory.read32(OUTPUT + 16) == 1 {
+                            break;
+                        }
+                    }
+                    check(|addr| threaded.shared.memory.read32(addr), case);
+                    let mut bus = WorkerBus::new(threaded.shared.clone(), core);
+                    assert_eq!(bus.read32(0xd000_0060), 77);
+                    assert_eq!(bus.read32(0xd000_0064), 11);
+                    assert_eq!(bus.read32(0xd000_0074), 0);
+                    assert_eq!(bus.read32(0xd000_0070), 7);
+                }
+            }
+        }
+    }
 
     #[test]
     fn from_emulator_builds_threaded() {
@@ -1485,10 +1520,7 @@ mod tests {
         assert_eq!(r0, 1u32 << 0);
         assert_eq!(r5, 1u32 << 5);
         assert_eq!(r31, 1u32 << 31);
-        assert_eq!(
-            emu.bus.sio.spinlock_bits(),
-            (1 << 0) | (1 << 5) | (1 << 31)
-        );
+        assert_eq!(emu.bus.sio.spinlock_bits(), (1 << 0) | (1 << 5) | (1 << 31));
         emu.cores[0].halt();
         emu.cores[1].halt();
 

@@ -1,0 +1,4 @@
+    Checking picoem-common v0.2.2 (/home/fuyuki/pico_dvl/codex/picoem-picocalc/crates/picoem-common)
+    Checking picoem-devices v0.1.3 (/home/fuyuki/pico_dvl/codex/picoem-picocalc/crates/picoem-devices)
+    Checking rp2040-emu v0.1.5 (/home/fuyuki/pico_dvl/codex/picoem-picocalc/crates/rp2040-emu)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.38s

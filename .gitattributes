@@ -1,0 +1,7 @@
+# Preserve exact bytes used by the retained evidence checksum manifests.
+docs/evidence/sio-divider-review-20261012/** -text
+docs/evidence/sio-divider-fix-20261012/** -text
+# Raw logs and a replay patch can contain intentional whitespace.
+docs/evidence/sio-divider-review-20261012/*.log -whitespace
+docs/evidence/sio-divider-fix-20261012/*.log -whitespace
+docs/evidence/sio-divider-fix-20261012/source.patch -whitespace

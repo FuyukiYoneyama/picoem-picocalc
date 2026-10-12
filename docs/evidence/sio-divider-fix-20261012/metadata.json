@@ -1,0 +1,122 @@
+{
+  "recorded_at": "2026-10-12T10:59:45.584882+09:00",
+  "kind": "emulator_correction_regression",
+  "base_backend_commit": "121d649930d625924fa7608a3b72ed622098f522",
+  "backend_dirty": true,
+  "committed": false,
+  "pushed": false,
+  "source_patch_scope": "crates/rp2040-emu (tracked changes and new files)",
+  "source_sha256": {
+    "crates/rp2040-emu/Cargo.toml": "a2163dedb18c1414649d9ed8d81a89d868e842b1e8730cabdf56f67add4e93f2",
+    "crates/rp2040-emu/README.md": "64d0158965f4bc9192b1a412ca1463b313db6f49962c78f8b25e99070b7c6c16",
+    "crates/rp2040-emu/src/behavior_trace.rs": "3a7684c4154414187305fc017af1b82b60bfa7ca15032651459a9b598850fed4",
+    "crates/rp2040-emu/src/bus/clocks.rs": "762f98a94e8e69b40f24e1d4475f0851761eb77acfa1ea2a511a62ceeb5f0adf",
+    "crates/rp2040-emu/src/bus/divider.rs": "bd56c939d672dd891e29475e97b2b2b24db98ac6cee724e38f3134950f5bc82e",
+    "crates/rp2040-emu/src/bus/io_bank0.rs": "77ae7476970ea13978e5179a290ed200bbf019f235eeed420b3246dc0e77a029",
+    "crates/rp2040-emu/src/bus/mod.rs": "e435696e525f88316177f757ad08c76a727326eeda83df35bb8159c595b97f6e",
+    "crates/rp2040-emu/src/bus/pads_bank0.rs": "956f5ad5dfca3ab4e0bdeea24bcc5ff0e774bb4293cf121f0f4bedd8f9ebdcda",
+    "crates/rp2040-emu/src/bus/peripheral_dispatch.rs": "cfbff56a298746340c60146b242ace32f96a01c29a2560f0878512ff31df9185",
+    "crates/rp2040-emu/src/bus/ppb.rs": "d66545160ae060bed67dea157481c3002dee6699dbe7e93325de20e08495066a",
+    "crates/rp2040-emu/src/bus/resets.rs": "4bc7c58d7771c1740d33c451ec8799cfcc27ce44ad504c5bea189c2b296760f8",
+    "crates/rp2040-emu/src/bus/sio.rs": "97711dcee3feb081773345947d5ea8aa18f622770355dddb27bb242491e7a5e7",
+    "crates/rp2040-emu/src/bus/ssi_flash.rs": "a108273564bd3b5784262a5242e838ee99b626cc14cde99938d95863e3f5ddbf",
+    "crates/rp2040-emu/src/bus/systick.rs": "a3e3bc06c628362d22cca67a5e7ced58097bdf0e8c7de32648a14ea837636e58",
+    "crates/rp2040-emu/src/core/bus_trait.rs": "e62a0f83ee2ad5b797739d1016e8d692e68323f0d6e75a0785a9599931dee774",
+    "crates/rp2040-emu/src/core/decode.rs": "cfed938f5a9f6efb26f3226100e8c6825da9e7f56959777f78cdc9c698a769fb",
+    "crates/rp2040-emu/src/core/exceptions.rs": "06e89b9dbfdeb4c318d8e8ea445b41cf04faf77f3d67d264965bd386cff01794",
+    "crates/rp2040-emu/src/core/execute.rs": "2f2be4405c7628ac782074c0b4bb1be9fe8f8b5e4d0884c6d0761542d29e27c5",
+    "crates/rp2040-emu/src/core/execute_wide.rs": "fb14b9e241a572bdf37c2c8f5f3ff686dab0608399d47e6773ddc23e4396014d",
+    "crates/rp2040-emu/src/core/mod.rs": "a2b84517fe787abe943470664e7d9821d1919225529c79ef9a5f2c5533986d93",
+    "crates/rp2040-emu/src/core/nvic.rs": "6d9de67910c6379903ddbe37124f09b37ba6b6f030f0a95d7663eb9f5d864e66",
+    "crates/rp2040-emu/src/core/registers.rs": "d6a8ce10e5029dfe1658a00129cd04ced47168cb58cb67716caf700889783c95",
+    "crates/rp2040-emu/src/divider_tests.rs": "925f2d05139350fb4c00e9d03141d63ce686b24c407ca8d5f3c943d2a36644dc",
+    "crates/rp2040-emu/src/dma.rs": "cf0c9d3e4539f07a883b8f440d827f7edfad2a886315b0495e444e1f2b01d675",
+    "crates/rp2040-emu/src/dreq.rs": "94fc11b19f092354c6851fff2927a97e27233c660aecebeb095e438a338c1ec1",
+    "crates/rp2040-emu/src/idle_profile.rs": "4be66c8148e734d25e2b6680e1f957540876485321d5c80242e28679fd1bc8d5",
+    "crates/rp2040-emu/src/irq.rs": "258e44a749e31737dc36d34a71174be2e19b7a79dab3cdfee05e955f0f19b245",
+    "crates/rp2040-emu/src/lib.rs": "4ddfd4d66233a5cdb60f13ac36e5fd4d98299285cfba83ffab080adf12e44d4b",
+    "crates/rp2040-emu/src/memory.rs": "e12116c40dfe38b1d01d708a6d75d7014d115b155ef569b2ffbc55f4a26d66ed",
+    "crates/rp2040-emu/src/peripherals/adc.rs": "bbe023823de797bd7692f519e992be468381989fbaaa88e71b415fd22269f6ad",
+    "crates/rp2040-emu/src/peripherals/i2c.rs": "8d4bab6f3257f06a86da2fbaa24efd261ba9ab5c56b48d643c031378d6a3c50c",
+    "crates/rp2040-emu/src/peripherals/mod.rs": "686e18362fb7f62a928e1b6784fcf6947dc5c0688ba5ea6fac616c1bb3168001",
+    "crates/rp2040-emu/src/peripherals/psram.rs": "58fba282651fb53f92b9a131964cbe5f9365def6be1afa0c603bd18d230ebf14",
+    "crates/rp2040-emu/src/peripherals/pwm.rs": "f1d08d34364817a6d627e7314c6d185e10640d6455852377344f98352f98883d",
+    "crates/rp2040-emu/src/peripherals/spi.rs": "26c5c3dcf86ea4bf37e43af828da2c77c39e1d39e045ab5c3edc327db09f1923",
+    "crates/rp2040-emu/src/peripherals/timer.rs": "20445e2ab1cac830fe86e93f844fac55176f83004ac9b98425aa018c14462034",
+    "crates/rp2040-emu/src/peripherals/uart.rs": "ba9391cf3a1e6722462b702da3b435673cb80b4ec25bafe61918bf9e33af45d6",
+    "crates/rp2040-emu/src/peripherals/watchdog_tick.rs": "36d662dab420a77240324f0d53b01c9d40e5adef8121339c304b4655ee4c098d",
+    "crates/rp2040-emu/src/pio_tests.rs": "93696d10c5749f17d183f0aeb4ed39662164eb4b7de46ca009235edf4dd2941b",
+    "crates/rp2040-emu/src/tests.rs": "e802c68c3d4cd7c45496a061df874b966bdd220691e7dfe51a2f5e73db297d58",
+    "crates/rp2040-emu/src/threaded/atomics.rs": "1cdf95358fdb26ac2113c7eaa64179686fdd0e1c36f3991b5a4f1c7e3ca28a14",
+    "crates/rp2040-emu/src/threaded/bus.rs": "940097578e7b1081201b18d27e262dd25fc4f1a00d41df9dcd2527900292128c",
+    "crates/rp2040-emu/src/threaded/emulator.rs": "e1d31a414187b3240c486fa787ee8b47676da89188a987bccf4db22d208395a0",
+    "crates/rp2040-emu/src/threaded/memory.rs": "bad651a1585f4d69498808f0919e00f7fe21dcd29b9b01a02bc2110fe1937135",
+    "crates/rp2040-emu/src/threaded/mod.rs": "242ed5838e1e26ad750644f967416b73e9b050f649e7d39af83acc18074190a6",
+    "crates/rp2040-emu/src/threaded/peripherals.rs": "8638ec6b09b90ab58ec4f618f329bd2a9678d8a0eca21edf21ec7a3483bfd6ae",
+    "crates/rp2040-emu/src/threaded/pio.rs": "271fd81813772fb222bfebef7b1691b3d18af9cc6988eaa34de098f3d9191c6d",
+    "crates/rp2040-emu/src/threaded/shared.rs": "6fbc6499b76f3fba2621774140c844888ed1e59baa4413aa49eab7038dcb65d0",
+    "crates/rp2040-emu/tests/dual_model.rs": "7f125046dea1f6316afb00f828d6c35b1f9774adb90617ca5c55ef41247d56c7",
+    "crates/rp2040-emu/tests/execution_model.rs": "d28624c230e274bba7748b9c755e41fa8fe8578a0bdbdb48d36f3958d325aa49",
+    "crates/rp2040-emu/tests/firmware.rs": "e8a03b6b556e389a81d52c15f38090d7bcbeb5e7c4a631f6576f75802f52c6dd",
+    "crates/rp2040-emu/tests/fixtures/sio_divider_sdk/README.md": "98e3282a55a94c0251cb6687a8359fc2926b357651b6ee2846d1fa92093dff2c",
+    "crates/rp2040-emu/tests/fixtures/sio_divider_sdk/build.py": "76d141ea29cae820548ac66d09f201d24cffb14672e2f833041eb25a7f270940",
+    "crates/rp2040-emu/tests/fixtures/sio_divider_sdk/fixture.bin": "241613056b71658b264adffaa87764aace17b628b0cf04aa61fe336de51bcbac",
+    "crates/rp2040-emu/tests/fixtures/sio_divider_sdk/harness.S": "ca97fb4c5e8fabc94cdc6922a67befca53fd8cca650a49125c93cce9a4548e03",
+    "crates/rp2040-emu/tests/fixtures/sio_divider_sdk/link.ld": "a215177ac66baf1ab136862235d871da6ad92c3b2597c7f00c56a0d77f94d776",
+    "crates/rp2040-emu/tests/fixtures/sio_divider_sdk/pico.h": "777fa6a77b884de29cf1b5a896cdce417a0728fb15be7f9a9c6a84e87dc84e54",
+    "crates/rp2040-emu/tests/fixtures/sio_divider_sdk/provenance.json": "15ffd42f23d702847b3ec0c210b431393d0e9fc9288752553858db0a953a1ce2",
+    "crates/rp2040-emu/tests/fixtures/sio_divider_sdk/symbols.txt": "18b3d3861fa6c5a4f97ee65ecc128363032af5caf97e7fd875f2924799e80715",
+    "crates/rp2040-emu/tests/multicore.rs": "0ef9a3775bc2dde3f38c4476819d7be01ab149e07e0891a48d9dd51755426906",
+    "crates/rp2040-emu/tests/psram_pio_edge_interleave.rs": "b4a856416975b8af8fe43c0425e3ded9695509897328f9bc4eaf94516db12373",
+    "crates/rp2040-emu/tests/sio_divider.rs": "0b7e827de47733461b43c3ec2ee8a34b4200da7f25809dcbcf7868e11639689d",
+    "crates/rp2040-emu/tests/smoke.rs": "dc91901444e63502ba25b8675ecbd9112e5ea5b50de261e7ae21d9cb92b35bf9",
+    "crates/rp2040-emu/tests/threaded_bus_paths.rs": "7fb265c0ff109fc1834698c646695d0339f30187d366ab10c39764f1404ed0db",
+    "crates/rp2040-emu/tests/wfe_irq_wake.rs": "249f31acb2e06d5176799056125aa7735ec3b1964f964379e18b328c1a151156"
+  },
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "commands": [
+    "cargo test --offline -p rp2040-emu",
+    "cargo test --offline -p rp2040-emu --features threading,testing",
+    "cargo test --offline -p rp2040-emu --features threading,testing --test sio_divider",
+    "cargo test --offline -p rp2040-emu --features threading,testing --lib sdk_64_bit",
+    "cargo clippy --offline -p rp2040-emu --lib --test sio_divider --features threading,testing -- -D warnings",
+    "cargo clippy --offline -p rp2040-emu --all-targets --features threading,testing -- -D warnings -A clippy::identity_op"
+  ],
+  "results": {
+    "default": {
+      "exit_code": 0,
+      "passed": 1269,
+      "failed": 0
+    },
+    "threading_testing": {
+      "exit_code": 0,
+      "passed": 1492,
+      "failed": 0
+    },
+    "register_cpu": {
+      "exit_code": 0,
+      "passed": 8,
+      "failed": 0
+    },
+    "sdk": {
+      "exit_code": 0,
+      "passed": 2,
+      "failed": 0
+    },
+    "strict_clippy_library_and_new_test": {
+      "exit_code": 0
+    },
+    "all_target_clippy": {
+      "exit_code": 0,
+      "allowed_existing_lint": "clippy::identity_op"
+    },
+    "rustfmt": {
+      "exit_code": 0
+    }
+  },
+  "register_arithmetic_comparisons": 6144,
+  "sdk_64_bit_calls": 104,
+  "hardware_operations": false,
+  "consumer_firmware_executed": false,
+  "sdk_fixture_sha256": "241613056b71658b264adffaa87764aace17b628b0cf04aa61fe336de51bcbac"
+}

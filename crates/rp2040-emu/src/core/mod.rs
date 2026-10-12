@@ -274,6 +274,7 @@ impl CortexM0Plus {
         // exception entry if one was taken; `0` otherwise.
         let exc_cycles = self.try_take_any_pending_exception(bus);
         if exc_cycles != 0 {
+            bus.advance_core_cycles(exc_cycles);
             self.cycles = self.cycles.wrapping_add(exc_cycles as u64);
             return exc_cycles;
         }
@@ -300,6 +301,7 @@ impl CortexM0Plus {
             cycles = cycles.wrapping_add(self.deliver_fault(fault, bus));
         }
 
+        bus.advance_core_cycles(cycles);
         self.cycles = self.cycles.wrapping_add(cycles as u64);
         cycles
     }

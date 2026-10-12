@@ -1,0 +1,10 @@
+   Compiling rp2040-emu v0.1.5 (/home/fuyuki/pico_dvl/codex/picoem-picocalc/crates/rp2040-emu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.74s
+     Running unittests src/lib.rs (/tmp/sio-divider-fix-20261012/target/debug/deps/rp2040_emu-932f2237f7dba861)
+
+running 2 tests
+test divider_tests::sdk_64_bit_division_both_cores_and_quantum_sizes ... ok
+test threaded::emulator::tests::sdk_64_bit_division_threaded_both_cores_and_quantum_sizes ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1408 filtered out; finished in 0.20s
+

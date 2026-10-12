@@ -1,0 +1,7 @@
+[package]
+name = "sio-divider-review"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+rp2040-emu = { path = "/home/fuyuki/pico_dvl/codex/picoem-picocalc/crates/rp2040-emu", features = ["threading"] }

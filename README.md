@@ -61,10 +61,12 @@ Feature coverage as of the published versions — Arm-mode only; Hazard3 RISC-V 
 
 Open cycle-timing gaps and post-Phase-7 residuals are tracked in `tech_debt.md`.
 
-Known correctness issue (2026-10-12): RP2040 SIO dividend writes do not
-recalculate the divider result in inspected revisions `32d27ff` and `f810d059`.
-Divisor-first SDK 64-bit division can use stale results. See the
-[open issue and evidence](docs/rp2040_sio_divider_bug_20261012.md).
+RP2040 SIO divider correction (2026-10-12): this source fixes operand
+triggers, DIRTY, eight-cycle READY transitions and Threaded state continuity
+using one per-core divider model. Register/CPU and pinned SDK 64-bit division
+regressions pass in both execution models. The inspected earlier revisions
+`32d27ff`, `f810d059` and `121d649` remain affected. See the
+[correction and acceptance record](docs/rp2040_sio_divider_fix_20261012.md).
 
 ### PicoCalc integration status
 

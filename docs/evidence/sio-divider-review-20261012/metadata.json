@@ -1,0 +1,44 @@
+{
+  "recorded_at": "2026-10-12T10:17:31.754776+09:00",
+  "kind": "direct_register_diagnostic_not_firmware_validation",
+  "backend_commit": "121d649930d625924fa7608a3b72ed622098f522",
+  "backend_clean_at_probe": true,
+  "backend_clean_at_probe_basis": "git status before the initial probe and after the final probe showed main...origin/main and no changed paths; evidence was added only after execution",
+  "worktree_had_new_evidence_at_metadata_collection": true,
+  "source_sha256": {
+    "crates/rp2040-emu/src/bus/sio.rs": "9cf02d8799171c06e595f057150738eae27049d95c636a92ca0ba62537f7b5de",
+    "crates/rp2040-emu/src/threaded/bus.rs": "6ce696ce623e5fc988ab5456068981a20aa382c8576b61d72edc3d694c3d7434",
+    "crates/picoem-common/src/divider.rs": "b0896cf51ca6cc6d5c199df263cf1ce8c48c7b2038160ef45e41307f80d48335"
+  },
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "sdk_commit": "a1438dff1d38bd9c65dbd693f0e5db4b9ae91779",
+  "sdk_reference_sha256": {
+    "src/rp2040/hardware_regs/include/hardware/regs/sio.h": "362bab775397e8c886a33adc010f76bec24701bf753d17dab1d95accc5a259e5",
+    "src/rp2_common/pico_divider/divider_hardware.S": "a358fbb27fa953a7ff6da8d953651b2e046eec9a830da52a2d09f2044a25e9e0",
+    "src/rp2_common/hardware_divider/include/hardware/divider.h": "65ac5806e4e40a0df4ee83b5c02da30da830bebc499509578e78e153a42912e5"
+  },
+  "command": "CARGO_TARGET_DIR=/tmp/sio-divider-review-20261012/target cargo run --offline --locked --manifest-path /tmp/sio-divider-review-20261012/probe/Cargo.toml",
+  "process_exit_code": 0,
+  "cpu_instructions_executed": false,
+  "worker_threads_started": false,
+  "firmware_replayed": false,
+  "timing_tested": false,
+  "fix_applied": false,
+  "models": {
+    "Serial Sio": {
+      "cases": 17,
+      "matches_spec": 6,
+      "mismatches": 11
+    },
+    "Threaded WorkerBus (no worker threads started)": {
+      "cases": 17,
+      "matches_spec": 7,
+      "mismatches": 10
+    }
+  },
+  "consumer_evidence_check": {
+    "artifacts_verified": 32,
+    "fixture_verified": true,
+    "reports_match_manifest": 4
+  }
+}

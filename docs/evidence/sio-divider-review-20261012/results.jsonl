@@ -1,0 +1,34 @@
+{"model":"Serial Sio","case":"unsigned_dividend_first","actual":[3,1],"expected":[3,1],"matches_spec":true}
+{"model":"Serial Sio","case":"unsigned_divisor_first","actual":[0,0],"expected":[3,1],"matches_spec":false}
+{"model":"Serial Sio","case":"signed_dividend_first","actual":[4294967293,4294967295],"expected":[4294967293,4294967295],"matches_spec":true}
+{"model":"Serial Sio","case":"signed_divisor_first","actual":[0,0],"expected":[4294967293,4294967295],"matches_spec":false}
+{"model":"Serial Sio","case":"repeated_dividend","actual":[3,1],"expected":[6,2],"matches_spec":false}
+{"model":"Serial Sio","case":"repeated_divisor","actual":[2,6],"expected":[2,6],"matches_spec":true}
+{"model":"Serial Sio","case":"last_signed_dividend_selects_mode","actual":[0,0],"expected":[4294967293,4294967295],"matches_spec":false}
+{"model":"Serial Sio","case":"last_unsigned_dividend_selects_mode","actual":[4294967293,4294967295],"expected":[3,1],"matches_spec":false}
+{"model":"Serial Sio","case":"sdk_reciprocal_operand_sequence","actual":[0,0],"expected":[65535,0],"matches_spec":false}
+{"model":"Serial Sio","case":"unsigned_zero_divisor_first","actual":[4294967295,0],"expected":[4294967295,42],"matches_spec":false}
+{"model":"Serial Sio","case":"signed_zero_divisor_first","actual":[4294967295,0],"expected":[1,4294967254],"matches_spec":false}
+{"model":"Serial Sio","case":"signed_overflow_dividend_first","actual":[2147483648,0],"expected":[2147483648,0],"matches_spec":true}
+{"model":"Serial Sio","case":"core0_isolation","actual":[14,2],"expected":[14,2],"matches_spec":true}
+{"model":"Serial Sio","case":"core1_isolation","actual":[6,2],"expected":[6,2],"matches_spec":true}
+{"model":"Serial Sio","case":"quotient_read_clears_dirty","actual":[2,0],"expected":[0,0],"matches_spec":false}
+{"model":"Serial Sio","case":"repeated_remainder_keeps_dirty","actual":[0,0],"expected":[2,0],"matches_spec":false}
+{"model":"Serial Sio","case":"dividend_write_after_result_consumption","actual":[0,0],"expected":[0,2],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"unsigned_dividend_first","actual":[3,1],"expected":[3,1],"matches_spec":true}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"unsigned_divisor_first","actual":[0,0],"expected":[3,1],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"signed_dividend_first","actual":[4294967293,4294967295],"expected":[4294967293,4294967295],"matches_spec":true}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"signed_divisor_first","actual":[0,0],"expected":[4294967293,4294967295],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"repeated_dividend","actual":[3,1],"expected":[6,2],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"repeated_divisor","actual":[2,6],"expected":[2,6],"matches_spec":true}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"last_signed_dividend_selects_mode","actual":[0,0],"expected":[4294967293,4294967295],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"last_unsigned_dividend_selects_mode","actual":[4294967293,4294967295],"expected":[3,1],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"sdk_reciprocal_operand_sequence","actual":[0,0],"expected":[65535,0],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"unsigned_zero_divisor_first","actual":[4294967295,0],"expected":[4294967295,42],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"signed_zero_divisor_first","actual":[4294967295,0],"expected":[1,4294967254],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"signed_overflow_dividend_first","actual":[2147483648,0],"expected":[2147483648,0],"matches_spec":true}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"core0_isolation","actual":[14,2],"expected":[14,2],"matches_spec":true}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"core1_isolation","actual":[6,2],"expected":[6,2],"matches_spec":true}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"quotient_read_clears_dirty","actual":[2,0],"expected":[0,0],"matches_spec":false}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"repeated_remainder_keeps_dirty","actual":[2,0],"expected":[2,0],"matches_spec":true}
+{"model":"Threaded WorkerBus (no worker threads started)","case":"dividend_write_after_result_consumption","actual":[2,2],"expected":[0,2],"matches_spec":false}

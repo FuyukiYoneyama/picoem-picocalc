@@ -2,19 +2,19 @@
 
 Items discovered during development that need addressing in later phases.
 
-## RP2040 SIO dividend writes do not trigger recalculation (2026-10-12)
+## RP2040 SIO divider correctness (2026-10-12)
 
-**Status: open; correctness defect, fix not applied.** Inspected public
-`32d27ff` and ClockCalc diagnostic backend `f810d059` both omit
-`compute_division` on DIV_UDIVIDEND / DIV_SDIVIDEND writes. RP2040 starts a
-calculation on either operand write. Divisor-first SDK 64-bit division can
-therefore use stale results and spend a long time in its correction loop.
+**Status: fixed and regression-checked.**
+The earlier revisions `32d27ff`, `f810d059` and `121d649` contain the missing
+operand trigger and incorrect DIRTY behavior. The shared RP2040 divider now
+handles all four operand writes, eight-cycle completion, result-write
+cancellation and QUOTIENT-specific DIRTY clearing in both execution models.
+Divider state survives Threaded promotion and repeated worker invocations.
 
-[Detailed issue, source-derived repro and evidence](docs/rp2040_sio_divider_bug_20261012.md)
-separate verified implementation behavior from the inferred explanation of
-the observed ClockCalc pressure-division stall. No corrected-backend run or
-physical LCD recovery has been confirmed. Existing latency/dirty-flag items
-do not cover this operand-trigger defect.
+[Correction and regression evidence](docs/rp2040_sio_divider_fix_20261012.md)
+and [historical defect record](docs/rp2040_sio_divider_bug_20261012.md).
+Emulator acceptance is based on register/CPU/SDK regressions. The historical
+consumer observations are not part of the emulator correction's acceptance.
 
 ## OneROM PIO ServingOracle fire-32-a servable sweep accepted (2026-05-04, Stage 4C)
 
@@ -510,9 +510,15 @@ These surfaced during Phase 5.A code review. The emulator compiles and Phase 5.A
 
 `crates/mdrp2040/src/core/execute.rs` treats WFE and WFI as 1-cycle NOPs. `Emulator::step` clears `event_flag[0]` each step without a corresponding wait-state on core 0. Firmware using `__wfe`/SEV protocol will busy-loop rather than suspend. Needs a proper `wfe_waiting` flag per the mdrp2350 pattern (core suspends until a SEV, interrupt, or FIFO-rx event pending). Blocker before any multicore firmware with `__wfe()` idle loops (and any SDK `sev()`/`wfe()` helpers) can run correctly.
 
-### RP2040 SIO divider 8-cycle latency not modelled
+### RP2040 SIO divider 8-cycle latency (resolved in working tree)
 
-`crates/mdrp2040/src/bus/sio.rs` `DIV_CSR` reports `READY=1` immediately after a divider write. Real hardware requires 8 cycles for the DIV result to become available. Pico SDK `hw_divider_delay` uses inline-asm hard-coded NOPs rather than polling `CSR.READY`, so most SDK-using firmware is unaffected, but any firmware that busy-polls `CSR.READY` will read a stale result. Low priority — fix with a cycle counter on the divider state.
+The pre-fix Serial/Threaded models reported READY=1 immediately. The shared
+RP2040 divider now publishes results after eight elapsed sysclk cycles,
+restarts on every operand write and cancels on result-register writes.
+CPU instruction/exception cycles advance it within a quantum; system-clock
+synchronization covers parked cores without double-counting elapsed cycles.
+Register boundary checks and actual SDK assembly execution pass. See the
+[correction record](docs/rp2040_sio_divider_fix_20261012.md).
 
 ### RP2040 multicore launch: entry with Thumb bit clear silently stripped
 
@@ -540,9 +546,15 @@ Fix requires a `Pacer` API extension to feed consumed cycles back
 actual cycle count from `emu.run`'s return). Low priority — firmware
 runs correctly; only the displayed MHz figure is wrong.
 
-### RP2040 SIO divider 2-read dirty clear heuristic
+### RP2040 SIO divider DIRTY clearing (resolved in working tree)
 
-`crates/mdrp2040/src/bus/sio.rs` clears the divider `dirty` flag after exactly two result reads. Real hardware clears `dirty` on any result read (per-register). The two-read heuristic happens to match the canonical `__aeabi_idivmod` pattern (quotient + remainder read in pairs), but misbehaves for firmware that reads only one result (e.g., modulo-only code paths leave `dirty` set until the next write). Low priority — fix by clearing on each read of `QUOTIENT`/`REMAINDER`.
+The pre-fix Serial model cleared DIRTY after two reads of either result;
+WorkerBus never cleared it on result reads. The shared RP2040 model now clears
+DIRTY on QUOTIENT only and preserves it on REMAINDER, matching the register
+specification. Operand/result writes set DIRTY, including dividend updates.
+The incorrect two-read test has been replaced. Context save/restore and the
+SDK's dirty-state paths are exercised by regressions. The old debt description
+saying that any result read clears DIRTY was incorrect.
 
 ### PIO not gated on RESETS bit
 

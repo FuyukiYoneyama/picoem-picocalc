@@ -14,11 +14,24 @@ public release simply ships those current versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- Correct the RP2040 SIO divider in Serial and Threaded: all operand aliases
+  restart calculation, QUOTIENT alone clears DIRTY, results become ready after
+  eight cycles, and direct result writes cancel pending calculations.
+  Preserve divider state at Threaded promotion and across worker invocations.
+  Add register/CPU regressions and a reproducible pinned SDK 64-bit division
+  fixture exercised on both cores and execution models.
+
 ### Added
 
+- Extend the open RP2040 SIO divider investigation with direct register
+  observations for Serial and Threaded, retained probe source/output,
+  specification-correct DIRTY documentation and a remediation plan.
+  This historical diagnostic predates the correction above.
 - Document the open RP2040 SIO dividend-write recalculation defect, its SDK
   divisor-first sequence, source-derived repro and retained ClockCalc evidence.
-  No emulator correction or new regression execution is included.
+  Preserve the original pre-fix observations alongside the correction above.
 - Add the R4 GitHub Actions backend quality gate with separate test/release-build, rustfmt, and
   Clippy jobs on pinned Ubuntu 24.04 and Rust 1.97.1. Formatting and linting are scoped to the
   PicoCalc-owned crates, while the RP2040 core remains covered by tests.

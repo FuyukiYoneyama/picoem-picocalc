@@ -22,7 +22,9 @@
 
 use tracing::trace;
 
-use picoem_common::{Divider, Fifo};
+use picoem_common::Fifo;
+
+use super::divider::Divider;
 
 /// RP2040 GPIO pin mask — 30 valid GPIOs (bits [29:0]).
 pub(crate) const PIN_MASK: u32 = 0x3FFF_FFFF;
@@ -220,14 +222,7 @@ impl Sio {
             0x050 => self.fifo_st_read(core),
             0x058 => self.fifo_rd(core),
             // Integer divider (0x060-0x078).
-            0x060 | 0x068 => self.divider[core].dividend,
-            0x064 | 0x06C => self.divider[core].divisor,
-            0x070 | 0x074 => self.divider_result_read(offset, core),
-            0x078 => {
-                let ready = 1u32;
-                let dirty = if self.divider[core].dirty { 2 } else { 0 };
-                ready | dirty
-            }
+            0x060..=0x078 => self.divider[core].read32(offset),
             // Interpolators (0x080-0x0FC). Each interpolator (INTERP0 at
             // 0x080, INTERP1 at 0x0C0) has its own register block. ACCUM
             // and BASE reads return the backing store; PEEK_LANE0/1,
@@ -277,7 +272,7 @@ impl Sio {
             0x050 => self.fifo_st_write(val, core),
             0x054 => self.fifo_wr(val, core),
             // Divider.
-            0x060..=0x078 => self.divider_write(offset, val, core),
+            0x060..=0x078 => self.divider[core].write32(offset, val),
             // Interpolators.
             0x080..=0x0FC => {
                 let idx = ((offset - 0x080) >> 2) as usize;
@@ -589,80 +584,24 @@ impl Sio {
         trace!(lock_id = n, "spinlock released");
     }
 
-    // --- Divider helpers ---------------------------------------------------
-
-    fn divider_result_read(&mut self, offset: u32, core: usize) -> u32 {
-        let d = &mut self.divider[core];
-        let val = match offset {
-            0x070 => d.quotient,
-            0x074 => d.remainder,
-            _ => return 0,
-        };
-        if d.dirty {
-            d.reads_pending += 1;
-            if d.reads_pending >= 2 {
-                d.dirty = false;
-                d.reads_pending = 0;
-            }
-        }
-        val
+    /// Advance the divider for one core by elapsed sysclk cycles.
+    /// Direct SIO users must call this before reading completed results.
+    /// CPU stepping does this automatically for instruction/exception cycles.
+    pub fn advance_divider_cycles(&mut self, core: usize, cycles: u64) {
+        self.divider[core].advance_cycles(cycles);
     }
 
-    fn divider_write(&mut self, offset: u32, val: u32, core: usize) {
-        let d = &mut self.divider[core];
-        match offset {
-            0x060 => {
-                d.dividend = val;
-                d.signed = false;
-            }
-            0x064 => {
-                d.divisor = val;
-                d.signed = false;
-                Self::compute_division(d);
-            }
-            0x068 => {
-                d.dividend = val;
-                d.signed = true;
-            }
-            0x06C => {
-                d.divisor = val;
-                d.signed = true;
-                Self::compute_division(d);
-            }
-            0x070 => {
-                d.quotient = val;
-                d.dirty = true;
-                d.reads_pending = 0;
-            }
-            0x074 => {
-                d.remainder = val;
-                d.dirty = true;
-                d.reads_pending = 0;
-            }
-            _ => {}
-        }
+    pub(crate) fn sync_divider_cycle(&mut self, core: usize, cycle: u64) {
+        self.divider[core].sync_cycle(cycle);
     }
 
-    fn compute_division(d: &mut Divider) {
-        if d.divisor == 0 {
-            if d.signed {
-                let a = d.dividend as i32;
-                d.quotient = if a < 0 { 1u32 } else { (-1i32) as u32 };
-            } else {
-                d.quotient = 0xFFFF_FFFF;
-            }
-            d.remainder = d.dividend;
-        } else if d.signed {
-            let a = d.dividend as i32;
-            let b = d.divisor as i32;
-            d.quotient = a.wrapping_div(b) as u32;
-            d.remainder = a.wrapping_rem(b) as u32;
-        } else {
-            d.quotient = d.dividend.wrapping_div(d.divisor);
-            d.remainder = d.dividend.wrapping_rem(d.divisor);
-        }
-        d.dirty = true;
-        d.reads_pending = 0;
+    #[cfg(all(
+        feature = "threading",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn divider_snapshot(&self, core: usize) -> Divider {
+        self.divider[core]
     }
 }
 
@@ -800,6 +739,7 @@ mod tests {
         let mut sio = Sio::new();
         sio.write32(0x060, 100, 0);
         sio.write32(0x064, 7, 0);
+        sio.advance_divider_cycles(0, 8);
         assert_eq!(sio.read32(0x070, 0), 14);
         assert_eq!(sio.read32(0x074, 0), 2);
     }
@@ -809,6 +749,7 @@ mod tests {
         let mut sio = Sio::new();
         sio.write32(0x068, (-42i32) as u32, 0);
         sio.write32(0x06C, 0, 0);
+        sio.advance_divider_cycles(0, 8);
         assert_eq!(sio.read32(0x070, 0), 1);
         assert_eq!(sio.read32(0x074, 0), (-42i32) as u32);
     }

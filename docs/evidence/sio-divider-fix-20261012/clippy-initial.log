@@ -1,0 +1,76 @@
+    Checking once_cell v1.21.4
+    Checking pin-project-lite v0.2.17
+    Checking libc v0.2.185
+    Checking tracing-core v0.1.36
+    Checking tracing v0.1.44
+    Checking picoem-devices v0.1.3 (/home/fuyuki/pico_dvl/codex/picoem-picocalc/crates/picoem-devices)
+    Checking picoem-common v0.2.2 (/home/fuyuki/pico_dvl/codex/picoem-picocalc/crates/picoem-common)
+    Checking rp2040-emu v0.1.5 (/home/fuyuki/pico_dvl/codex/picoem-picocalc/crates/rp2040-emu)
+error: this operation has no effect
+  --> crates/rp2040-emu/tests/threaded_bus_paths.rs:75:23
+   |
+75 | const UART0_DR: u32 = UART0_BASE + 0x000;
+   |                       ^^^^^^^^^^^^^^^^^^ help: consider reducing it to: `UART0_BASE`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#identity_op
+   = note: `-D clippy::identity-op` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::identity_op)]`
+
+error: this operation has no effect
+  --> crates/rp2040-emu/tests/threaded_bus_paths.rs:79:23
+   |
+79 | const SPI0_CR0: u32 = SPI0_BASE + 0x000;
+   |                       ^^^^^^^^^^^^^^^^^ help: consider reducing it to: `SPI0_BASE`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#identity_op
+
+error: this operation has no effect
+  --> crates/rp2040-emu/tests/threaded_bus_paths.rs:82:23
+   |
+82 | const I2C0_CON: u32 = I2C0_BASE + 0x000;
+   |                       ^^^^^^^^^^^^^^^^^ help: consider reducing it to: `I2C0_BASE`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#identity_op
+
+error: this operation has no effect
+  --> crates/rp2040-emu/tests/threaded_bus_paths.rs:85:21
+   |
+85 | const ADC_CS: u32 = ADC_BASE + 0x000;
+   |                     ^^^^^^^^^^^^^^^^ help: consider reducing it to: `ADC_BASE`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#identity_op
+
+error: this operation has no effect
+  --> crates/rp2040-emu/tests/threaded_bus_paths.rs:88:26
+   |
+88 | const PWM_CH0_CSR: u32 = PWM_BASE + 0x000;
+   |                          ^^^^^^^^^^^^^^^^ help: consider reducing it to: `PWM_BASE`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#identity_op
+
+error: could not compile `rp2040-emu` (test "threaded_bus_paths") due to 5 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: items after a test module
+  --> crates/rp2040-emu/src/bus/divider.rs:20:1
+   |
+20 | mod tests {
+   | ^^^^^^^^^
+...
+42 | impl Divider {
+   | ^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#items_after_test_module
+   = note: `-D clippy::items-after-test-module` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::items_after_test_module)]`
+
+error: this operation has no effect
+     --> crates/rp2040-emu/src/tests.rs:14657:25
+      |
+14657 |         emu.bus.write32(PIO0_BASE + 0x000, 0x1);
+      |                         ^^^^^^^^^^^^^^^^^ help: consider reducing it to: `PIO0_BASE`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#identity_op
+      = note: `-D clippy::identity-op` implied by `-D warnings`
+      = help: to override `-D warnings` add `#[allow(clippy::identity_op)]`
+
+error: could not compile `rp2040-emu` (lib test) due to 2 previous errors

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use picoem_common::threaded::SpscQueue;
 
 use crate::WorkerName;
+use crate::bus::divider::Divider;
 use crate::bus::ppb::Ppb;
 use crate::threaded::{CoreAtomics, Peripherals, SharedMemory, ThreadedPio};
 
@@ -91,6 +92,9 @@ pub struct SharedState {
     /// `spawn_worker` signature while still preserving pre-run pokes
     /// (VTOR, NVIC pending/enable via ICSR, SHPR priorities).
     pub initial_ppb: Arc<Mutex<Option<[Ppb; 2]>>>,
+    /// Per-core divider snapshots at promotion and between worker runs.
+    /// Locked only at worker construction/exit, never on an MMIO access.
+    pub(crate) dividers: [Arc<Mutex<Divider>>; 2],
 }
 
 impl SharedState {
@@ -120,6 +124,7 @@ impl SharedState {
             poisoned: Arc::new(AtomicBool::new(false)),
             panic_info: Arc::new(Mutex::new(None)),
             initial_ppb: Arc::new(Mutex::new(None)),
+            dividers: std::array::from_fn(|_| Arc::new(Mutex::new(Divider::default()))),
         }
     }
 
