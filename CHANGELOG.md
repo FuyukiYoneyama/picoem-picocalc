@@ -14,6 +14,18 @@ public release simply ships those current versions.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-12 — paired technical preview
+
+Release scope, migration requirements and local gates are recorded in
+[docs/release_v0.2.0.md](docs/release_v0.2.0.md). This source release includes
+incompatible scope reductions from the old baseline restoration; machine API,
+preview/audio analysis and SD/loader extensions require historical backend pins.
+Restored distribution notices from v0.1.0 and added the SDK divider fixture notice
+and license. Crate versions remain independent of the repository release tag.
+
+The following PicoCalc integration notes include the retained baseline as well
+as the current divider correction; they are not all additions since v0.1.0.
+
 ### Fixed
 
 - Correct the RP2040 SIO divider in Serial and Threaded: all operand aliases

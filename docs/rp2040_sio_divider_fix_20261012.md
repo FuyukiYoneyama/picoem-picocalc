@@ -71,4 +71,5 @@ default構成1269件、threading／testing構成1492件が合格しました。
 
 この確認は仕様に基づくエミュレーター回帰確認です。実機との比較は実施していません。
 MMIOアクセスの時点は既存CPUの命令単位のスケジュールに従います。
-target registry／accepted backend pin／公開タグの更新は行っていません。
+修正検証時点ではtarget registry／accepted backend pin／公開タグを更新していません。
+その後の公開版と移行条件は[v0.2.0リリース記録](release_v0.2.0.md)を参照してください。

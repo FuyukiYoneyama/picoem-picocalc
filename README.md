@@ -39,6 +39,10 @@ picoem-picocalc (this repo)      — PicoCalc-oriented derivative and test works
 
 ## Status
 
+The paired `v0.2.0` technical preview ships the RP2040 SIO divider correction.
+See [release scope and migration](docs/release_v0.2.0.md) before upgrading;
+registered firmware targets continue to require their exact historical pins.
+
 The upstream repository is a personal research project and does not promise issue-triage, pull-request review, or ongoing feature-development service levels. This derivative is maintained independently for PicoCalc integration; users should not expect the upstream author to support derivative-specific changes.
 
 Feature coverage as of the published versions — Arm-mode only; Hazard3 RISC-V cores on RP2350 are out of scope:

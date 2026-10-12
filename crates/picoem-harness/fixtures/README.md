@@ -2,8 +2,9 @@
 
 Test fixtures consumed by the harness binaries. The binary fixtures here
 are either functional captures (the `*.trace` files), locally-built RP2350
-firmware images (the `onerom-*.bin` files), or open-source firmware that we
-redistribute under its license (currently SeaBIOS, see below).
+OneROM firmware images redistributed under the upstream MIT license, or
+open-source firmware redistributed under its own license (currently SeaBIOS,
+see below).
 
 ## Trace files (`*.trace`)
 
@@ -43,13 +44,23 @@ this interface and are not present in any trace file.
 
 ## OneROM firmware images (`onerom-*.bin`)
 
-`onerom-fire-24-a-rp2350-*.bin` are OneROM firmware images built
-locally for the harness's `onerom_*` oracles (CPU, PIO, full-system,
-serving, stress, and speed-grade variants). They are RP2350 firmware
-images, not redistributed third-party content; rebuilds of these
-binaries are produced from the OneROM source tree as the project
-evolves. See the OneROM HLD documents under `wrk_docs/` for build
-provenance.
+`onerom-fire-24-a-rp2350-*.bin` and the fire-32-a image below are OneROM
+firmware images built locally for the harness's `onerom_*` oracles (CPU, PIO,
+full-system, serving, stress, and speed-grade variants). They are fixed
+redistributed binaries derived from the upstream OneROM software/firmware
+project, licensed under MIT; see `third_party/onerom/` and the root `NOTICE`.
+They are not a vendored OneROM source tree. The historical build journals
+clone upstream `main` without retaining a source commit, so the SHA-256 values
+below pin the supplied inputs but do not claim source-to-byte reproducibility.
+
+| File | Role | SHA-256 |
+|---|---|---|
+| `onerom-fire-24-a-rp2350-1541-cpu.bin` | fire-24-a CPU-serve fixture | `2e5df7da38881d1051b12b0af3a8bf6d81761065668f0aeace9e6939cc7f89a9` |
+| `onerom-fire-24-a-rp2350-1541.bin` | fire-24-a PIO-serve fixture | `ded73a819ca811dd0c7a526186cabd4cd99a9f4adee1fb63583ae177a3c86967` |
+| `onerom-fire-24-a-rp2350-seabios-cpu.bin` | fire-24-a SeaBIOS CPU-serve fixture | `05cbef6e2727528a63a44514b3beb58ff76ac4b796196560a28c6081786295c5` |
+| `onerom-fire-24-a-rp2350-test-sdrr-0-cpu.bin` | fire-24-a SDRR CPU fixture | `8543fbaca12b3bbdee5926b161490c28adaf7ca0695346d4934bd31ce9d1ac01` |
+| `onerom-fire-24-a-rp2350-test-sdrr-0.bin` | fire-24-a SDRR PIO fixture | `0798157fd0a88f3dc6adcd389c76aaa48c5bb5f673a4538ec905008277290b16` |
+| `onerom-fire-32-a-rp2350-seabios.bin` | fire-32-a SeaBIOS PIO fixture | `3fb7cb6f85ad371a483a4bbaa6597f29a36c58de6fdac928bf4843789e266c00` |
 
 `onerom-fire-32-a-rp2350-seabios.bin` is the fire-32-a RP2350 PIO-serve
 SeaBIOS fixture used by `seabios32_fixture_byte_correct`. It was generated
@@ -70,6 +81,10 @@ The 128 KiB SeaBIOS SDRR package used by mddosem lives in the private
 `mddosem-corpus` repository under `roms/bios/seabios-128k/`; picoem keeps only
 the generic validator and parser support for 64/128/256 KiB SeaBIOS inputs.
 
+The OneROM PIO differential helper also consumes the `epio` and `apio` MIT
+submodules declared in `.gitmodules`; their pinned gitlinks and license copies
+are documented in `third_party/README.md`.
+
 ## SeaBIOS image (`sources/seabios-256k.bin`)
 
 `sources/seabios-256k.bin` is a 256 KiB SeaBIOS x86 BIOS binary used by
@@ -80,6 +95,10 @@ https://github.com/coreboot/seabios. The byte-identical copy lives in
 mddosem at `assets/roms/bios-256k.bin`; see the journal
 `wrk_journals/2026.05.03 - JRN - SDRR SeaBIOS fixture.md` for SHA-256 +
 provenance.
+
+The corresponding LGPL-3.0 and incorporated GPL-3.0 license texts are kept
+in `third_party/seabios/`. The root `NOTICE` records the payload and the
+derived OneROM carrier images as redistributed third-party assets.
 
 The derived fixture `onerom-fire-24-a-rp2350-seabios-cpu.bin` embeds the
 SeaBIOS bytes inside SDRR firmware envelope; the fixture inherits SeaBIOS's

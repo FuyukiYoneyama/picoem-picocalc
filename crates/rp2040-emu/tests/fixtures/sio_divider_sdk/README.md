@@ -4,7 +4,8 @@
 the actual Cortex-M0+ instructions from the unmodified Pico SDK
 `divider_hardware.S` at commit `a1438dff1d38bd9c65dbd693f0e5db4b9ae91779`.
 SDK source and helpers are BSD-3-Clause, copyright Raspberry Pi; their source
-identities are recorded in `provenance.json`.
+identities are recorded in `provenance.json`. The upstream license text is
+preserved in `LICENSE-PICO-SDK.txt` and this binary is listed in the root `NOTICE`.
 
 `harness.S` loads two 64-bit inputs and a signedness selector from `0x20030000`,
 calls `__aeabi_uldivmod` or `__aeabi_ldivmod`, and writes quotient, remainder
