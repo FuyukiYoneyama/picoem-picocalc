@@ -2,6 +2,20 @@
 
 Items discovered during development that need addressing in later phases.
 
+## RP2040 SIO dividend writes do not trigger recalculation (2026-10-12)
+
+**Status: open; correctness defect, fix not applied.** Inspected public
+`32d27ff` and ClockCalc diagnostic backend `f810d059` both omit
+`compute_division` on DIV_UDIVIDEND / DIV_SDIVIDEND writes. RP2040 starts a
+calculation on either operand write. Divisor-first SDK 64-bit division can
+therefore use stale results and spend a long time in its correction loop.
+
+[Detailed issue, source-derived repro and evidence](docs/rp2040_sio_divider_bug_20261012.md)
+separate verified implementation behavior from the inferred explanation of
+the observed ClockCalc pressure-division stall. No corrected-backend run or
+physical LCD recovery has been confirmed. Existing latency/dirty-flag items
+do not cover this operand-trigger defect.
+
 ## OneROM PIO ServingOracle fire-32-a servable sweep accepted (2026-05-04, Stage 4C)
 
 **Status:** resolved for servable pin-pattern byte correctness. Stage 4A added
